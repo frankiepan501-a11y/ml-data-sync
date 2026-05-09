@@ -1,14 +1,22 @@
-# ML Direct Sync · 美客多直连同步
+# Funlab ML Direct Sync · 美客多直连同步（FUNLAB 单品牌）
 
-直连 Mercado Libre Open API 的轻量服务，把 4+ 店铺的销售数据按 `SKU × 平台 × 月份` 自动汇总到飞书多维表格。
+直连 Mercado Libre Open API 的轻量服务，把 FUNLAB 在 ML 多店铺的销售数据按 `SKU × 平台 × 月份` 自动汇总到飞书多维表格。
+
+> **Scope 注**：v1 只接入 FUNLAB 品牌的 ML 店铺。Powkong 跨境店以后会另注册独立 ML App + 单独跑一份 DPP 申请，本 repo 不混合两个品牌的凭证。
 
 ## 项目背景
 
 详见 `~/.claude/projects/C--Users-Administrator/memory/project_ml_direct_sync.md`。
 
 - 启动：2026-05-09
-- 业务体量：ML 月单 3000-10000，4+ 店（本土 + 跨境混合）
+- 业务体量：FUNLAB 在 ML 月单数千-上万，多店（本土 + 跨境混合）
 - 替代品：领星 ERP 不暴露 ML 数据；蓝鲸 BI 不支持 API
+
+## ML 开发者 App
+
+- App 名：`Funlab Internal Data Sync`
+- 注册位置：https://developers.mercadolibre.com.ar/devcenter（用墨西哥主店账号）
+- 跨境店扩展能力靠 ML Developer Partner Program (DPP) — 走 [Inhouse Development 通道](https://docs.google.com/forms/d/e/1FAIpQLSftLvUCWc3GMwag-dbArKgeliAKNqTWB2LgTOS1mrAKQF8AvA/viewform)，最长 6 个月审核
 
 ## 架构（仿 KOL 自动化）
 
