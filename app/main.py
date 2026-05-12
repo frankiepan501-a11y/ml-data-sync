@@ -241,6 +241,24 @@ async def admin_refresh_expiring(within_seconds: int = 1800):
 
 # ---------- M3 reporting ----------
 
+@app.get("/report/debug-order-detail", dependencies=[Depends(require_service_token)])
+async def debug_order_detail(order_id: int, parent_user_id: int = 1502520822):
+    """Fetch a single order's detailed schema via /marketplace/orders/{id} and /orders/{id}."""
+    row = await db.get_token(parent_user_id)
+    if not row:
+        raise HTTPException(404, "token not found")
+    headers = {"Authorization": f"Bearer {row['access_token']}"}
+    async with httpx.AsyncClient(timeout=30) as client:
+        out = {}
+        for ep in [
+            f"https://api.mercadolibre.com/marketplace/orders/{order_id}",
+            f"https://api.mercadolibre.com/orders/{order_id}",
+        ]:
+            r = await _ml_get(client, ep, headers)
+            out[ep] = {"status": r.status_code, "body": (r.json() if r.status_code == 200 else r.text[:200])}
+        return out
+
+
 @app.get("/report/debug-orders-first-page", dependencies=[Depends(require_service_token)])
 async def debug_orders_first_page(
     seller_id: int,
