@@ -259,10 +259,11 @@ async def debug_orders_first_page(
 
     headers = {"Authorization": f"Bearer {row['access_token']}"}
     async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(
+        r = await _ml_get(
+            client,
             "https://api.mercadolibre.com/marketplace/orders/search",
-            headers=headers,
-            params={
+            headers,
+            {
                 "seller": seller_id,
                 "order.date_created.from": date_from,
                 "order.date_created.to": date_to,
@@ -277,15 +278,36 @@ async def debug_orders_first_page(
     }
 
 
+import asyncio as _asyncio
+
+
+async def _ml_get(client: httpx.AsyncClient, url: str, headers: dict, params: dict | None = None, max_retries: int = 5) -> httpx.Response:
+    """httpx GET wrapper with 429-aware retry + sleep between calls.
+
+    - On 429: sleeps Retry-After (or exponential 2/4/8/16 s) and retries.
+    - Always sleeps 150 ms after the call to stay under ML's 1500 req/min.
+    """
+    for attempt in range(max_retries):
+        r = await client.get(url, headers=headers, params=params)
+        if r.status_code != 429:
+            await _asyncio.sleep(0.15)
+            return r
+        retry_after = int(r.headers.get("Retry-After", "0") or "0")
+        wait = max(retry_after, 2 ** (attempt + 1))
+        await _asyncio.sleep(min(wait, 30))
+    return r  # type: ignore[return-value]
+
+
 async def _fetch_seller_items_with_sku(client: httpx.AsyncClient, headers: dict, seller_id: int) -> dict[str, dict]:
     """Return {item_id: {sku, title, price, currency, status}} for all of a seller's listings."""
     items: dict[str, dict] = {}
     offset = 0
     while True:
-        r = await client.get(
+        r = await _ml_get(
+            client,
             f"https://api.mercadolibre.com/marketplace/users/{seller_id}/items/search",
-            headers=headers,
-            params={"limit": 50, "offset": offset},
+            headers,
+            {"limit": 50, "offset": offset},
         )
         if r.status_code != 200:
             raise HTTPException(502, f"items/search failed seller={seller_id} offset={offset} status={r.status_code} body={r.text[:300]}")
@@ -297,10 +319,7 @@ async def _fetch_seller_items_with_sku(client: httpx.AsyncClient, headers: dict,
         if not ids:
             break
         for item_id in ids:
-            r2 = await client.get(
-                f"https://api.mercadolibre.com/items/{item_id}",
-                headers=headers,
-            )
+            r2 = await _ml_get(client, f"https://api.mercadolibre.com/items/{item_id}", headers)
             if r2.status_code != 200:
                 items[item_id] = {"sku": "(item_403)", "title": None, "price": None}
                 continue
@@ -360,10 +379,11 @@ async def _report_sku_monthly_impl(seller_id: int, month: str, parent_user_id: i
         orders: list[dict] = []
         offset = 0
         while True:
-            r = await client.get(
+            r = await _ml_get(
+                client,
                 "https://api.mercadolibre.com/marketplace/orders/search",
-                headers=headers,
-                params={
+                headers,
+                {
                     "seller": seller_id,
                     "order.date_created.from": date_from,
                     "order.date_created.to": date_to,
