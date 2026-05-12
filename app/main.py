@@ -336,7 +336,12 @@ async def _report_sku_monthly_impl(seller_id: int, month: str, parent_user_id: i
                     "sort": "date_asc",
                 },
             )
-            rr = r.json().get("results", [])
+            if r.status_code != 200:
+                raise HTTPException(502, f"orders/search failed seller={seller_id} offset={offset} status={r.status_code} body={r.text[:400]}")
+            try:
+                rr = r.json().get("results", [])
+            except Exception:
+                raise HTTPException(502, f"orders/search non-JSON seller={seller_id} offset={offset} status={r.status_code} ct={r.headers.get('content-type')} body={r.text[:400]}")
             if not rr:
                 break
             orders.extend(rr)
