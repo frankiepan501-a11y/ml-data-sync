@@ -383,19 +383,18 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
     headers = {"Authorization": f"Bearer {row['access_token']}"}
 
     async with httpx.AsyncClient(timeout=120) as client:
-        # 1. pull pack list (last N)
+        # 1. pull pack list (last N) — orders/search is critical; allow ONE 30s retry on 429
         packs: list[dict] = []
         offset = 0
         while len(packs) < recent_n:
             page_size = min(50, recent_n - len(packs))
-            r = await _ml_get(
-                client,
-                "https://api.mercadolibre.com/marketplace/orders/search",
-                headers,
-                {"seller": seller_id, "limit": page_size, "offset": offset, "sort": "date_desc"},
-            )
+            params = {"seller": seller_id, "limit": page_size, "offset": offset, "sort": "date_desc"}
+            r = await _ml_get(client, "https://api.mercadolibre.com/marketplace/orders/search", headers, params)
+            if r.status_code == 429:
+                await _asyncio.sleep(30)
+                r = await _ml_get(client, "https://api.mercadolibre.com/marketplace/orders/search", headers, params)
             if r.status_code != 200:
-                raise HTTPException(502, f"orders/search failed status={r.status_code} body={r.text[:300]}")
+                raise HTTPException(502, f"orders/search failed after retry status={r.status_code} body={r.text[:300]}")
             rr = r.json().get("results", [])
             if not rr:
                 break
