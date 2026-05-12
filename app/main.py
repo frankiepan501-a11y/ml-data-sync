@@ -308,11 +308,11 @@ async def _ml_get(client: httpx.AsyncClient, url: str, headers: dict, params: di
     for attempt in range(max_retries):
         r = await client.get(url, headers=headers, params=params)
         if r.status_code != 429:
-            await _asyncio.sleep(0.15)
+            await _asyncio.sleep(0.3)  # 300ms ~= 200 req/min, conservative
             return r
         retry_after = int(r.headers.get("Retry-After", "0") or "0")
-        wait = max(retry_after, 2 ** (attempt + 1))
-        await _asyncio.sleep(min(wait, 30))
+        wait = max(retry_after, 3 ** (attempt + 1))  # 3, 9, 27, 81, 243 s
+        await _asyncio.sleep(min(wait, 60))
     return r  # type: ignore[return-value]
 
 
