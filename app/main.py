@@ -402,7 +402,7 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
                 client,
                 "https://api.mercadolibre.com/marketplace/orders/search",
                 headers,
-                {"seller": seller_id, "limit": page_size, "offset": offset, "sort": "date_asc"},
+                {"seller": seller_id, "limit": page_size, "offset": offset, "sort": "date_desc"},
             )
             if r.status_code != 200:
                 raise HTTPException(502, f"orders/search failed status={r.status_code} body={r.text[:300]}")
@@ -462,6 +462,116 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
         "unique_skus": len(rows),
         "rows": rows,
         "_note": "Uses 'global_price' which is the listing price in USD; for actual paid amount per order use paid_amount + currency.",
+    }
+
+
+# ---------- M3 → Feishu Bitable writer ----------
+
+# Bitable target (created 2026-05-12)
+FEISHU_BASE_APP_TOKEN = os.getenv("FEISHU_BASE_APP_TOKEN", "WM3LbBr76aRqMys2of8c1dGInEb")
+FEISHU_BASE_TABLE_ID = os.getenv("FEISHU_BASE_TABLE_ID", "tbl09sRPkX35PDfU")
+
+# Map child seller_id → store option label (must match Bitable single-select option)
+SHOP_LABEL: dict[int, str] = {
+    1510203792: "ML CBT-自发货 (1510203792)",
+    1502236229: "ML CBT-FULL (1502236229)",
+    1407362838: "ML 本土1店 FUNLABDIRECTMX",
+    1436420028: "ML 本土2店 FUNLAB_MX",
+}
+
+
+async def _feishu_tenant_token() -> str:
+    app_id = os.getenv("FEISHU_APP_ID", "cli_a9f6ae86fce8dbd8")
+    app_secret = os.getenv("FEISHU_APP_SECRET", "")
+    if not app_secret:
+        raise HTTPException(500, "FEISHU_APP_SECRET not configured")
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(
+            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+            json={"app_id": app_id, "app_secret": app_secret},
+        )
+    if r.status_code != 200:
+        raise HTTPException(502, f"feishu auth failed: {r.text}")
+    return r.json()["tenant_access_token"]
+
+
+def _to_ms(date_str: str | None) -> int | None:
+    """ISO date string (YYYY-MM-DD or full ISO) → ms timestamp."""
+    if not date_str:
+        return None
+    try:
+        from datetime import datetime
+        s = date_str[:10]
+        return int(datetime.fromisoformat(s).timestamp() * 1000)
+    except Exception:
+        return None
+
+
+@app.post("/report/sync-feishu", dependencies=[Depends(require_service_token)])
+async def report_sync_feishu(
+    seller_id: int,
+    recent_n: int = 100,
+    parent_user_id: int = 1502520822,
+    period_label: str = "",
+):
+    """Pull recent N orders, aggregate by SKU, write to Feishu Bitable."""
+    if seller_id not in SHOP_LABEL:
+        raise HTTPException(400, f"unknown seller_id {seller_id}; allowed: {list(SHOP_LABEL.keys())}")
+    period = period_label or f"recent_{recent_n}"
+
+    agg = await _report_sku_recent_impl(seller_id, recent_n, parent_user_id)
+    rows = agg["rows"]
+    if not rows:
+        return {"status": "no_data", "agg": agg}
+
+    feishu_token = await _feishu_tenant_token()
+    import time as _t
+    pulled_at_ms = int(_t.time() * 1000)
+
+    records: list[dict] = []
+    for r in rows:
+        rev = r["revenue_total"]
+        cnt = r["orders_count"]
+        record: dict = {
+            "fields": {
+                "SKU": r["sku"],
+                "平台": "Mercado Libre",
+                "店铺": SHOP_LABEL[seller_id],
+                "周期": period,
+                "订单数": cnt,
+                "件数": r["units"],
+                "营收(USD)": round(rev, 2),
+                "客单价(USD)": round(rev / cnt, 2) if cnt else 0,
+                "商品标题": r.get("sample_title") or "",
+                "数据拉取时间": pulled_at_ms,
+            }
+        }
+        fs = _to_ms(r.get("first_seen"))
+        ls = _to_ms(r.get("last_seen"))
+        if fs:
+            record["fields"]["首次销售日"] = fs
+        if ls:
+            record["fields"]["最后销售日"] = ls
+        records.append(record)
+
+    # batch insert
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            f"https://open.feishu.cn/open-apis/bitable/v1/apps/{FEISHU_BASE_APP_TOKEN}/tables/{FEISHU_BASE_TABLE_ID}/records/batch_create",
+            headers={"Authorization": f"Bearer {feishu_token}", "Content-Type": "application/json"},
+            json={"records": records},
+        )
+    if r.status_code != 200 or r.json().get("code") != 0:
+        raise HTTPException(502, f"feishu write failed: {r.status_code} {r.text[:500]}")
+
+    return {
+        "status": "synced",
+        "seller_id": seller_id,
+        "shop": SHOP_LABEL[seller_id],
+        "period": period,
+        "rows_written": len(records),
+        "agg_summary": {k: agg[k] for k in ("packs_returned", "orders_with_detail", "unique_skus")},
+        "bitable_url": f"https://u1wpma3xuhr.feishu.cn/base/{FEISHU_BASE_APP_TOKEN}",
     }
 
 
