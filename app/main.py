@@ -241,6 +241,42 @@ async def admin_refresh_expiring(within_seconds: int = 1800):
 
 # ---------- M3 reporting ----------
 
+@app.get("/report/debug-orders-first-page", dependencies=[Depends(require_service_token)])
+async def debug_orders_first_page(
+    seller_id: int,
+    month: str,
+    parent_user_id: int = 1502520822,
+    limit: int = 5,
+):
+    """Pull just the first N orders for a seller in a month — to validate date filter actually works."""
+    row = await db.get_token(parent_user_id)
+    if not row:
+        raise HTTPException(404, "token not found")
+    yyyy, mm = [int(x) for x in month.split("-")]
+    date_from = f"{yyyy}-{mm:02d}-01T00:00:00.000-00:00"
+    dty, dtm = (yyyy + 1, 1) if mm == 12 else (yyyy, mm + 1)
+    date_to = f"{dty}-{dtm:02d}-01T00:00:00.000-00:00"
+
+    headers = {"Authorization": f"Bearer {row['access_token']}"}
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(
+            "https://api.mercadolibre.com/marketplace/orders/search",
+            headers=headers,
+            params={
+                "seller": seller_id,
+                "order.date_created.from": date_from,
+                "order.date_created.to": date_to,
+                "limit": limit,
+                "sort": "date_desc",
+            },
+        )
+    return {
+        "request_params": {"seller": seller_id, "date_from": date_from, "date_to": date_to, "limit": limit},
+        "status": r.status_code,
+        "ml_response": r.json() if r.status_code == 200 else r.text[:1000],
+    }
+
+
 async def _fetch_seller_items_with_sku(client: httpx.AsyncClient, headers: dict, seller_id: int) -> dict[str, dict]:
     """Return {item_id: {sku, title, price, currency, status}} for all of a seller's listings."""
     items: dict[str, dict] = {}
