@@ -89,16 +89,15 @@ async def oauth_callback(code: str | None = None, state: str | None = None, erro
     scope = data.get("scope")
     expires_in = data.get("expires_in")
 
-    # M1: dump full tokens to runtime logs (Zeabur owner-only) for retrieval
+    # M1 PoC: return tokens directly in response (will be replaced by SQLite persistence in M2)
     print(f"[OAUTH SUCCESS] user_id={user_id} scope={scope} expires_in={expires_in}", flush=True)
-    print(f"[OAUTH TOKEN_TYPE] {data.get('token_type')}", flush=True)
-    print(f"[OAUTH ACCESS_TOKEN] {data.get('access_token')}", flush=True)
-    print(f"[OAUTH REFRESH_TOKEN] {data.get('refresh_token')}", flush=True)
-
     return {
         "status": "success",
         "user_id": user_id,
         "scope": scope,
         "expires_in": expires_in,
-        "note": "Tokens stored server-side. You can close this page.",
+        "token_type": data.get("token_type"),
+        "access_token": data.get("access_token"),
+        "refresh_token": data.get("refresh_token"),
+        "note": "M1 PoC — tokens shown in response. Screenshot and send privately, then close this page. M2 will persist server-side.",
     }
