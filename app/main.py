@@ -361,20 +361,108 @@ async def _fetch_seller_items_with_sku(client: httpx.AsyncClient, headers: dict,
     return items
 
 
-@app.get("/report/sku-monthly", dependencies=[Depends(require_service_token)])
-async def report_sku_monthly(
+@app.get("/report/sku-recent", dependencies=[Depends(require_service_token)])
+async def report_sku_recent(
     seller_id: int,
-    month: str,
+    recent_n: int = 100,
     parent_user_id: int = 1502520822,
 ):
-    """SKU × month aggregation PoC. M3 debug mode: returns traceback on error."""
+    """SKU aggregation over the most recent N orders (fast PoC).
+
+    Strategy:
+      1. /marketplace/orders/search?seller=X&limit=N&sort=date_asc — pull recent pack list
+      2. For each pack: take inner orders[].id, fetch /marketplace/orders/{id} for date + amount + SKU
+      3. Aggregate by SKU: count + sum(paid_amount) + min/max date_created
+
+    Trade-off vs strict month filter: marketplace search doesn't accept date filter,
+    so true monthly aggregation requires full pagination (slow). M3.1 will fix this.
+    """
     import traceback
     try:
-        return await _report_sku_monthly_impl(seller_id, month, parent_user_id)
+        return await _report_sku_recent_impl(seller_id, recent_n, parent_user_id)
     except HTTPException:
         raise
     except Exception as e:
         return {"status": "error", "exc": type(e).__name__, "msg": str(e), "traceback": traceback.format_exc()}
+
+
+async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id: int):
+    row = await db.get_token(parent_user_id)
+    if not row:
+        raise HTTPException(404, "parent token not found in DB; seed first")
+    headers = {"Authorization": f"Bearer {row['access_token']}"}
+
+    async with httpx.AsyncClient(timeout=120) as client:
+        # 1. pull pack list (last N)
+        packs: list[dict] = []
+        offset = 0
+        while len(packs) < recent_n:
+            page_size = min(50, recent_n - len(packs))
+            r = await _ml_get(
+                client,
+                "https://api.mercadolibre.com/marketplace/orders/search",
+                headers,
+                {"seller": seller_id, "limit": page_size, "offset": offset, "sort": "date_asc"},
+            )
+            if r.status_code != 200:
+                raise HTTPException(502, f"orders/search failed status={r.status_code} body={r.text[:300]}")
+            rr = r.json().get("results", [])
+            if not rr:
+                break
+            packs.extend(rr)
+            if len(rr) < page_size:
+                break
+            offset += page_size
+
+        # 2. fetch detail for each inner order
+        order_details: list[dict] = []
+        for pack in packs:
+            for sub in (pack.get("orders") or []):
+                order_id = sub.get("id")
+                if not order_id:
+                    continue
+                rd = await _ml_get(client, f"https://api.mercadolibre.com/marketplace/orders/{order_id}", headers)
+                if rd.status_code == 200:
+                    order_details.append(rd.json())
+
+    # 3. aggregate by seller_sku
+    by_sku: dict[str, dict] = {}
+    for od in order_details:
+        for item in (od.get("order_items") or []):
+            it = item.get("item") or {}
+            sku = it.get("seller_sku") or it.get("seller_custom_field") or "(no_sku)"
+            currency = (it.get("global_price") or {}).get("currency") or "?"
+            amount = float((it.get("global_price") or {}).get("amount") or 0)
+            quantity = int(item.get("quantity") or 1)
+            cell = by_sku.setdefault(sku, {
+                "sku": sku,
+                "orders_count": 0,
+                "units": 0,
+                "revenue_total": 0.0,
+                "currency": currency,
+                "sample_title": it.get("title"),
+                "sample_item_id": it.get("id"),
+                "first_seen": None,
+                "last_seen": None,
+            })
+            cell["orders_count"] += 1
+            cell["units"] += quantity
+            cell["revenue_total"] += amount * quantity
+            dc = od.get("date_created", "")[:10]
+            if dc:
+                cell["first_seen"] = min(cell["first_seen"] or dc, dc)
+                cell["last_seen"] = max(cell["last_seen"] or dc, dc)
+
+    rows = sorted(by_sku.values(), key=lambda x: x["revenue_total"], reverse=True)
+    return {
+        "seller_id": seller_id,
+        "recent_n_requested": recent_n,
+        "packs_returned": len(packs),
+        "orders_with_detail": len(order_details),
+        "unique_skus": len(rows),
+        "rows": rows,
+        "_note": "Uses 'global_price' which is the listing price in USD; for actual paid amount per order use paid_amount + currency.",
+    }
 
 
 async def _report_sku_monthly_impl(seller_id: int, month: str, parent_user_id: int):
