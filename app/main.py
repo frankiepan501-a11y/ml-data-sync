@@ -288,13 +288,17 @@ async def report_sku_monthly(
     month: str,
     parent_user_id: int = 1502520822,
 ):
-    """SKU × month aggregation PoC.
+    """SKU × month aggregation PoC. M3 debug mode: returns traceback on error."""
+    import traceback
+    try:
+        return await _report_sku_monthly_impl(seller_id, month, parent_user_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        return {"status": "error", "exc": type(e).__name__, "msg": str(e), "traceback": traceback.format_exc()}
 
-    Args:
-        seller_id: child seller user_id (e.g. 1510203792 = CBT 自发货)
-        month: "YYYY-MM" (e.g. "2026-04")
-        parent_user_id: CBT parent user (default 1502520822, owner of token in DB)
-    """
+
+async def _report_sku_monthly_impl(seller_id: int, month: str, parent_user_id: int):
     row = await db.get_token(parent_user_id)
     if not row:
         raise HTTPException(404, "parent token not found in DB; seed first")
