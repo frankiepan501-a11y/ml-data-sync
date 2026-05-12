@@ -251,7 +251,13 @@ async def _fetch_seller_items_with_sku(client: httpx.AsyncClient, headers: dict,
             headers=headers,
             params={"limit": 50, "offset": offset},
         )
-        ids = r.json().get("results", [])
+        if r.status_code != 200:
+            raise HTTPException(502, f"items/search failed seller={seller_id} offset={offset} status={r.status_code} body={r.text[:300]}")
+        try:
+            data = r.json()
+        except Exception:
+            raise HTTPException(502, f"items/search non-JSON seller={seller_id} status={r.status_code} ct={r.headers.get('content-type')} body={r.text[:300]}")
+        ids = data.get("results", [])
         if not ids:
             break
         for item_id in ids:
