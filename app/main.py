@@ -299,21 +299,11 @@ async def debug_orders_first_page(
 import asyncio as _asyncio
 
 
-async def _ml_get(client: httpx.AsyncClient, url: str, headers: dict, params: dict | None = None, max_retries: int = 5) -> httpx.Response:
-    """httpx GET wrapper with 429-aware retry + sleep between calls.
-
-    - On 429: sleeps Retry-After (or exponential 2/4/8/16 s) and retries.
-    - Always sleeps 150 ms after the call to stay under ML's 1500 req/min.
-    """
-    for attempt in range(max_retries):
-        r = await client.get(url, headers=headers, params=params)
-        if r.status_code != 429:
-            await _asyncio.sleep(0.3)  # 300ms ~= 200 req/min, conservative
-            return r
-        retry_after = int(r.headers.get("Retry-After", "0") or "0")
-        wait = max(retry_after, 3 ** (attempt + 1))  # 3, 9, 27, 81, 243 s
-        await _asyncio.sleep(min(wait, 60))
-    return r  # type: ignore[return-value]
+async def _ml_get(client: httpx.AsyncClient, url: str, headers: dict, params: dict | None = None) -> httpx.Response:
+    """httpx GET wrapper. 1s sleep AFTER call (60 req/min). 429 → return immediately, caller skips."""
+    r = await client.get(url, headers=headers, params=params)
+    await _asyncio.sleep(1.0)
+    return r
 
 
 async def _fetch_seller_items_with_sku(client: httpx.AsyncClient, headers: dict, seller_id: int) -> dict[str, dict]:
@@ -416,6 +406,8 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
 
         # 2. fetch detail for each inner order
         order_details: list[dict] = []
+        skipped_429 = 0
+        skipped_other = 0
         for pack in packs:
             for sub in (pack.get("orders") or []):
                 order_id = sub.get("id")
@@ -424,6 +416,10 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
                 rd = await _ml_get(client, f"https://api.mercadolibre.com/marketplace/orders/{order_id}", headers)
                 if rd.status_code == 200:
                     order_details.append(rd.json())
+                elif rd.status_code == 429:
+                    skipped_429 += 1
+                else:
+                    skipped_other += 1
 
     # 3. aggregate by seller_sku
     by_sku: dict[str, dict] = {}
@@ -459,9 +455,11 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
         "recent_n_requested": recent_n,
         "packs_returned": len(packs),
         "orders_with_detail": len(order_details),
+        "skipped_429": skipped_429,
+        "skipped_other": skipped_other,
         "unique_skus": len(rows),
         "rows": rows,
-        "_note": "Uses 'global_price' which is the listing price in USD; for actual paid amount per order use paid_amount + currency.",
+        "_note": "1s/call rate limit, 429 skipped (no retry). Uses global_price (listing USD price).",
     }
 
 
