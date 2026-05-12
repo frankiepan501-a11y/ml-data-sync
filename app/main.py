@@ -237,3 +237,140 @@ async def admin_refresh_expiring(within_seconds: int = 1800):
         except HTTPException as e:
             results.append({"user_id": row["user_id"], "ok": False, "error": str(e.detail)})
     return {"checked": len(rows), "results": results}
+
+
+# ---------- M3 reporting ----------
+
+async def _fetch_seller_items_with_sku(client: httpx.AsyncClient, headers: dict, seller_id: int) -> dict[str, dict]:
+    """Return {item_id: {sku, title, price, currency, status}} for all of a seller's listings."""
+    items: dict[str, dict] = {}
+    offset = 0
+    while True:
+        r = await client.get(
+            f"https://api.mercadolibre.com/marketplace/users/{seller_id}/items/search",
+            headers=headers,
+            params={"limit": 50, "offset": offset},
+        )
+        ids = r.json().get("results", [])
+        if not ids:
+            break
+        for item_id in ids:
+            r2 = await client.get(
+                f"https://api.mercadolibre.com/items/{item_id}",
+                headers=headers,
+            )
+            if r2.status_code != 200:
+                items[item_id] = {"sku": "(item_403)", "title": None, "price": None}
+                continue
+            it = r2.json()
+            sku = it.get("seller_custom_field")
+            if not sku:
+                for a in (it.get("attributes") or []):
+                    if a.get("id") == "SELLER_SKU":
+                        sku = a.get("value_name") or a.get("value_id")
+                        break
+            items[item_id] = {
+                "sku": sku or "(no_sku)",
+                "title": it.get("title"),
+                "price": it.get("price"),
+                "currency_id": it.get("currency_id"),
+                "status": it.get("status"),
+            }
+        if len(ids) < 50:
+            break
+        offset += 50
+    return items
+
+
+@app.get("/report/sku-monthly", dependencies=[Depends(require_service_token)])
+async def report_sku_monthly(
+    seller_id: int,
+    month: str,
+    parent_user_id: int = 1502520822,
+):
+    """SKU × month aggregation PoC.
+
+    Args:
+        seller_id: child seller user_id (e.g. 1510203792 = CBT 自发货)
+        month: "YYYY-MM" (e.g. "2026-04")
+        parent_user_id: CBT parent user (default 1502520822, owner of token in DB)
+    """
+    row = await db.get_token(parent_user_id)
+    if not row:
+        raise HTTPException(404, "parent token not found in DB; seed first")
+    headers = {"Authorization": f"Bearer {row['access_token']}"}
+
+    yyyy, mm = month.split("-")
+    yyyy, mm = int(yyyy), int(mm)
+    date_from = f"{yyyy}-{mm:02d}-01T00:00:00.000-00:00"
+    date_to_year, date_to_month = (yyyy + 1, 1) if mm == 12 else (yyyy, mm + 1)
+    date_to = f"{date_to_year}-{date_to_month:02d}-01T00:00:00.000-00:00"
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        # 1. items SKU map
+        items_meta = await _fetch_seller_items_with_sku(client, headers, seller_id)
+
+        # 2. orders in month (marketplace endpoint)
+        orders: list[dict] = []
+        offset = 0
+        while True:
+            r = await client.get(
+                "https://api.mercadolibre.com/marketplace/orders/search",
+                headers=headers,
+                params={
+                    "seller": seller_id,
+                    "order.date_created.from": date_from,
+                    "order.date_created.to": date_to,
+                    "limit": 50,
+                    "offset": offset,
+                    "sort": "date_asc",
+                },
+            )
+            rr = r.json().get("results", [])
+            if not rr:
+                break
+            orders.extend(rr)
+            if len(rr) < 50:
+                break
+            offset += 50
+
+    # 3. aggregate by SKU
+    agg: dict[str, dict] = {}
+    untracked_items: dict[str, int] = {}
+    for o in orders:
+        for it in (o.get("config", {}).get("items") or []):
+            item_id = it.get("id")
+            meta = items_meta.get(item_id)
+            if not meta:
+                untracked_items[item_id] = untracked_items.get(item_id, 0) + 1
+                continue
+            sku = meta["sku"]
+            cell = agg.setdefault(sku, {
+                "sku": sku,
+                "orders_count": 0,
+                "list_price": meta.get("price"),
+                "currency_id": meta.get("currency_id"),
+                "sample_title": meta.get("title"),
+                "item_ids": set(),
+            })
+            cell["orders_count"] += 1
+            cell["item_ids"].add(item_id)
+
+    rows = []
+    for cell in agg.values():
+        item_ids = sorted(cell.pop("item_ids"))
+        cell["item_ids"] = item_ids
+        cell["estimated_revenue"] = (cell["orders_count"] * (cell.get("list_price") or 0))
+        rows.append(cell)
+    rows.sort(key=lambda x: x["orders_count"], reverse=True)
+
+    return {
+        "seller_id": seller_id,
+        "month": month,
+        "orders_total": len(orders),
+        "listings_total": len(items_meta),
+        "skus_with_orders": len(rows),
+        "untracked_items": untracked_items,
+        "rows": rows,
+        "_note": "estimated_revenue uses listing list_price × orders_count (rough). For exact revenue, fetch per-order detail (todo M3.1).",
+    }
