@@ -555,28 +555,35 @@ async def admin_process_webhook_queue(limit: int = 50, parent_user_id: int = 150
     results: list[dict] = []
     async with httpx.AsyncClient(timeout=30) as client:
         for ev in events:
-            topic = ev["topic"]
-            resource = ev["resource"]
+            topic = ev["topic"] or ""
+            resource = ev["resource"] or ""
+            # Decide URL + cache target by resource path (more robust than topic name)
+            # ML 2026 UI uses topics: items / marketplace_items / marketplace_questions /
+            #   marketplace_orders / marketplace_shipments / marketplace_orders_on_site / ...
+            # resource path is canonical (e.g. /orders/<id>, /items/<id>, /questions/<id>)
+            is_order = resource.startswith("/orders/") or "orders" in topic
+            is_item = resource.startswith("/items/") or topic == "items"
+            # For CBT parent token: orders need /marketplace prefix to be readable
             url = f"https://api.mercadolibre.com{resource}"
+            if is_order and "/marketplace/" not in url:
+                url = f"https://api.mercadolibre.com/marketplace{resource}"
             try:
-                # marketplace prefix for CBT parent token access
-                if topic in ("orders_v2", "marketplace_orders"):
-                    url = f"https://api.mercadolibre.com/marketplace{resource}"
                 r = await _ml_get(client, url, headers)
                 if r.status_code == 200:
                     detail = r.json()
-                    if topic in ("orders_v2", "marketplace_orders"):
+                    if is_order:
                         seller_id = ((detail.get("seller") or {}).get("id")
                                      or (detail.get("orders") or [{}])[0].get("seller", {}).get("id")
-                                     or 0)
+                                     or ev.get("user_id") or 0)
                         await db.cache_put_order(int(detail.get("id") or 0), int(seller_id or 0), detail)
-                    elif topic == "items":
+                    elif is_item:
                         await db.cache_put_item(detail.get("id"), detail)
+                    # other topics (questions/shipments/messages): payload not cached yet, just mark done
                     await db.mark_event_done(ev["id"])
-                    results.append({"id": ev["id"], "ok": True, "topic": topic})
+                    results.append({"id": ev["id"], "ok": True, "topic": topic, "resource": resource})
                 else:
                     await db.mark_event_failed(ev["id"], f"http {r.status_code}: {r.text[:200]}")
-                    results.append({"id": ev["id"], "ok": False, "http": r.status_code})
+                    results.append({"id": ev["id"], "ok": False, "http": r.status_code, "resource": resource})
             except Exception as e:
                 await db.mark_event_failed(ev["id"], f"{type(e).__name__}: {str(e)[:200]}")
                 results.append({"id": ev["id"], "ok": False, "error": str(e)[:100]})
