@@ -102,6 +102,13 @@ async def init_db() -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(SCHEMA)
         await db.commit()
+        # Defensive ALTER for existing tokens tables created before multi-app columns
+        cur = await db.execute("PRAGMA table_info(tokens)")
+        existing_cols = {row[1] for row in await cur.fetchall()}
+        for col_def in [("app_key", "TEXT"), ("store_label", "TEXT")]:
+            if col_def[0] not in existing_cols:
+                await db.execute(f"ALTER TABLE tokens ADD COLUMN {col_def[0]} {col_def[1]}")
+        await db.commit()
 
 
 async def upsert_token(
