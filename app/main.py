@@ -46,53 +46,78 @@ def health():
     return {"ok": True}
 
 
-@app.get("/oauth/authorize-url")
-def authorize_url(site: str = "CBT"):
-    """Build the ML OAuth authorization URL.
+from fastapi.responses import RedirectResponse, HTMLResponse
 
-    For CBT (Global Selling) accounts, use `site=CBT` (default) — the auth
-    domain MUST be `global-selling.mercadolibre.com` (no country suffix),
-    not `auth.mercadolibre.com.??`.
+
+@app.get("/oauth/start")
+async def oauth_start(app: str, label: str = ""):
+    """Self-serve OAuth kickoff — operators just click this link.
+
+    Looks up the ml_apps row by app_key, builds the correct ML authorization URL
+    (each account system has its own auth host), 302 redirects to ML login.
     """
-    site = site.upper()
-    if site == "CBT":
-        host = "global-selling.mercadolibre.com"
-    else:
-        tld_map = {
-            "MLM": "com.mx",
-            "MLA": "com.ar",
-            "MLB": "com.br",
-            "MLC": "cl",
-            "MCO": "com.co",
-        }
-        host = f"auth.mercadolibre.{tld_map.get(site, 'com.mx')}"
-
-    app_id = os.getenv("ML_APP_ID", "")
-    redirect = os.getenv("ML_REDIRECT_URI", "")
-    if not app_id or not redirect:
-        raise HTTPException(500, "ML_APP_ID or ML_REDIRECT_URI not configured")
+    app_row = await db.get_app(app)
+    if not app_row:
+        raise HTTPException(404, f"app_key '{app}' not registered. POST to /admin/apps first.")
     import urllib.parse
+    state = app  # state carries app_key back to callback
+    if label:
+        state = f"{app}|{label}"
     qs = urllib.parse.urlencode({
         "response_type": "code",
-        "client_id": app_id,
-        "redirect_uri": redirect,
+        "client_id": app_row["client_id"],
+        "redirect_uri": app_row["redirect_uri"],
+        "state": state,
         "scope": "offline_access read",
     })
-    return {"site": site, "host": host, "url": f"https://{host}/authorization?{qs}"}
+    url = f"https://{app_row['auth_host']}/authorization?{qs}"
+    return RedirectResponse(url=url, status_code=302)
+
+
+@app.get("/oauth/apps-page", response_class=HTMLResponse)
+async def oauth_apps_page():
+    """Minimal HTML page listing registered Apps with click-to-authorize links."""
+    apps = await db.list_apps()
+    rows_html = "\n".join(
+        f"<tr><td>{a['app_key']}</td><td>{a['app_name']}</td><td>{a['account_type']}</td>"
+        f"<td>{a['auth_host']}</td>"
+        f"<td><a href='/oauth/start?app={a['app_key']}'>授权该 App →</a></td></tr>"
+        for a in apps
+    )
+    return f"""<!DOCTYPE html><html><head><meta charset='utf-8'><title>ML 多店 OAuth 自助页</title>
+<style>body{{font-family:sans-serif;padding:20px;max-width:900px;margin:auto}}
+table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #ddd;padding:8px;text-align:left}}
+th{{background:#f4f4f4}}a{{color:#0066cc;text-decoration:none}}a:hover{{text-decoration:underline}}</style>
+</head><body><h1>ML 多店 OAuth 自助页</h1>
+<p>共 {len(apps)} 个 App。点最右侧链接即跳 ML 登录授权，自动写入服务端 tokens 表。</p>
+<table><thead><tr><th>app_key</th><th>App 名</th><th>账号体系</th><th>auth host</th><th>操作</th></tr></thead>
+<tbody>{rows_html}</tbody></table></body></html>"""
 
 
 # ---------- OAuth callback ----------
 
-async def _exchange_code(code: str) -> dict:
+async def _exchange_code(code: str, app_row: dict | None = None) -> dict:
+    """Exchange authorization code → tokens. If app_row given, use that App's credentials.
+
+    Fallback to legacy env vars (single-app mode) for backward compatibility.
+    """
+    if app_row:
+        client_id = app_row["client_id"]
+        client_secret = app_row["client_secret"]
+        redirect_uri = app_row["redirect_uri"]
+    else:
+        client_id = os.getenv("ML_APP_ID")
+        client_secret = os.getenv("ML_APP_SECRET")
+        redirect_uri = os.getenv("ML_REDIRECT_URI")
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(
             "https://api.mercadolibre.com/oauth/token",
             data={
                 "grant_type": "authorization_code",
-                "client_id": os.getenv("ML_APP_ID"),
-                "client_secret": os.getenv("ML_APP_SECRET"),
+                "client_id": client_id,
+                "client_secret": client_secret,
                 "code": code,
-                "redirect_uri": os.getenv("ML_REDIRECT_URI"),
+                "redirect_uri": redirect_uri,
             },
             headers={"Accept": "application/json"},
         )
@@ -117,7 +142,16 @@ async def oauth_callback(code: str | None = None, state: str | None = None, erro
     if not code:
         raise HTTPException(400, "missing code parameter")
 
-    data = await _exchange_code(code)
+    # state may carry "app_key" or "app_key|store_label"
+    app_key, store_label = None, None
+    if state:
+        if "|" in state:
+            app_key, store_label = state.split("|", 1)
+        else:
+            app_key = state
+
+    app_row = await db.get_app(app_key) if app_key else None
+    data = await _exchange_code(code, app_row=app_row)
     user_id = data.get("user_id")
     access_token = data.get("access_token")
     refresh_token = data.get("refresh_token")
@@ -128,6 +162,10 @@ async def oauth_callback(code: str | None = None, state: str | None = None, erro
     nickname = user_info.get("nickname")
     site_id = user_info.get("site_id")
 
+    # Default store_label from app_row if not provided in state
+    if not store_label and app_row:
+        store_label = app_row.get("store_label_default") or app_row.get("app_name")
+
     await db.upsert_token(
         user_id=user_id,
         access_token=access_token,
@@ -136,18 +174,22 @@ async def oauth_callback(code: str | None = None, state: str | None = None, erro
         scope=scope,
         nickname=nickname,
         site_id=site_id,
+        app_key=app_key,
+        store_label=store_label,
     )
-    print(f"[OAUTH STORED] user_id={user_id} nickname={nickname} site={site_id} has_refresh={bool(refresh_token)}", flush=True)
+    print(f"[OAUTH STORED] user_id={user_id} app_key={app_key} nickname={nickname} site={site_id} has_refresh={bool(refresh_token)}", flush=True)
 
     return {
         "status": "success",
         "user_id": user_id,
+        "app_key": app_key,
+        "store_label": store_label,
         "nickname": nickname,
         "site_id": site_id,
         "scope_has_offline_access": "offline_access" in (scope or ""),
         "has_refresh_token": bool(refresh_token),
         "expires_in": expires_in,
-        "note": "Token persisted server-side. You can close this page.",
+        "note": f"Token persisted as {store_label or nickname}. You can close this page.",
     }
 
 
@@ -504,6 +546,65 @@ async def admin_cache_stats():
     return await db.cache_stats()
 
 
+# ---------- ml_apps admin ----------
+
+@app.get("/admin/apps", dependencies=[Depends(require_service_token)])
+async def admin_list_apps():
+    apps = await db.list_apps()
+    return {"count": len(apps), "apps": [db.redact_app(a) for a in apps]}
+
+
+@app.post("/admin/apps", dependencies=[Depends(require_service_token)])
+async def admin_upsert_app(req: Request):
+    """Register or update an ML App config.
+
+    Body: {
+      "app_key": "local_mx_1",
+      "app_name": "Funlab Internal Data Sync · MX1",
+      "client_id": "1234567890123456",
+      "client_secret": "xxx",
+      "account_type": "local_mx",
+      "auth_host": "auth.mercadolibre.com.mx",   // optional, derived from account_type if absent
+      "store_label_default": "ML 本土1店 FUNLABDIRECTMX",
+      "redirect_uri": "https://ml-sync.zeabur.app/oauth/callback"  // optional, defaults to ML_REDIRECT_URI env
+    }
+    """
+    body = await req.json()
+    required = ("app_key", "app_name", "client_id", "client_secret", "account_type")
+    missing = [k for k in required if not body.get(k)]
+    if missing:
+        raise HTTPException(400, f"missing fields: {missing}")
+
+    # Sensible defaults for auth_host based on account_type
+    default_hosts = {
+        "cbt": "global-selling.mercadolibre.com",
+        "local_mx": "auth.mercadolibre.com.mx",
+        "local_br": "auth.mercadolivre.com.br",
+        "local_ar": "auth.mercadolibre.com.ar",
+        "local_cl": "auth.mercadolibre.cl",
+        "local_co": "auth.mercadolibre.com.co",
+        "local_pe": "auth.mercadolibre.com.pe",
+    }
+    auth_host = body.get("auth_host") or default_hosts.get(body["account_type"])
+    if not auth_host:
+        raise HTTPException(400, f"cannot infer auth_host for account_type={body['account_type']}; pass auth_host explicitly")
+    redirect_uri = body.get("redirect_uri") or os.getenv("ML_REDIRECT_URI") or "https://ml-sync.zeabur.app/oauth/callback"
+
+    await db.upsert_app(
+        app_key=body["app_key"],
+        app_name=body["app_name"],
+        client_id=str(body["client_id"]),
+        client_secret=body["client_secret"],
+        auth_host=auth_host,
+        redirect_uri=redirect_uri,
+        account_type=body["account_type"],
+        store_label_default=body.get("store_label_default"),
+    )
+    row = await db.get_app(body["app_key"])
+    return {"status": "saved", "app": db.redact_app(row) if row else None,
+            "next_step": f"Open https://ml-sync.zeabur.app/oauth/start?app={body['app_key']} in browser to authorize a seller account."}
+
+
 # ---------- Phase 2·① ML Webhook ----------
 
 @app.post("/webhook/ml")
@@ -519,10 +620,16 @@ async def webhook_ml(req: Request):
         body = await req.json()
     except Exception:
         raise HTTPException(400, "invalid JSON")
-    expected_app = os.getenv("ML_APP_ID")
-    if expected_app and str(body.get("application_id")) != expected_app:
-        # Drop foreign notifications quietly with 200 (so ML doesn't retry)
-        return {"status": "ignored", "reason": "wrong application_id"}
+    # Multi-app validation: accept if application_id matches ANY registered ml_apps row,
+    # OR the legacy single-App ML_APP_ID env (backward compat).
+    incoming_app_id = str(body.get("application_id") or "")
+    legacy_app_id = os.getenv("ML_APP_ID", "")
+    is_known = (incoming_app_id == legacy_app_id) if legacy_app_id else False
+    if not is_known and incoming_app_id:
+        app_row = await db.get_app_by_client_id(incoming_app_id)
+        is_known = bool(app_row)
+    if not is_known:
+        return {"status": "ignored", "reason": f"unknown application_id {incoming_app_id}"}
     is_new = await db.enqueue_event(body)
     return {"status": "queued" if is_new else "duplicate", "topic": body.get("topic"), "resource": body.get("resource")}
 

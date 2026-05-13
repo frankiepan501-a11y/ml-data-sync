@@ -18,8 +18,24 @@ DB_PATH = os.getenv("SQLITE_PATH", "/data/ml_sync.db")
 
 
 SCHEMA = """
+-- Multi-app registry (one row per ML App / account-system entry)
+CREATE TABLE IF NOT EXISTS ml_apps (
+    app_key             TEXT PRIMARY KEY,        -- human-readable: cbt / local_mx_1 / local_mx_2 / local_br / ...
+    app_name            TEXT NOT NULL,
+    client_id           TEXT NOT NULL,           -- ML APP_ID (numeric string)
+    client_secret       TEXT NOT NULL,
+    auth_host           TEXT NOT NULL,           -- e.g. global-selling.mercadolibre.com | auth.mercadolibre.com.mx | auth.mercadolivre.com.br
+    redirect_uri        TEXT NOT NULL,
+    account_type        TEXT NOT NULL,           -- cbt / local_mx / local_br / local_ar / ...
+    store_label_default TEXT,                    -- prefilled "ML CBT-自发货" etc.
+    created_at          INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS tokens (
     user_id       INTEGER PRIMARY KEY,
+    app_key       TEXT,                          -- FK → ml_apps.app_key (which App authorized this token)
+    store_label   TEXT,                          -- e.g. "ML 本土1店 FUNLABDIRECTMX"
     nickname      TEXT,
     site_id       TEXT,
     access_token  TEXT NOT NULL,
@@ -30,6 +46,7 @@ CREATE TABLE IF NOT EXISTS tokens (
     updated_at    INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tokens_expires_at ON tokens(expires_at);
+CREATE INDEX IF NOT EXISTS idx_tokens_app_key ON tokens(app_key);
 
 -- M3 / Phase 1·④: detail caches to avoid re-fetching ML API
 CREATE TABLE IF NOT EXISTS ml_order_cache (
@@ -95,6 +112,8 @@ async def upsert_token(
     scope: str | None = None,
     nickname: str | None = None,
     site_id: str | None = None,
+    app_key: str | None = None,
+    store_label: str | None = None,
 ) -> None:
     now = int(time.time())
     expires_at = now + int(expires_in)
@@ -102,10 +121,12 @@ async def upsert_token(
         await db.execute(
             """
             INSERT INTO tokens
-                (user_id, nickname, site_id, access_token, refresh_token,
+                (user_id, app_key, store_label, nickname, site_id, access_token, refresh_token,
                  expires_at, scope, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
+                app_key = COALESCE(excluded.app_key, tokens.app_key),
+                store_label = COALESCE(excluded.store_label, tokens.store_label),
                 nickname = COALESCE(excluded.nickname, tokens.nickname),
                 site_id = COALESCE(excluded.site_id, tokens.site_id),
                 access_token = excluded.access_token,
@@ -114,10 +135,72 @@ async def upsert_token(
                 scope = COALESCE(excluded.scope, tokens.scope),
                 updated_at = excluded.updated_at
             """,
-            (user_id, nickname, site_id, access_token, refresh_token,
+            (user_id, app_key, store_label, nickname, site_id, access_token, refresh_token,
              expires_at, scope, now, now),
         )
         await db.commit()
+
+
+# ---------- ml_apps registry ----------
+
+async def upsert_app(
+    app_key: str, app_name: str, client_id: str, client_secret: str,
+    auth_host: str, redirect_uri: str, account_type: str,
+    store_label_default: str | None = None,
+) -> None:
+    now = int(time.time())
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO ml_apps (app_key, app_name, client_id, client_secret, auth_host,
+                                 redirect_uri, account_type, store_label_default,
+                                 created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(app_key) DO UPDATE SET
+                app_name = excluded.app_name,
+                client_id = excluded.client_id,
+                client_secret = excluded.client_secret,
+                auth_host = excluded.auth_host,
+                redirect_uri = excluded.redirect_uri,
+                account_type = excluded.account_type,
+                store_label_default = excluded.store_label_default,
+                updated_at = excluded.updated_at
+            """,
+            (app_key, app_name, client_id, client_secret, auth_host, redirect_uri,
+             account_type, store_label_default, now, now),
+        )
+        await db.commit()
+
+
+async def get_app(app_key: str) -> dict[str, Any] | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM ml_apps WHERE app_key = ?", (app_key,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def get_app_by_client_id(client_id: str) -> dict[str, Any] | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM ml_apps WHERE client_id = ?", (client_id,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def list_apps() -> list[dict[str, Any]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM ml_apps ORDER BY app_key")
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+def redact_app(row: dict[str, Any]) -> dict[str, Any]:
+    """Strip client_secret from app row for safe listing."""
+    out = {k: v for k, v in row.items() if k != "client_secret"}
+    out["client_secret_set"] = bool(row.get("client_secret"))
+    return out
 
 
 async def get_token(user_id: int) -> dict[str, Any] | None:
