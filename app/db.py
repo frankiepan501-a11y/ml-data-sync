@@ -213,6 +213,18 @@ def redact_app(row: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+async def update_token_app_link(user_id: int, app_key: str, store_label: str | None = None) -> bool:
+    """Set/update app_key + store_label on an existing token row, without touching access_token."""
+    now = int(time.time())
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "UPDATE tokens SET app_key = ?, store_label = COALESCE(?, store_label), updated_at = ? WHERE user_id = ?",
+            (app_key, store_label, now, user_id),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+
+
 async def get_token(user_id: int) -> dict[str, Any] | None:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row

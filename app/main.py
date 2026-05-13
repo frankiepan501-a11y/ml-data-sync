@@ -267,6 +267,17 @@ async def admin_refresh_one(user_id: int):
     return {"status": "refreshed", "token": await _refresh_one(user_id)}
 
 
+@app.post("/admin/tokens/{user_id}/app-link", dependencies=[Depends(require_service_token)])
+async def admin_token_app_link(user_id: int, app_key: str, store_label: str | None = None):
+    """Link an existing token row to an ml_apps entry (sets app_key + store_label).
+    Useful for backfilling tokens that were stored before multi-app system."""
+    ok = await db.update_token_app_link(user_id, app_key, store_label)
+    if not ok:
+        raise HTTPException(404, f"token user_id={user_id} not found")
+    row = await db.get_token(user_id)
+    return {"status": "linked", "token": db.redact(row) if row else None}
+
+
 @app.post("/admin/refresh-expiring", dependencies=[Depends(require_service_token)])
 async def admin_refresh_expiring(within_seconds: int = 1800):
     """Refresh all tokens expiring within `within_seconds` (default 30 min).
