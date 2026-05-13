@@ -235,13 +235,24 @@ async def _refresh_one(user_id: int) -> dict:
     if not row.get("refresh_token"):
         raise HTTPException(400, f"user_id={user_id} has no refresh_token (re-authorize required)")
 
+    # Use the App's client_id/secret that originally minted this token (per app_key),
+    # falling back to env ML_APP_ID/SECRET for legacy tokens without app_key.
+    client_id = os.getenv("ML_APP_ID")
+    client_secret = os.getenv("ML_APP_SECRET")
+    app_key = row.get("app_key")
+    if app_key:
+        app_row = await db.get_app(app_key)
+        if app_row:
+            client_id = app_row["client_id"]
+            client_secret = app_row["client_secret"]
+
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(
             "https://api.mercadolibre.com/oauth/token",
             data={
                 "grant_type": "refresh_token",
-                "client_id": os.getenv("ML_APP_ID"),
-                "client_secret": os.getenv("ML_APP_SECRET"),
+                "client_id": client_id,
+                "client_secret": client_secret,
                 "refresh_token": row["refresh_token"],
             },
             headers={"Accept": "application/json"},
