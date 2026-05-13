@@ -221,6 +221,8 @@ async def admin_seed(req: Request):
         scope=body.get("scope"),
         nickname=body.get("nickname"),
         site_id=body.get("site_id"),
+        app_key=body.get("app_key"),
+        store_label=body.get("store_label"),
     )
     row = await db.get_token(int(body["user_id"]))
     return {"status": "seeded", "token": db.redact(row) if row else None}

@@ -443,6 +443,8 @@ def redact(token_row: dict[str, Any]) -> dict[str, Any]:
         return f"{s[:14]}...{s[-6:]}" if s and len(s) > 25 else s
     return {
         "user_id": token_row.get("user_id"),
+        "app_key": token_row.get("app_key"),
+        "store_label": token_row.get("store_label"),
         "nickname": token_row.get("nickname"),
         "site_id": token_row.get("site_id"),
         "access_token_preview": _preview(token_row.get("access_token")),
