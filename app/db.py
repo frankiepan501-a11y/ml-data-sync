@@ -46,7 +46,7 @@ CREATE TABLE IF NOT EXISTS tokens (
     updated_at    INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tokens_expires_at ON tokens(expires_at);
-CREATE INDEX IF NOT EXISTS idx_tokens_app_key ON tokens(app_key);
+-- idx_tokens_app_key created after ALTER (column may not exist on legacy schema)
 
 -- M3 / Phase 1·④: detail caches to avoid re-fetching ML API
 CREATE TABLE IF NOT EXISTS ml_order_cache (
@@ -108,6 +108,9 @@ async def init_db() -> None:
         for col_def in [("app_key", "TEXT"), ("store_label", "TEXT")]:
             if col_def[0] not in existing_cols:
                 await db.execute(f"ALTER TABLE tokens ADD COLUMN {col_def[0]} {col_def[1]}")
+        await db.commit()
+        # Now safe to create the app_key index (column guaranteed to exist)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_tokens_app_key ON tokens(app_key)")
         await db.commit()
 
 
