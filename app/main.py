@@ -504,6 +504,113 @@ async def admin_cache_stats():
     return await db.cache_stats()
 
 
+# ---------- Phase 2·① ML Webhook ----------
+
+@app.post("/webhook/ml")
+async def webhook_ml(req: Request):
+    """Receive ML notification, validate, enqueue, ACK 200 within ~500ms.
+
+    ML expects HTTP 200 quickly (≤500ms); otherwise retries up to 8 times in 1 hour
+    then marks as missed_feed. We must NOT process inline — just ACK + enqueue.
+
+    Auth: verifies application_id matches our configured ML_APP_ID.
+    """
+    try:
+        body = await req.json()
+    except Exception:
+        raise HTTPException(400, "invalid JSON")
+    expected_app = os.getenv("ML_APP_ID")
+    if expected_app and str(body.get("application_id")) != expected_app:
+        # Drop foreign notifications quietly with 200 (so ML doesn't retry)
+        return {"status": "ignored", "reason": "wrong application_id"}
+    is_new = await db.enqueue_event(body)
+    return {"status": "queued" if is_new else "duplicate", "topic": body.get("topic"), "resource": body.get("resource")}
+
+
+@app.get("/admin/event-queue-stats", dependencies=[Depends(require_service_token)])
+async def admin_event_queue_stats():
+    return await db.event_queue_stats()
+
+
+@app.post("/admin/process-webhook-queue", dependencies=[Depends(require_service_token)])
+async def admin_process_webhook_queue(limit: int = 50, parent_user_id: int = 1502520822):
+    """Drain up to `limit` pending events.
+
+    For each event:
+      - GET the resource URL with parent token
+      - On orders_v2: cache the order detail
+      - On items: cache the item detail
+      - Other topics currently just marked done (extend later)
+
+    Run via n8n cron every 5 minutes.
+    """
+    row = await db.get_token(parent_user_id)
+    if not row:
+        raise HTTPException(404, "parent token not found")
+    headers = {"Authorization": f"Bearer {row['access_token']}"}
+    events = await db.claim_pending_events(limit)
+    if not events:
+        return {"processed": 0, "events": []}
+
+    results: list[dict] = []
+    async with httpx.AsyncClient(timeout=30) as client:
+        for ev in events:
+            topic = ev["topic"]
+            resource = ev["resource"]
+            url = f"https://api.mercadolibre.com{resource}"
+            try:
+                # marketplace prefix for CBT parent token access
+                if topic in ("orders_v2", "marketplace_orders"):
+                    url = f"https://api.mercadolibre.com/marketplace{resource}"
+                r = await _ml_get(client, url, headers)
+                if r.status_code == 200:
+                    detail = r.json()
+                    if topic in ("orders_v2", "marketplace_orders"):
+                        seller_id = ((detail.get("seller") or {}).get("id")
+                                     or (detail.get("orders") or [{}])[0].get("seller", {}).get("id")
+                                     or 0)
+                        await db.cache_put_order(int(detail.get("id") or 0), int(seller_id or 0), detail)
+                    elif topic == "items":
+                        await db.cache_put_item(detail.get("id"), detail)
+                    await db.mark_event_done(ev["id"])
+                    results.append({"id": ev["id"], "ok": True, "topic": topic})
+                else:
+                    await db.mark_event_failed(ev["id"], f"http {r.status_code}: {r.text[:200]}")
+                    results.append({"id": ev["id"], "ok": False, "http": r.status_code})
+            except Exception as e:
+                await db.mark_event_failed(ev["id"], f"{type(e).__name__}: {str(e)[:200]}")
+                results.append({"id": ev["id"], "ok": False, "error": str(e)[:100]})
+
+    ok = sum(1 for r in results if r.get("ok"))
+    return {"processed": len(events), "ok": ok, "failed": len(events) - ok, "events": results}
+
+
+@app.post("/admin/missed-feeds", dependencies=[Depends(require_service_token)])
+async def admin_missed_feeds(parent_user_id: int = 1502520822):
+    """Backfill via ML missed_feeds endpoint — for events ML retried 8x without our 200.
+
+    Run daily via n8n cron.
+    """
+    row = await db.get_token(parent_user_id)
+    if not row:
+        raise HTTPException(404, "parent token not found")
+    headers = {"Authorization": f"Bearer {row['access_token']}"}
+    app_id = os.getenv("ML_APP_ID")
+    if not app_id:
+        raise HTTPException(500, "ML_APP_ID not configured")
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await _ml_get(client, f"https://api.mercadolibre.com/missed_feeds?app_id={app_id}", headers)
+    if r.status_code != 200:
+        raise HTTPException(r.status_code, f"missed_feeds failed: {r.text[:300]}")
+    missed = r.json() if isinstance(r.json(), list) else r.json().get("missed_feeds") or []
+    enqueued = 0
+    for n in missed:
+        if await db.enqueue_event(n):
+            enqueued += 1
+    return {"missed_total": len(missed), "newly_enqueued": enqueued}
+
+
 # ---------- M3 → Feishu Bitable writer ----------
 
 # Bitable target (created 2026-05-12)

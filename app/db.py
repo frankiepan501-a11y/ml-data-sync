@@ -57,6 +57,26 @@ CREATE TABLE IF NOT EXISTS ml_item_cache (
     payload         TEXT NOT NULL,
     fetched_at      INTEGER NOT NULL
 );
+
+-- Phase 2·①: ML webhook event queue (ACK-first pattern)
+CREATE TABLE IF NOT EXISTS ml_event_queue (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    topic           TEXT NOT NULL,
+    resource        TEXT NOT NULL,        -- e.g. /orders/2000016389286648
+    user_id         INTEGER,
+    application_id  INTEGER,
+    attempts        INTEGER,
+    sent_at         TEXT,
+    received_at     INTEGER NOT NULL,
+    raw             TEXT NOT NULL,        -- full notification JSON
+    status          TEXT NOT NULL DEFAULT 'pending',  -- pending / processing / done / failed
+    processed_at    INTEGER,
+    error           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_event_status ON ml_event_queue(status);
+CREATE INDEX IF NOT EXISTS idx_event_topic ON ml_event_queue(topic);
+-- idempotency: same resource + sent_at = duplicate notification
+CREATE UNIQUE INDEX IF NOT EXISTS uq_event_resource_sent ON ml_event_queue(resource, sent_at);
 """
 
 
@@ -234,6 +254,94 @@ async def cache_stats() -> dict[str, Any]:
         row1 = await (await db.execute("SELECT COUNT(*) FROM ml_order_cache")).fetchone()
         row2 = await (await db.execute("SELECT COUNT(*) FROM ml_item_cache")).fetchone()
     return {"orders_cached": row1[0] if row1 else 0, "items_cached": row2[0] if row2 else 0}
+
+
+# ---------- Phase 2·① webhook queue ----------
+
+async def enqueue_event(notification: dict[str, Any]) -> bool:
+    """Insert webhook notification into queue. Returns True if new, False if duplicate."""
+    import json as _j
+    now = int(time.time())
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                """
+                INSERT INTO ml_event_queue
+                    (topic, resource, user_id, application_id, attempts, sent_at,
+                     received_at, raw, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+                """,
+                (
+                    notification.get("topic", ""),
+                    notification.get("resource", ""),
+                    notification.get("user_id"),
+                    notification.get("application_id"),
+                    notification.get("attempts"),
+                    notification.get("sent"),
+                    now,
+                    _j.dumps(notification, ensure_ascii=False),
+                ),
+            )
+            await db.commit()
+            return True
+    except aiosqlite.IntegrityError:
+        # duplicate (same resource + sent_at) — ML retried, ignore
+        return False
+
+
+async def claim_pending_events(limit: int = 50) -> list[dict[str, Any]]:
+    """Atomically claim up to `limit` pending events (mark them 'processing')."""
+    now = int(time.time())
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT * FROM ml_event_queue WHERE status = 'pending' ORDER BY received_at LIMIT ?",
+            (limit,),
+        )
+        rows = [dict(r) for r in await cur.fetchall()]
+        if rows:
+            ids = [r["id"] for r in rows]
+            placeholders = ",".join("?" * len(ids))
+            await db.execute(
+                f"UPDATE ml_event_queue SET status = 'processing', processed_at = ? WHERE id IN ({placeholders})",
+                (now, *ids),
+            )
+            await db.commit()
+        return rows
+
+
+async def mark_event_done(event_id: int) -> None:
+    now = int(time.time())
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE ml_event_queue SET status = 'done', processed_at = ? WHERE id = ?",
+            (now, event_id),
+        )
+        await db.commit()
+
+
+async def mark_event_failed(event_id: int, error: str) -> None:
+    now = int(time.time())
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE ml_event_queue SET status = 'failed', processed_at = ?, error = ? WHERE id = ?",
+            (now, error[:500], event_id),
+        )
+        await db.commit()
+
+
+async def event_queue_stats() -> dict[str, Any]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT status, COUNT(*) FROM ml_event_queue GROUP BY status"
+        )
+        rows = await cur.fetchall()
+        cur2 = await db.execute("SELECT topic, COUNT(*) FROM ml_event_queue GROUP BY topic")
+        topic_rows = await cur2.fetchall()
+    return {
+        "by_status": {r[0]: r[1] for r in rows},
+        "by_topic": {r[0]: r[1] for r in topic_rows},
+    }
 
 
 def redact(token_row: dict[str, Any]) -> dict[str, Any]:
