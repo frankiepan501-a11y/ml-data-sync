@@ -297,13 +297,40 @@ async def debug_orders_first_page(
 
 
 import asyncio as _asyncio
+import random as _random
+from aiolimiter import AsyncLimiter
+
+# Token buckets per ML endpoint class.
+# ML real limits (researched 2026-05-13):
+#   /orders/search, /items/search  → 100 req/min  (hard wall, easy to hit)
+#   /items/{id}, /orders/{id}, /users/me, etc  → 1500 req/min
+#   /oauth/token refresh           → very strict (~2/hour); leave manual
+# Leave 20% headroom on each.
+_LIMIT_SEARCH = AsyncLimiter(80, 60)    # 80 / 60s
+_LIMIT_DETAIL = AsyncLimiter(1200, 60)  # 1200 / 60s
 
 
-async def _ml_get(client: httpx.AsyncClient, url: str, headers: dict, params: dict | None = None) -> httpx.Response:
-    """httpx GET wrapper. 1s sleep AFTER call (60 req/min). 429 → return immediately, caller skips."""
-    r = await client.get(url, headers=headers, params=params)
-    await _asyncio.sleep(1.0)
-    return r
+def _pick_bucket(url: str) -> AsyncLimiter:
+    if "/search" in url:
+        return _LIMIT_SEARCH
+    return _LIMIT_DETAIL
+
+
+async def _ml_get(client: httpx.AsyncClient, url: str, headers: dict, params: dict | None = None, max_retries: int = 4) -> httpx.Response:
+    """httpx GET with token-bucket rate limiting + Retry-After-aware exponential backoff."""
+    bucket = _pick_bucket(url)
+    last = None
+    for attempt in range(max_retries):
+        async with bucket:
+            r = await client.get(url, headers=headers, params=params)
+        last = r
+        if r.status_code != 429:
+            return r
+        retry_after = int(r.headers.get("Retry-After", "0") or "0")
+        # Retry-After honored if present, else exponential 2/4/8/16 + jitter, capped at 60
+        wait = retry_after if retry_after > 0 else min(60, (2 ** (attempt + 1)) + _random.uniform(0, 5))
+        await _asyncio.sleep(wait)
+    return last  # type: ignore[return-value]
 
 
 async def _fetch_seller_items_with_sku(client: httpx.AsyncClient, headers: dict, seller_id: int) -> dict[str, dict]:
