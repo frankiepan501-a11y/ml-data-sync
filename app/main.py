@@ -430,18 +430,27 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
                 break
             offset += page_size
 
-        # 2. fetch detail for each inner order
+        # 2. fetch detail for each inner order — with SQLite cache (Phase 1·④)
         order_details: list[dict] = []
         skipped_429 = 0
         skipped_other = 0
+        cache_hits = 0
         for pack in packs:
             for sub in (pack.get("orders") or []):
                 order_id = sub.get("id")
                 if not order_id:
                     continue
+                # Cache check first — order details are immutable once paid
+                cached = await db.cache_get_order(int(order_id))
+                if cached and cached.get("_payload"):
+                    order_details.append(cached["_payload"])
+                    cache_hits += 1
+                    continue
                 rd = await _ml_get(client, f"https://api.mercadolibre.com/marketplace/orders/{order_id}", headers)
                 if rd.status_code == 200:
-                    order_details.append(rd.json())
+                    detail = rd.json()
+                    order_details.append(detail)
+                    await db.cache_put_order(int(order_id), seller_id, detail)
                 elif rd.status_code == 429:
                     skipped_429 += 1
                 else:
@@ -481,12 +490,18 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
         "recent_n_requested": recent_n,
         "packs_returned": len(packs),
         "orders_with_detail": len(order_details),
+        "cache_hits": cache_hits,
         "skipped_429": skipped_429,
         "skipped_other": skipped_other,
         "unique_skus": len(rows),
         "rows": rows,
-        "_note": "1s/call rate limit, 429 skipped (no retry). Uses global_price (listing USD price).",
+        "_note": "Token bucket: 80/min search, 1200/min detail. Order details cached in SQLite. Uses global_price (listing USD).",
     }
+
+
+@app.get("/admin/cache-stats", dependencies=[Depends(require_service_token)])
+async def admin_cache_stats():
+    return await db.cache_stats()
 
 
 # ---------- M3 → Feishu Bitable writer ----------

@@ -30,6 +30,33 @@ CREATE TABLE IF NOT EXISTS tokens (
     updated_at    INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tokens_expires_at ON tokens(expires_at);
+
+-- M3 / Phase 1·④: detail caches to avoid re-fetching ML API
+CREATE TABLE IF NOT EXISTS ml_order_cache (
+    order_id        INTEGER PRIMARY KEY,
+    seller_id       INTEGER NOT NULL,
+    pack_id         INTEGER,
+    date_created    TEXT,           -- ISO string from ML
+    date_closed     TEXT,
+    paid_amount     REAL,
+    currency        TEXT,
+    payload         TEXT NOT NULL,  -- full ML JSON (for SKU + items)
+    fetched_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ml_order_cache_seller ON ml_order_cache(seller_id);
+CREATE INDEX IF NOT EXISTS idx_ml_order_cache_date ON ml_order_cache(date_created);
+
+CREATE TABLE IF NOT EXISTS ml_item_cache (
+    item_id         TEXT PRIMARY KEY,
+    seller_id       INTEGER,
+    sku             TEXT,
+    title           TEXT,
+    price           REAL,
+    currency        TEXT,
+    status          TEXT,
+    payload         TEXT NOT NULL,
+    fetched_at      INTEGER NOT NULL
+);
 """
 
 
@@ -100,6 +127,113 @@ async def list_expiring(within_seconds: int = 1800) -> list[dict[str, Any]]:
         )
         rows = await cur.fetchall()
         return [dict(r) for r in rows]
+
+
+async def cache_get_order(order_id: int) -> dict[str, Any] | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM ml_order_cache WHERE order_id = ?", (order_id,))
+        row = await cur.fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        try:
+            import json as _j
+            d["_payload"] = _j.loads(d.pop("payload"))
+        except Exception:
+            d["_payload"] = None
+        return d
+
+
+async def cache_put_order(order_id: int, seller_id: int, payload: dict[str, Any]) -> None:
+    import json as _j
+    now = int(time.time())
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO ml_order_cache (order_id, seller_id, pack_id, date_created, date_closed,
+                                        paid_amount, currency, payload, fetched_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(order_id) DO UPDATE SET
+                seller_id = excluded.seller_id,
+                pack_id = excluded.pack_id,
+                date_created = excluded.date_created,
+                date_closed = excluded.date_closed,
+                paid_amount = excluded.paid_amount,
+                currency = excluded.currency,
+                payload = excluded.payload,
+                fetched_at = excluded.fetched_at
+            """,
+            (
+                order_id, seller_id, payload.get("pack_id"),
+                payload.get("date_created"), payload.get("date_closed"),
+                payload.get("paid_amount"),
+                ((payload.get("order_items") or [{}])[0].get("currency_id")
+                 if payload.get("order_items") else None),
+                _j.dumps(payload, ensure_ascii=False),
+                now,
+            ),
+        )
+        await db.commit()
+
+
+async def cache_get_item(item_id: str) -> dict[str, Any] | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM ml_item_cache WHERE item_id = ?", (item_id,))
+        row = await cur.fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        try:
+            import json as _j
+            d["_payload"] = _j.loads(d.pop("payload"))
+        except Exception:
+            d["_payload"] = None
+        return d
+
+
+async def cache_put_item(item_id: str, payload: dict[str, Any]) -> None:
+    import json as _j
+    now = int(time.time())
+    sku = payload.get("seller_custom_field")
+    if not sku:
+        for a in (payload.get("attributes") or []):
+            if a.get("id") == "SELLER_SKU":
+                sku = a.get("value_name") or a.get("value_id")
+                break
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO ml_item_cache (item_id, seller_id, sku, title, price, currency,
+                                       status, payload, fetched_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(item_id) DO UPDATE SET
+                seller_id = excluded.seller_id,
+                sku = excluded.sku,
+                title = excluded.title,
+                price = excluded.price,
+                currency = excluded.currency,
+                status = excluded.status,
+                payload = excluded.payload,
+                fetched_at = excluded.fetched_at
+            """,
+            (
+                item_id, payload.get("seller_id"), sku,
+                payload.get("title"), payload.get("price"),
+                payload.get("currency_id"), payload.get("status"),
+                _j.dumps(payload, ensure_ascii=False),
+                now,
+            ),
+        )
+        await db.commit()
+
+
+async def cache_stats() -> dict[str, Any]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        row1 = await (await db.execute("SELECT COUNT(*) FROM ml_order_cache")).fetchone()
+        row2 = await (await db.execute("SELECT COUNT(*) FROM ml_item_cache")).fetchone()
+    return {"orders_cached": row1[0] if row1 else 0, "items_cached": row2[0] if row2 else 0}
 
 
 def redact(token_row: dict[str, Any]) -> dict[str, Any]:
