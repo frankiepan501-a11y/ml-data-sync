@@ -836,6 +836,7 @@ async def report_sync_feishu(
     for r in rows:
         rev = r["revenue_total"]
         cnt = r["orders_count"]
+        currency = r.get("currency") or "?"
         record: dict = {
             "fields": {
                 "SKU": r["sku"],
@@ -844,8 +845,9 @@ async def report_sync_feishu(
                 "周期": period,
                 "订单数": cnt,
                 "件数": r["units"],
-                "营收(USD)": round(rev, 2),
-                "客单价(USD)": round(rev / cnt, 2) if cnt else 0,
+                "币种": currency,
+                "营收(原币)": round(rev, 2),
+                "客单价(原币)": round(rev / cnt, 2) if cnt else 0,
                 "商品标题": r.get("sample_title") or "",
                 "数据拉取时间": pulled_at_ms,
             }
