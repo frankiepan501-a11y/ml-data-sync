@@ -978,9 +978,18 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
     order_shipments: list[tuple[int, int, int]] = []  # (shipment_id, seller_id, order_id)
     order_to_sku: dict[int, list[tuple[str, int]]] = {}  # order_id → [(sku, units), ...]
     refunds_by_order: dict[int, float] = {}  # order_id → total refunded amount in order currency
+    cancelled_count = 0
     for cr in cached_rows:
         od = cr.get("_payload") or {}
         order_id = int(od.get("id") or 0)
+        # Phase B2.1 fix: skip cancelled orders entirely. They have paid_amount=0
+        # but order_items still show quantity > 0 — including them inflates revenue
+        # and double-counts with the refund field. The cancelled order's
+        # transaction_amount_refunded is also in buyer currency (MXN for CBT),
+        # not seller currency, so it can't be reliably summed.
+        if od.get("status") == "cancelled":
+            cancelled_count += 1
+            continue
         order_items_skus: list[tuple[str, int]] = []
         for item in (od.get("order_items") or []):
             it = item.get("item") or {}
