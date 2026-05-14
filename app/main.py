@@ -475,6 +475,17 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
         raise HTTPException(404, "parent token not found in DB; seed first")
     headers = {"Authorization": f"Bearer {row['access_token']}"}
 
+    # CBT uses /marketplace/orders/... endpoints; local accounts use bare /orders/...
+    is_cbt = (row.get("app_key") == "cbt")
+    orders_search_url = (
+        "https://api.mercadolibre.com/marketplace/orders/search" if is_cbt
+        else "https://api.mercadolibre.com/orders/search"
+    )
+    orders_detail_prefix = (
+        "https://api.mercadolibre.com/marketplace/orders" if is_cbt
+        else "https://api.mercadolibre.com/orders"
+    )
+
     async with httpx.AsyncClient(timeout=120) as client:
         # 1. pull pack list (last N) — orders/search is critical; allow ONE 30s retry on 429
         packs: list[dict] = []
@@ -482,10 +493,10 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
         while len(packs) < recent_n:
             page_size = min(50, recent_n - len(packs))
             params = {"seller": seller_id, "limit": page_size, "offset": offset, "sort": "date_desc"}
-            r = await _ml_get(client, "https://api.mercadolibre.com/marketplace/orders/search", headers, params)
+            r = await _ml_get(client, orders_search_url, headers, params)
             if r.status_code == 429:
                 await _asyncio.sleep(30)
-                r = await _ml_get(client, "https://api.mercadolibre.com/marketplace/orders/search", headers, params)
+                r = await _ml_get(client, orders_search_url, headers, params)
             if r.status_code != 200:
                 raise HTTPException(502, f"orders/search failed after retry status={r.status_code} body={r.text[:300]}")
             rr = r.json().get("results", [])
@@ -502,7 +513,9 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
         skipped_other = 0
         cache_hits = 0
         for pack in packs:
-            for sub in (pack.get("orders") or []):
+            # CBT packs have inner `orders[]`; local search may return flat orders directly
+            inner = pack.get("orders") or [pack]
+            for sub in inner:
                 order_id = sub.get("id")
                 if not order_id:
                     continue
@@ -512,7 +525,7 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
                     order_details.append(cached["_payload"])
                     cache_hits += 1
                     continue
-                rd = await _ml_get(client, f"https://api.mercadolibre.com/marketplace/orders/{order_id}", headers)
+                rd = await _ml_get(client, f"{orders_detail_prefix}/{order_id}", headers)
                 if rd.status_code == 200:
                     detail = rd.json()
                     order_details.append(detail)
@@ -528,8 +541,14 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
         for item in (od.get("order_items") or []):
             it = item.get("item") or {}
             sku = it.get("seller_sku") or it.get("seller_custom_field") or "(no_sku)"
-            currency = (it.get("global_price") or {}).get("currency") or "?"
-            amount = float((it.get("global_price") or {}).get("amount") or 0)
+            # CBT exposes item.global_price={currency,amount}; local exposes order_item.{unit_price, currency_id}
+            gp = it.get("global_price") or {}
+            if gp:
+                currency = gp.get("currency") or "?"
+                amount = float(gp.get("amount") or 0)
+            else:
+                currency = item.get("currency_id") or od.get("currency_id") or "?"
+                amount = float(item.get("unit_price") or 0)
             quantity = int(item.get("quantity") or 1)
             cell = by_sku.setdefault(sku, {
                 "sku": sku,
