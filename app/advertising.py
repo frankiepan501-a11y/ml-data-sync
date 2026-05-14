@@ -44,9 +44,19 @@ TOKEN_USER_FOR_ADVERTISING: dict[int, int] = {
     2378517428: 2378517428,
 }
 
-# Currency advertiser bills in (per site_id).
+# Site_id used in the marketplace advertising endpoint URL path.
+# CBT-FULL advertiser registers under site=MLM (Mexico) since that's where it sells.
+# CBT-FULL ads are also billed in USD (not MXN like local MX).
+AD_SITE_BY_ADVERTISER: dict[int, str] = {
+    501915: "MLM",  # CBT-FULL, billed in USD (CBT is USD-denominated)
+    38602: "MLM",
+    380587: "MLM",
+    683851: "MLB",
+}
+
+# Currency advertiser bills in.
 AD_CURRENCY_BY_ADVERTISER: dict[int, str] = {
-    501915: "MXN",  # CBT-FULL advertiser, billed in MXN
+    501915: "USD",  # CBT-FULL — CBT advertiser bills in USD (verified 2026-05-14)
     38602: "MXN",
     380587: "MXN",
     683851: "BRL",
@@ -108,28 +118,41 @@ async def fetch_campaigns_for_month(advertiser_id: int, month: str, token_user_i
 async def fetch_ad_items_for_month(advertiser_id: int, month: str, token_user_id: int) -> list[dict]:
     """Return ad items list with metrics for the given month. 1-hour cached.
 
-    Endpoint: /advertising/advertisers/{id}/product_ads/items?date_from=...&date_to=...
-    Each item has: item_id (ML listing ID), title, campaign_id, metrics.cost,
-    metrics.clicks, metrics.prints.
+    Endpoint (Marketplace Advertising API v2):
+      GET /marketplace/advertising/{SITE}/advertisers/{id}/product_ads/ads/search
+      Headers: api-version: 2
+      Params: date_from, date_to, metrics, metrics_summary=true, limit, offset
 
-    Preferred over fetch_campaigns_for_month for SKU attribution: ML listing
-    item_id matches order_items[].item.id exactly, no name-regex needed.
+    Each result has item_id (ML listing ID, matches order_items[].item.id), title,
+    campaign_id, metrics.{cost,clicks,prints}.
+
+    Works uniformly for CBT advertisers (site=MLM, currency=USD) and local
+    advertisers (site=MLM/MLB, currency=MXN/BRL). Replaces deprecated
+    /advertising/advertisers/{id}/product_ads/items endpoint.
     """
     key = (advertiser_id, month)
     cached = _items_cache.get(key)
     if cached and cached.get("_expires_at", 0) > time.time():
         return cached["results"]
 
+    site = AD_SITE_BY_ADVERTISER.get(advertiser_id)
+    if not site:
+        return []
+
     row = await db.get_token(token_user_id)
     if not row:
         return []
-    headers = {"Authorization": f"Bearer {row['access_token']}"}
+    headers = {
+        "Authorization": f"Bearer {row['access_token']}",
+        "api-version": "2",
+    }
     date_from, date_to = _month_range(month)
-    url = f"https://api.mercadolibre.com/advertising/advertisers/{advertiser_id}/product_ads/items"
-    params = {
+    url = f"https://api.mercadolibre.com/marketplace/advertising/{site}/advertisers/{advertiser_id}/product_ads/ads/search"
+    params: dict[str, Any] = {
         "date_from": date_from,
         "date_to": date_to,
         "metrics": "cost,clicks,prints",
+        "metrics_summary": "true",
         "limit": 50,
         "offset": 0,
     }
