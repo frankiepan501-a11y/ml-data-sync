@@ -881,6 +881,111 @@ async def report_sync_feishu(
     }
 
 
+@app.post("/report/sync-feishu-monthly", dependencies=[Depends(require_service_token)])
+async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: str = ""):
+    """Aggregate seller_id's `month` orders FROM SQLite CACHE and write to Feishu.
+
+    Reads only from ml_order_cache — does NOT call ML. Pair with /admin/backfill-orders
+    for one-time historical filling, and rely on webhook + missed-feeds for ongoing freshness.
+
+    Args:
+      seller_id: ML child seller id (must be in SHOP_LABEL)
+      month: YYYY-MM
+      period_label: optional Feishu 周期 label; default = "month_{month}"
+    """
+    if seller_id not in SHOP_LABEL:
+        raise HTTPException(400, f"unknown seller_id {seller_id}; allowed: {list(SHOP_LABEL.keys())}")
+    period = period_label or f"month_{month}"
+
+    cached_rows = await db.cache_list_orders_for_month(seller_id, month)
+    if not cached_rows:
+        return {"status": "no_cache", "seller_id": seller_id, "month": month,
+                "hint": "Run /admin/backfill-orders to fill cache, or wait for webhook to populate."}
+
+    # Aggregate by SKU — mirrors _report_sku_recent_impl logic, dual-schema aware
+    by_sku: dict[str, dict] = {}
+    for cr in cached_rows:
+        od = cr.get("_payload") or {}
+        for item in (od.get("order_items") or []):
+            it = item.get("item") or {}
+            sku = it.get("seller_sku") or it.get("seller_custom_field") or "(no_sku)"
+            gp = it.get("global_price") or {}
+            if gp:
+                currency = gp.get("currency") or "?"
+                amount = float(gp.get("amount") or 0)
+            else:
+                currency = item.get("currency_id") or od.get("currency_id") or "?"
+                amount = float(item.get("unit_price") or 0)
+            quantity = int(item.get("quantity") or 1)
+            cell = by_sku.setdefault(sku, {
+                "sku": sku, "orders_count": 0, "units": 0, "revenue_total": 0.0,
+                "currency": currency, "sample_title": it.get("title"),
+                "first_seen": None, "last_seen": None,
+            })
+            cell["orders_count"] += 1
+            cell["units"] += quantity
+            cell["revenue_total"] += amount * quantity
+            dc = (od.get("date_created") or "")[:10]
+            if dc:
+                cell["first_seen"] = min(cell["first_seen"] or dc, dc)
+                cell["last_seen"] = max(cell["last_seen"] or dc, dc)
+
+    rows = sorted(by_sku.values(), key=lambda x: x["revenue_total"], reverse=True)
+    if not rows:
+        return {"status": "no_data", "seller_id": seller_id, "month": month,
+                "cached_orders": len(cached_rows)}
+
+    feishu_token = await _feishu_tenant_token()
+    import time as _t
+    pulled_at_ms = int(_t.time() * 1000)
+    records: list[dict] = []
+    for r in rows:
+        rev = r["revenue_total"]; cnt = r["orders_count"]
+        record: dict = {"fields": {
+            "SKU": r["sku"], "平台": "Mercado Libre", "店铺": SHOP_LABEL[seller_id],
+            "周期": period, "订单数": cnt, "件数": r["units"],
+            "币种": r.get("currency") or "?",
+            "营收(原币)": round(rev, 2),
+            "客单价(原币)": round(rev / cnt, 2) if cnt else 0,
+            "商品标题": r.get("sample_title") or "",
+            "数据拉取时间": pulled_at_ms,
+        }}
+        fs = _to_ms(r.get("first_seen")); ls = _to_ms(r.get("last_seen"))
+        if fs: record["fields"]["首次销售日"] = fs
+        if ls: record["fields"]["最后销售日"] = ls
+        records.append(record)
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            f"https://open.feishu.cn/open-apis/bitable/v1/apps/{FEISHU_BASE_APP_TOKEN}/tables/{FEISHU_BASE_TABLE_ID}/records/batch_create",
+            headers={"Authorization": f"Bearer {feishu_token}", "Content-Type": "application/json"},
+            json={"records": records},
+        )
+    if r.status_code != 200 or r.json().get("code") != 0:
+        raise HTTPException(502, f"feishu write failed: {r.status_code} {r.text[:500]}")
+
+    return {"status": "synced", "seller_id": seller_id, "shop": SHOP_LABEL[seller_id],
+            "month": month, "period": period, "rows_written": len(records),
+            "cached_orders_total": len(cached_rows), "unique_skus": len(rows),
+            "bitable_url": f"https://u1wpma3xuhr.feishu.cn/base/{FEISHU_BASE_APP_TOKEN}"}
+
+
+@app.post("/admin/backfill-orders", dependencies=[Depends(require_service_token)])
+async def admin_backfill_orders(seller_id: int, recent_n: int = 200, parent_user_id: int = 0):
+    """One-time historical fill: pull recent N orders into ml_order_cache, no Feishu write.
+
+    Useful for filling pre-webhook history before running /report/sync-feishu-monthly.
+    Reuses _report_sku_recent_impl which already caches detail responses.
+    """
+    parent = parent_user_id or seller_id
+    agg = await _report_sku_recent_impl(seller_id, recent_n, parent)
+    # Discard aggregation; the side-effect of cache_put_order is what we want.
+    return {"status": "backfilled", "seller_id": seller_id, "parent_user_id": parent,
+            "packs": agg.get("packs_returned"), "orders_with_detail": agg.get("orders_with_detail"),
+            "unique_skus": agg.get("unique_skus"),
+            "note": "Orders cached in SQLite. Now call /report/sync-feishu-monthly to write Feishu."}
+
+
 async def _report_sku_monthly_impl(seller_id: int, month: str, parent_user_id: int):
     row = await db.get_token(parent_user_id)
     if not row:

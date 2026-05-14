@@ -302,6 +302,24 @@ async def cache_put_order(order_id: int, seller_id: int, payload: dict[str, Any]
         await db.commit()
 
 
+async def cache_list_orders_for_month(seller_id: int, month: str) -> list[dict[str, Any]]:
+    """Return all cached orders for (seller_id, YYYY-MM). Each row has _payload dict."""
+    import json as _j
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT * FROM ml_order_cache WHERE seller_id = ? AND date_created LIKE ?",
+            (seller_id, f"{month}%"),
+        )
+        rows = [dict(r) for r in await cur.fetchall()]
+    for d in rows:
+        try:
+            d["_payload"] = _j.loads(d.pop("payload"))
+        except Exception:
+            d["_payload"] = None
+    return rows
+
+
 async def cache_get_item(item_id: str) -> dict[str, Any] | None:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
