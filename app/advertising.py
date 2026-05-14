@@ -67,11 +67,22 @@ _items_cache: dict[tuple[int, str], dict] = {}     # (advertiser_id, month) → 
 
 
 def _month_range(month: str) -> tuple[str, str]:
-    """YYYY-MM → (YYYY-MM-01, YYYY-MM-DD-last). e.g. 2026-05 → (2026-05-01, 2026-05-31)."""
+    """YYYY-MM → (YYYY-MM-01, YYYY-MM-DD-last), capped at today.
+
+    ML advertising endpoint silently returns 0 cost when date_to is in the future,
+    so we clamp date_to to today for the current month.
+    """
     import calendar
+    from datetime import date
     y, m = map(int, month.split("-"))
     last = calendar.monthrange(y, m)[1]
-    return f"{y}-{m:02d}-01", f"{y}-{m:02d}-{last:02d}"
+    date_from = f"{y}-{m:02d}-01"
+    today = date.today()
+    if y == today.year and m == today.month:
+        date_to = today.isoformat()
+    else:
+        date_to = f"{y}-{m:02d}-{last:02d}"
+    return date_from, date_to
 
 
 async def fetch_campaigns_for_month(advertiser_id: int, month: str, token_user_id: int) -> list[dict]:
