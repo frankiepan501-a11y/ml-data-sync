@@ -159,10 +159,13 @@ async def fetch_ad_items_for_month(advertiser_id: int, month: str, token_user_id
     }
     date_from, date_to = _month_range(month)
     url = f"https://api.mercadolibre.com/marketplace/advertising/{site}/advertisers/{advertiser_id}/product_ads/ads/search"
+    # Valid ML metrics (probed 2026-05-14): cost / clicks / prints / cpc / roas / acos
+    # / direct_amount / indirect_amount / total_amount.
+    # Invalid (do NOT include): units, orders, conversions, direct_units.
     params: dict[str, Any] = {
         "date_from": date_from,
         "date_to": date_to,
-        "metrics": "cost,clicks,prints",
+        "metrics": "cost,clicks,prints,direct_amount,indirect_amount,total_amount",
         "metrics_summary": "true",
         "limit": 50,
         "offset": 0,
@@ -186,48 +189,52 @@ async def fetch_ad_items_for_month(advertiser_id: int, month: str, token_user_id
     return all_results
 
 
-async def attribute_ad_cost_by_item_id(
+async def attribute_ad_metrics_by_item_id(
     ad_items: list[dict],
     item_id_to_sku: dict[str, str],
     token_user_id: int | None = None,
-) -> tuple[dict[str, float], float, list[str]]:
-    """Attribute per-item ad cost to SKUs via item_id mapping.
+) -> tuple[dict[str, dict[str, float]], dict[str, float], list[str]]:
+    """Attribute per-item ad METRICS (cost, clicks, prints, direct/indirect/total_amount)
+    to SKUs via item_id mapping.
 
-    item_id_to_sku comes from already-cached orders (order_items[].item.id → seller_sku).
-    For ad items whose item_id is NOT in the map (advertised but unsold this month),
-    try cache_get_item then ML /items/{id} to fetch its seller_sku. If still no SKU
-    found, the cost goes to `_unallocated_ads` bucket.
-
-    Returns (sku_cost, unallocated_cost, advertised_unsold_skus).
+    Returns:
+      sku_metrics: {sku: {cost, clicks, prints, direct_amount, indirect_amount, total_amount}}
+      unallocated_metrics: same shape for items with no SKU resolution
+      advertised_unsold: SKUs whose item_id was advertised but did not appear in cached orders
     """
-    sku_cost: dict[str, float] = {}
-    unallocated = 0.0
+    sku_metrics: dict[str, dict[str, float]] = {}
+    unallocated_metrics: dict[str, float] = {
+        "cost": 0.0, "clicks": 0.0, "prints": 0.0,
+        "direct_amount": 0.0, "indirect_amount": 0.0, "total_amount": 0.0,
+    }
     advertised_unsold: list[str] = []
 
-    # Lazy fetch ml /items/{id} for unknown item_ids — share an httpx client + token
     fetch_token: str | None = None
     if token_user_id:
         trow = await db.get_token(token_user_id)
         if trow:
             fetch_token = trow["access_token"]
 
+    def _add(target: dict[str, float], m: dict):
+        for k in ("cost", "clicks", "prints", "direct_amount", "indirect_amount", "total_amount"):
+            target[k] = target.get(k, 0.0) + float(m.get(k) or 0)
+
     async with httpx.AsyncClient(timeout=15) as client:
         for it in ad_items:
-            cost = float((it.get("metrics") or {}).get("cost") or 0)
-            if cost <= 0:
+            m = it.get("metrics") or {}
+            # Skip if no signal at all
+            if not any((m.get("cost"), m.get("clicks"), m.get("prints"), m.get("total_amount"))):
                 continue
             item_id = it.get("item_id")
             if not item_id:
-                unallocated += cost
+                _add(unallocated_metrics, m)
                 continue
             sku = item_id_to_sku.get(item_id)
             if not sku:
-                # Try item cache first
                 cached_item = await db.cache_get_item(item_id)
                 if cached_item and cached_item.get("sku"):
                     sku = cached_item["sku"]
                 elif fetch_token:
-                    # Fallback: fetch from ML
                     try:
                         r = await client.get(
                             f"https://api.mercadolibre.com/items/{item_id}",
@@ -246,13 +253,27 @@ async def attribute_ad_cost_by_item_id(
                     except Exception:
                         pass
             if sku:
-                sku_cost[sku] = sku_cost.get(sku, 0.0) + cost
+                cell = sku_metrics.setdefault(sku, {})
+                _add(cell, m)
                 if item_id not in item_id_to_sku:
                     advertised_unsold.append(sku)
             else:
-                unallocated += cost
+                _add(unallocated_metrics, m)
 
-    return sku_cost, unallocated, advertised_unsold
+    return sku_metrics, unallocated_metrics, advertised_unsold
+
+
+# Backward compat wrapper (still used by some flows internally; returns only cost dict)
+async def attribute_ad_cost_by_item_id(
+    ad_items: list[dict],
+    item_id_to_sku: dict[str, str],
+    token_user_id: int | None = None,
+) -> tuple[dict[str, float], float, list[str]]:
+    sku_m, unalloc_m, advert_unsold = await attribute_ad_metrics_by_item_id(
+        ad_items, item_id_to_sku, token_user_id
+    )
+    sku_cost = {k: v.get("cost", 0.0) for k, v in sku_m.items()}
+    return sku_cost, unalloc_m.get("cost", 0.0), advert_unsold
 
 
 def attribute_ad_cost_to_skus(campaigns: list[dict], known_skus: set[str]) -> tuple[dict[str, float], float]:

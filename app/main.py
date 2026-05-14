@@ -985,11 +985,10 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
     else:
         lingxing_error = None
 
-    # Phase B1.1: pull advertising at ITEM-level (item_id → cost), attribute to SKUs via
-    # already-built item_id_to_sku map from cached orders. Fallback to ML /items/{id} for
-    # advertised-but-unsold items.
-    ad_sku_cost: dict[str, float] = {}
-    ad_unallocated_cost = 0.0
+    # Phase B1.3: pull advertising at ITEM-level with full metrics dict
+    # (cost / clicks / prints / direct_amount / indirect_amount / total_amount).
+    ad_sku_metrics: dict[str, dict[str, float]] = {}
+    ad_unallocated_metrics: dict[str, float] = {}
     ad_advertised_unsold: list[str] = []
     ad_currency = "?"
     ad_advertiser_id = advertising.ADVERTISER_BY_SELLER.get(seller_id)
@@ -997,12 +996,15 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
     if ad_advertiser_id:
         try:
             ad_items = await advertising.fetch_ad_items_for_month(ad_advertiser_id, month, ad_token_user)
-            ad_sku_cost, ad_unallocated_cost, ad_advertised_unsold = await advertising.attribute_ad_cost_by_item_id(
+            ad_sku_metrics, ad_unallocated_metrics, ad_advertised_unsold = await advertising.attribute_ad_metrics_by_item_id(
                 ad_items, item_id_to_sku, token_user_id=ad_token_user
             )
             ad_currency = advertising.AD_CURRENCY_BY_ADVERTISER.get(ad_advertiser_id, "?")
         except Exception:
             pass
+    # Legacy view for backward-compat reporting fields
+    ad_sku_cost: dict[str, float] = {k: v.get("cost", 0.0) for k, v in ad_sku_metrics.items()}
+    ad_unallocated_cost = ad_unallocated_metrics.get("cost", 0.0)
 
     # VAT rate by site_id (from any cached order's currency context: MLM/MLB/CBT)
     # Use first cached row to infer site_id; CBT uses USD revenue but seller site is CBT
@@ -1025,8 +1027,17 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
     for r in rows:
         rev = r["revenue_total"]; cnt = r["orders_count"]
         currency = r.get("currency") or "?"
-        commission_local = r.get("commission_total") or 0  # sale_fee, seller currency
-        ad_cost_local = ad_sku_cost.get(r["sku"], 0.0)  # ads cost, advertiser currency (usually seller-side)
+        commission_local = r.get("commission_total") or 0
+        # Phase B1.3: pull full ad metrics dict for this SKU
+        ad_m = ad_sku_metrics.get(r["sku"], {})
+        ad_cost_local = ad_m.get("cost", 0.0)
+        ad_clicks = int(ad_m.get("clicks", 0))
+        ad_prints = int(ad_m.get("prints", 0))
+        ad_direct_local = ad_m.get("direct_amount", 0.0)
+        ad_total_local = ad_m.get("total_amount", 0.0)
+        ctr = (ad_clicks / ad_prints) if ad_prints else 0
+        cpc_local = (ad_cost_local / ad_clicks) if ad_clicks else 0
+        ml_roas = (ad_total_local / ad_cost_local) if ad_cost_local else 0
         vat_estimate_local = rev * vat_rate
         fields: dict = {
             "SKU": r["sku"], "平台": "Mercado Libre", "店铺": SHOP_LABEL[seller_id],
@@ -1037,22 +1048,35 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
             "ML佣金(原币)": round(commission_local, 2),
             "广告费(原币)": round(ad_cost_local, 2),
             "VAT估算(原币)": round(vat_estimate_local, 2),
+            "广告展示": ad_prints,
+            "广告点击": ad_clicks,
+            "CTR": round(ctr, 4),
+            "CPC(原币)": round(cpc_local, 4),
+            "广告直接销售(原币)": round(ad_direct_local, 2),
+            "ML ROAS": round(ml_roas, 2),
             "商品标题": r.get("sample_title") or "",
             "数据拉取时间": pulled_at_ms,
         }
-        # FX-aware RMB columns
         fx = fx_map.get(currency)
         if fx:
             fields["我的汇率"] = round(fx, 4)
             rev_rmb = rev * fx
             commission_rmb = commission_local * fx
-            ad_cost_rmb = ad_cost_local * fx  # ad cost in advertiser currency, assumed = seller currency (verified for MLM/MLB)
+            ad_cost_rmb = ad_cost_local * fx
             vat_rmb = vat_estimate_local * fx
+            ad_direct_rmb = ad_direct_local * fx
             fields["营收(RMB)"] = round(rev_rmb, 2)
             fields["ML佣金(RMB)"] = round(commission_rmb, 2)
             fields["广告费(RMB)"] = round(ad_cost_rmb, 2)
             fields["VAT估算(RMB)"] = round(vat_rmb, 2)
-            # cg_price from Lingxing (RMB, no FX needed)
+            # Phase B1.3 业务级指标
+            tacos = (ad_cost_rmb / rev_rmb) if rev_rmb else 0
+            natural_rmb = rev_rmb - ad_direct_rmb
+            natural_ratio = (natural_rmb / rev_rmb) if rev_rmb else 0
+            fields["TACOS"] = round(tacos, 4)
+            fields["自然销售(RMB)"] = round(natural_rmb, 2)
+            fields["自然销售占比"] = round(natural_ratio, 4)
+            # cg_price from Lingxing
             prod = products.get(r["sku"])
             if prod and prod.get("cg_price") is not None:
                 try:
@@ -1060,7 +1084,6 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
                     cost_rmb = cgp * r["units"]
                     fields["采购成本(RMB)"] = round(cost_rmb, 2)
                     fields["简易毛利(RMB)"] = round(rev_rmb - cost_rmb, 2)
-                    # Phase B1 全额毛利 = 简易毛利 - ML佣金 - 广告费 - VAT估算 (all RMB)
                     full_profit = rev_rmb - cost_rmb - commission_rmb - ad_cost_rmb - vat_rmb
                     fields["全额毛利(RMB)"] = round(full_profit, 2)
                 except (TypeError, ValueError):
@@ -1072,18 +1095,20 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
         if ls: fields["最后销售日"] = ls
         records.append({"fields": fields})
 
-    # Emit rows for advertised-but-unsold SKUs (SKUs in ad_sku_cost not in `rows`)
+    # Emit rows for advertised-but-unsold SKUs
     sold_skus = {r["sku"] for r in rows}
-    for sku, cost_local in ad_sku_cost.items():
+    for sku, m in ad_sku_metrics.items():
         if sku in sold_skus:
             continue
-        # Advertised this month but no sale. Compute ad-only row.
+        cost_local = m.get("cost", 0.0)
+        clicks = int(m.get("clicks", 0))
+        prints_ = int(m.get("prints", 0))
+        direct_local = m.get("direct_amount", 0.0)
+        total_local = m.get("total_amount", 0.0)
         fx_ad = fx_map.get(ad_currency) or 0
         cost_rmb = cost_local * fx_ad if fx_ad else 0
-        # Try to get product info for context
         prod = products.get(sku) or {}
-        title = prod.get("product_name") or f"(advertised but no sale)"
-        full_profit_rmb = -cost_rmb  # net loss equal to ad spend
+        title = prod.get("product_name") or "(advertised but no sale)"
         fields = {
             "SKU": sku,
             "平台": "Mercado Libre",
@@ -1093,10 +1118,16 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
             "币种": ad_currency,
             "营收(原币)": 0,
             "广告费(原币)": round(cost_local, 2),
+            "广告展示": prints_,
+            "广告点击": clicks,
+            "CTR": round(clicks / prints_, 4) if prints_ else 0,
+            "CPC(原币)": round(cost_local / clicks, 4) if clicks else 0,
+            "广告直接销售(原币)": round(direct_local, 2),
+            "ML ROAS": round(total_local / cost_local, 2) if cost_local else 0,
             "广告费(RMB)": round(cost_rmb, 2),
             "我的汇率": round(fx_ad, 4) if fx_ad else 0,
             "营收(RMB)": 0,
-            "全额毛利(RMB)": round(full_profit_rmb, 2),
+            "全额毛利(RMB)": round(-cost_rmb, 2),
             "商品标题": title,
             "数据拉取时间": pulled_at_ms,
         }
