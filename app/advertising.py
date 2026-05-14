@@ -221,10 +221,12 @@ async def fetch_ad_items_for_month(advertiser_id: int, month: str, token_user_id
         "offset": 0,
     }
     all_results: list[dict] = []
+    had_error = False
     async with httpx.AsyncClient(timeout=30) as client:
         while True:
             r = await client.get(url, headers=headers, params=params)
             if r.status_code != 200:
+                had_error = True
                 break
             data = r.json()
             results = data.get("results") or []
@@ -235,7 +237,10 @@ async def fetch_ad_items_for_month(advertiser_id: int, month: str, token_user_id
                 break
             params["offset"] += params["limit"]
 
-    _items_cache[key] = {"results": all_results, "_expires_at": time.time() + 3600}
+    # Only cache successful non-empty results. If ML rate-limited / 5xx,
+    # next call should retry rather than serve stale empty data.
+    if not had_error and all_results:
+        _items_cache[key] = {"results": all_results, "_expires_at": time.time() + 3600}
     return all_results
 
 
