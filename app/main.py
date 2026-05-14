@@ -931,6 +931,7 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
                 "hint": "Run /admin/backfill-orders to fill cache, or wait for webhook to populate."}
 
     # Aggregate by SKU — mirrors _report_sku_recent_impl logic, dual-schema aware
+    # Phase B1: also extract order_items[].sale_fee (ML commission in seller currency)
     by_sku: dict[str, dict] = {}
     for cr in cached_rows:
         od = cr.get("_payload") or {}
@@ -945,14 +946,17 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
                 currency = item.get("currency_id") or od.get("currency_id") or "?"
                 amount = float(item.get("unit_price") or 0)
             quantity = int(item.get("quantity") or 1)
+            sale_fee = float(item.get("sale_fee") or 0)  # ML commission per line item (seller currency)
             cell = by_sku.setdefault(sku, {
                 "sku": sku, "orders_count": 0, "units": 0, "revenue_total": 0.0,
+                "commission_total": 0.0,
                 "currency": currency, "sample_title": it.get("title"),
                 "first_seen": None, "last_seen": None,
             })
             cell["orders_count"] += 1
             cell["units"] += quantity
             cell["revenue_total"] += amount * quantity
+            cell["commission_total"] += sale_fee  # sale_fee is already per-line total
             dc = (od.get("date_created") or "")[:10]
             if dc:
                 cell["first_seen"] = min(cell["first_seen"] or dc, dc)
@@ -964,16 +968,43 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
                 "cached_orders": len(cached_rows)}
 
     # Enrich with Lingxing cost (cg_price) + monthly FX rate → compute RMB revenue/cost/profit
-    from app import lingxing
+    from app import lingxing, advertising
     try:
         products = await lingxing.fetch_all_products()
         fx_map = await lingxing.fetch_fx_rate(month)
     except Exception as e:
-        # If Lingxing fails, still write sales data; cost columns left blank
         products, fx_map = {}, {}
         lingxing_error = str(e)[:200]
     else:
         lingxing_error = None
+
+    # Phase B1: pull advertising spend for this seller's advertiser_id, attribute to SKUs by name
+    ad_sku_cost: dict[str, float] = {}
+    ad_unallocated_cost = 0.0
+    ad_currency = "?"
+    ad_advertiser_id = advertising.ADVERTISER_BY_SELLER.get(seller_id)
+    ad_token_user = advertising.TOKEN_USER_FOR_ADVERTISING.get(seller_id, seller_id)
+    if ad_advertiser_id:
+        try:
+            campaigns = await advertising.fetch_campaigns_for_month(ad_advertiser_id, month, ad_token_user)
+            known_skus = {r["sku"] for r in rows}
+            ad_sku_cost, ad_unallocated_cost = advertising.attribute_ad_cost_to_skus(campaigns, known_skus)
+            ad_currency = advertising.AD_CURRENCY_BY_ADVERTISER.get(ad_advertiser_id, "?")
+        except Exception:
+            pass
+
+    # VAT rate by site_id (from any cached order's currency context: MLM/MLB/CBT)
+    # Use first cached row to infer site_id; CBT uses USD revenue but seller site is CBT
+    site_id_for_vat = "?"
+    for cr in cached_rows:
+        site = ((cr.get("_payload") or {}).get("seller") or {}).get("site_id")
+        if not site:
+            # fallback to currency-based heuristic
+            cur = cr.get("currency") or (cr.get("_payload") or {}).get("currency_id")
+            site = {"USD": "CBT", "MXN": "MLM", "BRL": "MLB"}.get(cur, "?")
+        site_id_for_vat = site
+        break
+    vat_rate = advertising.vat_for_site(site_id_for_vat)
 
     feishu_token = await _feishu_tenant_token()
     import time as _t
@@ -983,12 +1014,18 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
     for r in rows:
         rev = r["revenue_total"]; cnt = r["orders_count"]
         currency = r.get("currency") or "?"
+        commission_local = r.get("commission_total") or 0  # sale_fee, seller currency
+        ad_cost_local = ad_sku_cost.get(r["sku"], 0.0)  # ads cost, advertiser currency (usually seller-side)
+        vat_estimate_local = rev * vat_rate
         fields: dict = {
             "SKU": r["sku"], "平台": "Mercado Libre", "店铺": SHOP_LABEL[seller_id],
             "周期": period, "订单数": cnt, "件数": r["units"],
             "币种": currency,
             "营收(原币)": round(rev, 2),
             "客单价(原币)": round(rev / cnt, 2) if cnt else 0,
+            "ML佣金(原币)": round(commission_local, 2),
+            "广告费(原币)": round(ad_cost_local, 2),
+            "VAT估算(原币)": round(vat_estimate_local, 2),
             "商品标题": r.get("sample_title") or "",
             "数据拉取时间": pulled_at_ms,
         }
@@ -997,7 +1034,13 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
         if fx:
             fields["我的汇率"] = round(fx, 4)
             rev_rmb = rev * fx
+            commission_rmb = commission_local * fx
+            ad_cost_rmb = ad_cost_local * fx  # ad cost in advertiser currency, assumed = seller currency (verified for MLM/MLB)
+            vat_rmb = vat_estimate_local * fx
             fields["营收(RMB)"] = round(rev_rmb, 2)
+            fields["ML佣金(RMB)"] = round(commission_rmb, 2)
+            fields["广告费(RMB)"] = round(ad_cost_rmb, 2)
+            fields["VAT估算(RMB)"] = round(vat_rmb, 2)
             # cg_price from Lingxing (RMB, no FX needed)
             prod = products.get(r["sku"])
             if prod and prod.get("cg_price") is not None:
@@ -1006,6 +1049,9 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
                     cost_rmb = cgp * r["units"]
                     fields["采购成本(RMB)"] = round(cost_rmb, 2)
                     fields["简易毛利(RMB)"] = round(rev_rmb - cost_rmb, 2)
+                    # Phase B1 全额毛利 = 简易毛利 - ML佣金 - 广告费 - VAT估算 (all RMB)
+                    full_profit = rev_rmb - cost_rmb - commission_rmb - ad_cost_rmb - vat_rmb
+                    fields["全额毛利(RMB)"] = round(full_profit, 2)
                 except (TypeError, ValueError):
                     skus_missing_cost.append(r["sku"])
             else:
@@ -1014,6 +1060,25 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
         if fs: fields["首次销售日"] = fs
         if ls: fields["最后销售日"] = ls
         records.append({"fields": fields})
+
+    # If unallocated ad spend > 0, emit a synthetic row
+    if ad_unallocated_cost > 0:
+        unalloc_fx = fx_map.get(ad_currency) or 0
+        unalloc_rmb = ad_unallocated_cost * unalloc_fx if unalloc_fx else 0
+        records.append({"fields": {
+            "SKU": "_unallocated_ads",
+            "平台": "Mercado Libre",
+            "店铺": SHOP_LABEL[seller_id],
+            "周期": period,
+            "订单数": 0, "件数": 0,
+            "币种": ad_currency,
+            "营收(原币)": 0,
+            "广告费(原币)": round(ad_unallocated_cost, 2),
+            "广告费(RMB)": round(unalloc_rmb, 2),
+            "我的汇率": round(unalloc_fx, 4) if unalloc_fx else 0,
+            "商品标题": "未归因广告花费 (campaign 名未含已知 SKU)",
+            "数据拉取时间": pulled_at_ms,
+        }})
 
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(
@@ -1030,6 +1095,12 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
             "lingxing_products_loaded": len(products),
             "lingxing_error": lingxing_error,
             "skus_missing_cost": skus_missing_cost,
+            "advertiser_id": ad_advertiser_id,
+            "ad_currency": ad_currency,
+            "ad_attributed_skus": len(ad_sku_cost),
+            "ad_unallocated_local": round(ad_unallocated_cost, 2),
+            "vat_rate": vat_rate,
+            "site_id_inferred": site_id_for_vat,
             "bitable_url": f"https://u1wpma3xuhr.feishu.cn/base/{FEISHU_BASE_APP_TOKEN}"}
 
 
