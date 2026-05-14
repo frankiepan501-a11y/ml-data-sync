@@ -308,20 +308,22 @@ async def admin_refresh_expiring(within_seconds: int = 1800):
 # ---------- M3 reporting ----------
 
 @app.get("/admin/raw-ml-get", dependencies=[Depends(require_service_token)])
-async def admin_raw_ml_get(user_id: int, path: str):
+async def admin_raw_ml_get(user_id: int, path: str, api_version: str | None = None):
     """Temporary probe: GET any ML endpoint with the given user_id's token.
+
+    api_version: optional, sent as 'Api-Version' / 'api-version' header. ML's marketplace
+    advertising endpoints require api-version: 2.
 
     Path examples (URL-encode the query):
       /billing/integration/periods?user_id=1510203792
-      /billing/integration/periods/key/{KEY}/group/ML/details
-      /advertising/advertisers/{id}/campaigns
-
-    Used for exploring billing/advertising API shapes during route B build-out.
+      /marketplace/advertising/MLM/advertisers/{id}/product_ads/campaigns/search
     """
     row = await db.get_token(user_id)
     if not row:
         raise HTTPException(404, f"token not found for user_id={user_id}")
     headers = {"Authorization": f"Bearer {row['access_token']}"}
+    if api_version:
+        headers["api-version"] = api_version
     if not path.startswith("/"):
         path = "/" + path
     url = f"https://api.mercadolibre.com{path}"
@@ -330,7 +332,7 @@ async def admin_raw_ml_get(user_id: int, path: str):
     return {
         "url": url,
         "status": r.status_code,
-        "body": r.text[:4000] if r.headers.get("content-type", "").startswith("application/json") else r.text[:1000],
+        "body": r.text[:6000] if r.headers.get("content-type", "").startswith("application/json") else r.text[:1500],
         "headers": {k: v for k, v in r.headers.items() if k.lower() in ("content-type", "x-request-id", "retry-after")},
     }
 
