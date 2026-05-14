@@ -307,6 +307,45 @@ async def admin_refresh_expiring(within_seconds: int = 1800):
 
 # ---------- M3 reporting ----------
 
+@app.get("/admin/debug-sku-cache", dependencies=[Depends(require_service_token)])
+async def admin_debug_sku_cache(seller_id: int, sku: str, month: str):
+    """Debug: list cached orders for a (seller, month) containing the given SKU,
+    showing per-order paid_amount, units, transaction_amount_refunded."""
+    cached_rows = await db.cache_list_orders_for_month(seller_id, month)
+    matches = []
+    for cr in cached_rows:
+        od = cr.get("_payload") or {}
+        for item in (od.get("order_items") or []):
+            it = item.get("item") or {}
+            sku_v = it.get("seller_sku") or it.get("seller_custom_field") or ""
+            if sku_v != sku:
+                continue
+            payments = od.get("payments") or []
+            matches.append({
+                "order_id": od.get("id"),
+                "date_created": od.get("date_created"),
+                "status": od.get("status"),
+                "paid_amount": od.get("paid_amount"),
+                "total_amount": od.get("total_amount"),
+                "currency_id": od.get("currency_id"),
+                "item_quantity": item.get("quantity"),
+                "unit_price": item.get("unit_price"),
+                "sale_fee": item.get("sale_fee"),
+                "shipping_id": (od.get("shipping") or {}).get("id"),
+                "payments_refunded": [p.get("transaction_amount_refunded") for p in payments],
+                "payments_transaction_amount": [p.get("transaction_amount") for p in payments],
+                "payments_status": [p.get("status") for p in payments],
+            })
+            break
+    total_refunded = sum(sum(m["payments_refunded"] or [0]) for m in matches)
+    return {
+        "seller_id": seller_id, "sku": sku, "month": month,
+        "matched_orders": len(matches),
+        "total_refunded_summed": total_refunded,
+        "orders": matches[:30],
+    }
+
+
 @app.get("/admin/raw-ml-get", dependencies=[Depends(require_service_token)])
 async def admin_raw_ml_get(user_id: int, path: str, api_version: str | None = None):
     """Temporary probe: GET any ML endpoint with the given user_id's token.
