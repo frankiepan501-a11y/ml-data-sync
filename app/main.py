@@ -307,6 +307,34 @@ async def admin_refresh_expiring(within_seconds: int = 1800):
 
 # ---------- M3 reporting ----------
 
+@app.get("/admin/raw-ml-get", dependencies=[Depends(require_service_token)])
+async def admin_raw_ml_get(user_id: int, path: str):
+    """Temporary probe: GET any ML endpoint with the given user_id's token.
+
+    Path examples (URL-encode the query):
+      /billing/integration/periods?user_id=1510203792
+      /billing/integration/periods/key/{KEY}/group/ML/details
+      /advertising/advertisers/{id}/campaigns
+
+    Used for exploring billing/advertising API shapes during route B build-out.
+    """
+    row = await db.get_token(user_id)
+    if not row:
+        raise HTTPException(404, f"token not found for user_id={user_id}")
+    headers = {"Authorization": f"Bearer {row['access_token']}"}
+    if not path.startswith("/"):
+        path = "/" + path
+    url = f"https://api.mercadolibre.com{path}"
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(url, headers=headers)
+    return {
+        "url": url,
+        "status": r.status_code,
+        "body": r.text[:4000] if r.headers.get("content-type", "").startswith("application/json") else r.text[:1000],
+        "headers": {k: v for k, v in r.headers.items() if k.lower() in ("content-type", "x-request-id", "retry-after")},
+    }
+
+
 @app.get("/report/debug-order-detail", dependencies=[Depends(require_service_token)])
 async def debug_order_detail(order_id: int, parent_user_id: int = 1502520822):
     """Fetch a single order's detailed schema via /marketplace/orders/{id} and /orders/{id}."""
