@@ -53,6 +53,7 @@ AD_CURRENCY_BY_ADVERTISER: dict[int, str] = {
 }
 
 _campaign_cache: dict[tuple[int, str], dict] = {}  # (advertiser_id, month) → {results, cached_at}
+_items_cache: dict[tuple[int, str], dict] = {}     # (advertiser_id, month) → {results, cached_at}
 
 
 def _month_range(month: str) -> tuple[str, str]:
@@ -104,13 +105,124 @@ async def fetch_campaigns_for_month(advertiser_id: int, month: str, token_user_i
     return all_results
 
 
-def attribute_ad_cost_to_skus(campaigns: list[dict], known_skus: set[str]) -> tuple[dict[str, float], float]:
-    """Attribute each campaign's cost to a SKU by word-match against campaign name.
+async def fetch_ad_items_for_month(advertiser_id: int, month: str, token_user_id: int) -> list[dict]:
+    """Return ad items list with metrics for the given month. 1-hour cached.
 
-    Returns (sku_to_cost, unallocated_cost). If a campaign name contains multiple
-    SKUs, splits cost equally among them. If no SKU matches, contributes to
-    unallocated_cost bucket.
+    Endpoint: /advertising/advertisers/{id}/product_ads/items?date_from=...&date_to=...
+    Each item has: item_id (ML listing ID), title, campaign_id, metrics.cost,
+    metrics.clicks, metrics.prints.
+
+    Preferred over fetch_campaigns_for_month for SKU attribution: ML listing
+    item_id matches order_items[].item.id exactly, no name-regex needed.
     """
+    key = (advertiser_id, month)
+    cached = _items_cache.get(key)
+    if cached and cached.get("_expires_at", 0) > time.time():
+        return cached["results"]
+
+    row = await db.get_token(token_user_id)
+    if not row:
+        return []
+    headers = {"Authorization": f"Bearer {row['access_token']}"}
+    date_from, date_to = _month_range(month)
+    url = f"https://api.mercadolibre.com/advertising/advertisers/{advertiser_id}/product_ads/items"
+    params = {
+        "date_from": date_from,
+        "date_to": date_to,
+        "metrics": "cost,clicks,prints",
+        "limit": 50,
+        "offset": 0,
+    }
+    all_results: list[dict] = []
+    async with httpx.AsyncClient(timeout=30) as client:
+        while True:
+            r = await client.get(url, headers=headers, params=params)
+            if r.status_code != 200:
+                break
+            data = r.json()
+            results = data.get("results") or []
+            all_results.extend(results)
+            paging = data.get("paging") or {}
+            total = int(paging.get("total") or 0)
+            if params["offset"] + len(results) >= total or not results:
+                break
+            params["offset"] += params["limit"]
+
+    _items_cache[key] = {"results": all_results, "_expires_at": time.time() + 3600}
+    return all_results
+
+
+async def attribute_ad_cost_by_item_id(
+    ad_items: list[dict],
+    item_id_to_sku: dict[str, str],
+    token_user_id: int | None = None,
+) -> tuple[dict[str, float], float, list[str]]:
+    """Attribute per-item ad cost to SKUs via item_id mapping.
+
+    item_id_to_sku comes from already-cached orders (order_items[].item.id → seller_sku).
+    For ad items whose item_id is NOT in the map (advertised but unsold this month),
+    try cache_get_item then ML /items/{id} to fetch its seller_sku. If still no SKU
+    found, the cost goes to `_unallocated_ads` bucket.
+
+    Returns (sku_cost, unallocated_cost, advertised_unsold_skus).
+    """
+    sku_cost: dict[str, float] = {}
+    unallocated = 0.0
+    advertised_unsold: list[str] = []
+
+    # Lazy fetch ml /items/{id} for unknown item_ids — share an httpx client + token
+    fetch_token: str | None = None
+    if token_user_id:
+        trow = await db.get_token(token_user_id)
+        if trow:
+            fetch_token = trow["access_token"]
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        for it in ad_items:
+            cost = float((it.get("metrics") or {}).get("cost") or 0)
+            if cost <= 0:
+                continue
+            item_id = it.get("item_id")
+            if not item_id:
+                unallocated += cost
+                continue
+            sku = item_id_to_sku.get(item_id)
+            if not sku:
+                # Try item cache first
+                cached_item = await db.cache_get_item(item_id)
+                if cached_item and cached_item.get("sku"):
+                    sku = cached_item["sku"]
+                elif fetch_token:
+                    # Fallback: fetch from ML
+                    try:
+                        r = await client.get(
+                            f"https://api.mercadolibre.com/items/{item_id}",
+                            headers={"Authorization": f"Bearer {fetch_token}"},
+                        )
+                        if r.status_code == 200:
+                            payload = r.json()
+                            sku = payload.get("seller_custom_field") or ""
+                            if not sku:
+                                for a in (payload.get("attributes") or []):
+                                    if a.get("id") == "SELLER_SKU":
+                                        sku = a.get("value_name") or a.get("value_id") or ""
+                                        break
+                            if sku:
+                                await db.cache_put_item(item_id, payload)
+                    except Exception:
+                        pass
+            if sku:
+                sku_cost[sku] = sku_cost.get(sku, 0.0) + cost
+                if item_id not in item_id_to_sku:
+                    advertised_unsold.append(sku)
+            else:
+                unallocated += cost
+
+    return sku_cost, unallocated, advertised_unsold
+
+
+def attribute_ad_cost_to_skus(campaigns: list[dict], known_skus: set[str]) -> tuple[dict[str, float], float]:
+    """[DEPRECATED — use attribute_ad_cost_by_item_id] Attribute campaign cost via name regex match."""
     sku_cost: dict[str, float] = {}
     unallocated = 0.0
     for c in campaigns:
@@ -118,7 +230,6 @@ def attribute_ad_cost_to_skus(campaigns: list[dict], known_skus: set[str]) -> tu
         if cost <= 0:
             continue
         name = c.get("name") or ""
-        # Find all known SKUs whose full identifier appears as a word boundary in name
         matched = [s for s in known_skus if re.search(rf"(?<![A-Za-z0-9]){re.escape(s)}(?![A-Za-z0-9])", name)]
         if not matched:
             unallocated += cost

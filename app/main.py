@@ -932,12 +932,17 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
 
     # Aggregate by SKU — mirrors _report_sku_recent_impl logic, dual-schema aware
     # Phase B1: also extract order_items[].sale_fee (ML commission in seller currency)
+    # Phase B1.1: also build item_id_to_sku map for downstream ad attribution
     by_sku: dict[str, dict] = {}
+    item_id_to_sku: dict[str, str] = {}
     for cr in cached_rows:
         od = cr.get("_payload") or {}
         for item in (od.get("order_items") or []):
             it = item.get("item") or {}
             sku = it.get("seller_sku") or it.get("seller_custom_field") or "(no_sku)"
+            ml_item_id = it.get("id")
+            if ml_item_id and sku and sku != "(no_sku)":
+                item_id_to_sku[ml_item_id] = sku
             gp = it.get("global_price") or {}
             if gp:
                 currency = gp.get("currency") or "?"
@@ -978,17 +983,21 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
     else:
         lingxing_error = None
 
-    # Phase B1: pull advertising spend for this seller's advertiser_id, attribute to SKUs by name
+    # Phase B1.1: pull advertising at ITEM-level (item_id → cost), attribute to SKUs via
+    # already-built item_id_to_sku map from cached orders. Fallback to ML /items/{id} for
+    # advertised-but-unsold items.
     ad_sku_cost: dict[str, float] = {}
     ad_unallocated_cost = 0.0
+    ad_advertised_unsold: list[str] = []
     ad_currency = "?"
     ad_advertiser_id = advertising.ADVERTISER_BY_SELLER.get(seller_id)
     ad_token_user = advertising.TOKEN_USER_FOR_ADVERTISING.get(seller_id, seller_id)
     if ad_advertiser_id:
         try:
-            campaigns = await advertising.fetch_campaigns_for_month(ad_advertiser_id, month, ad_token_user)
-            known_skus = {r["sku"] for r in rows}
-            ad_sku_cost, ad_unallocated_cost = advertising.attribute_ad_cost_to_skus(campaigns, known_skus)
+            ad_items = await advertising.fetch_ad_items_for_month(ad_advertiser_id, month, ad_token_user)
+            ad_sku_cost, ad_unallocated_cost, ad_advertised_unsold = await advertising.attribute_ad_cost_by_item_id(
+                ad_items, item_id_to_sku, token_user_id=ad_token_user
+            )
             ad_currency = advertising.AD_CURRENCY_BY_ADVERTISER.get(ad_advertiser_id, "?")
         except Exception:
             pass
@@ -1061,7 +1070,37 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
         if ls: fields["最后销售日"] = ls
         records.append({"fields": fields})
 
-    # If unallocated ad spend > 0, emit a synthetic row
+    # Emit rows for advertised-but-unsold SKUs (SKUs in ad_sku_cost not in `rows`)
+    sold_skus = {r["sku"] for r in rows}
+    for sku, cost_local in ad_sku_cost.items():
+        if sku in sold_skus:
+            continue
+        # Advertised this month but no sale. Compute ad-only row.
+        fx_ad = fx_map.get(ad_currency) or 0
+        cost_rmb = cost_local * fx_ad if fx_ad else 0
+        # Try to get product info for context
+        prod = products.get(sku) or {}
+        title = prod.get("product_name") or f"(advertised but no sale)"
+        full_profit_rmb = -cost_rmb  # net loss equal to ad spend
+        fields = {
+            "SKU": sku,
+            "平台": "Mercado Libre",
+            "店铺": SHOP_LABEL[seller_id],
+            "周期": period,
+            "订单数": 0, "件数": 0,
+            "币种": ad_currency,
+            "营收(原币)": 0,
+            "广告费(原币)": round(cost_local, 2),
+            "广告费(RMB)": round(cost_rmb, 2),
+            "我的汇率": round(fx_ad, 4) if fx_ad else 0,
+            "营收(RMB)": 0,
+            "全额毛利(RMB)": round(full_profit_rmb, 2),
+            "商品标题": title,
+            "数据拉取时间": pulled_at_ms,
+        }
+        records.append({"fields": fields})
+
+    # If unallocated ad spend > 0 (item_id missing from cache + ML lookup failed), emit synthetic row
     if ad_unallocated_cost > 0:
         unalloc_fx = fx_map.get(ad_currency) or 0
         unalloc_rmb = ad_unallocated_cost * unalloc_fx if unalloc_fx else 0
@@ -1076,7 +1115,8 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
             "广告费(原币)": round(ad_unallocated_cost, 2),
             "广告费(RMB)": round(unalloc_rmb, 2),
             "我的汇率": round(unalloc_fx, 4) if unalloc_fx else 0,
-            "商品标题": "未归因广告花费 (campaign 名未含已知 SKU)",
+            "全额毛利(RMB)": round(-unalloc_rmb, 2),
+            "商品标题": "未归因广告花费 (item_id 无 SKU)",
             "数据拉取时间": pulled_at_ms,
         }})
 
