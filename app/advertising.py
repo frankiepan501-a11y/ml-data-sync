@@ -44,6 +44,56 @@ TOKEN_USER_FOR_ADVERTISING: dict[int, int] = {
     2378517428: 2378517428,
 }
 
+# Visits API auth: which user_id's token to use for /users/{seller}/items_visits.
+# CBT sellers are NOT accessible via CBT parent token (403 forbidden — ML treats
+# child-seller visit data as private). Use the SAME seller_id's own token where
+# available, else map to a token that has access.
+VISITS_TOKEN_USER: dict[int, int | None] = {
+    1510203792: None,  # CBT 自发货 — no token covers, skip
+    1502236229: None,  # CBT-FULL — no token covers, skip
+    1407362838: 1407362838,
+    1436420028: 1436420028,
+    2378517428: 2378517428,
+}
+
+_visits_cache: dict[tuple[int, str], dict] = {}  # (seller_id, month) → {total, _expires_at}
+
+
+async def fetch_shop_visits_for_month(seller_id: int, month: str) -> int | None:
+    """Return total visits to this seller's listings for the given YYYY-MM. None if unavailable.
+
+    Endpoint: GET /users/{seller_id}/items_visits?date_from=YYYY-MM-01&date_to=YYYY-MM-DD
+    (date_to capped at today for current month — same convention as ads).
+
+    CBT sellers return 403. We pre-populate VISITS_TOKEN_USER with None for them
+    and skip the API call.
+    """
+    token_user = VISITS_TOKEN_USER.get(seller_id)
+    if not token_user:
+        return None
+    key = (seller_id, month)
+    cached = _visits_cache.get(key)
+    if cached and cached.get("_expires_at", 0) > time.time():
+        return cached.get("total")
+
+    row = await db.get_token(token_user)
+    if not row:
+        return None
+    headers = {"Authorization": f"Bearer {row['access_token']}"}
+    date_from, date_to = _month_range(month)
+    url = f"https://api.mercadolibre.com/users/{seller_id}/items_visits"
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            r = await client.get(url, headers=headers, params={"date_from": date_from, "date_to": date_to})
+            if r.status_code != 200:
+                return None
+            total = int((r.json() or {}).get("total_visits") or 0)
+        except Exception:
+            return None
+    _visits_cache[key] = {"total": total, "_expires_at": time.time() + 3600}
+    return total
+
+
 # Site_id used in the marketplace advertising endpoint URL path.
 # CBT-FULL advertiser registers under site=MLM (Mexico) since that's where it sells.
 # CBT-FULL ads are also billed in USD (not MXN like local MX).
@@ -165,7 +215,7 @@ async def fetch_ad_items_for_month(advertiser_id: int, month: str, token_user_id
     params: dict[str, Any] = {
         "date_from": date_from,
         "date_to": date_to,
-        "metrics": "cost,clicks,prints,direct_amount,indirect_amount,total_amount",
+        "metrics": "cost,clicks,prints,direct_amount,indirect_amount,total_amount,direct_items_quantity,indirect_items_quantity",
         "metrics_summary": "true",
         "limit": 50,
         "offset": 0,
@@ -206,6 +256,7 @@ async def attribute_ad_metrics_by_item_id(
     unallocated_metrics: dict[str, float] = {
         "cost": 0.0, "clicks": 0.0, "prints": 0.0,
         "direct_amount": 0.0, "indirect_amount": 0.0, "total_amount": 0.0,
+        "direct_items_quantity": 0.0, "indirect_items_quantity": 0.0,
     }
     advertised_unsold: list[str] = []
 
@@ -216,7 +267,9 @@ async def attribute_ad_metrics_by_item_id(
             fetch_token = trow["access_token"]
 
     def _add(target: dict[str, float], m: dict):
-        for k in ("cost", "clicks", "prints", "direct_amount", "indirect_amount", "total_amount"):
+        for k in ("cost", "clicks", "prints",
+                 "direct_amount", "indirect_amount", "total_amount",
+                 "direct_items_quantity", "indirect_items_quantity"):
             target[k] = target.get(k, 0.0) + float(m.get(k) or 0)
 
     async with httpx.AsyncClient(timeout=15) as client:

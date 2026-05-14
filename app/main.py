@@ -986,7 +986,6 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
         lingxing_error = None
 
     # Phase B1.3: pull advertising at ITEM-level with full metrics dict
-    # (cost / clicks / prints / direct_amount / indirect_amount / total_amount).
     ad_sku_metrics: dict[str, dict[str, float]] = {}
     ad_unallocated_metrics: dict[str, float] = {}
     ad_advertised_unsold: list[str] = []
@@ -1002,9 +1001,14 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
             ad_currency = advertising.AD_CURRENCY_BY_ADVERTISER.get(ad_advertiser_id, "?")
         except Exception:
             pass
-    # Legacy view for backward-compat reporting fields
     ad_sku_cost: dict[str, float] = {k: v.get("cost", 0.0) for k, v in ad_sku_metrics.items()}
     ad_unallocated_cost = ad_unallocated_metrics.get("cost", 0.0)
+
+    # Phase B1.4: pull shop-level visits (per ML user/items_visits endpoint).
+    # CBT sellers return 403 → None. Used to compute 整店 CVR = sum(件数) / 访客.
+    shop_visits = await advertising.fetch_shop_visits_for_month(seller_id, month)
+    total_units_in_shop = sum(r["units"] for r in rows)
+    shop_cvr = (total_units_in_shop / shop_visits) if (shop_visits and shop_visits > 0) else 0
 
     # VAT rate by site_id (from any cached order's currency context: MLM/MLB/CBT)
     # Use first cached row to infer site_id; CBT uses USD revenue but seller site is CBT
@@ -1035,9 +1039,13 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
         ad_prints = int(ad_m.get("prints", 0))
         ad_direct_local = ad_m.get("direct_amount", 0.0)
         ad_total_local = ad_m.get("total_amount", 0.0)
+        ad_direct_qty = int(ad_m.get("direct_items_quantity", 0))
+        ad_indirect_qty = int(ad_m.get("indirect_items_quantity", 0))
+        ad_attributed_qty = ad_direct_qty + ad_indirect_qty
         ctr = (ad_clicks / ad_prints) if ad_prints else 0
         cpc_local = (ad_cost_local / ad_clicks) if ad_clicks else 0
         ml_roas = (ad_total_local / ad_cost_local) if ad_cost_local else 0
+        ad_cvr = (ad_attributed_qty / ad_clicks) if ad_clicks else 0
         vat_estimate_local = rev * vat_rate
         fields: dict = {
             "SKU": r["sku"], "平台": "Mercado Libre", "店铺": SHOP_LABEL[seller_id],
@@ -1054,6 +1062,10 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
             "CPC(原币)": round(cpc_local, 4),
             "广告直接销售(原币)": round(ad_direct_local, 2),
             "ML ROAS": round(ml_roas, 2),
+            "广告归因件数": ad_attributed_qty,
+            "广告CVR": round(ad_cvr, 4),
+            "整店访客": int(shop_visits or 0),
+            "整店CVR": round(shop_cvr, 4),
             "商品标题": r.get("sample_title") or "",
             "数据拉取时间": pulled_at_ms,
         }
@@ -1153,7 +1165,33 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
             "数据拉取时间": pulled_at_ms,
         }})
 
+    # Idempotency: delete existing rows for (店铺, 周期) before inserting new.
+    # Use Bitable search API to find current shop+period records, then batch_delete.
+    shop_label = SHOP_LABEL[seller_id]
     async with httpx.AsyncClient(timeout=30) as client:
+        # Search existing records for this shop + period
+        existing_ids: list[str] = []
+        sr_url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{FEISHU_BASE_APP_TOKEN}/tables/{FEISHU_BASE_TABLE_ID}/records/search?page_size=500"
+        sr = await client.post(
+            sr_url,
+            headers={"Authorization": f"Bearer {feishu_token}", "Content-Type": "application/json"},
+            json={"filter": {"conjunction": "and", "conditions": [
+                {"field_name": "店铺", "operator": "is", "value": [shop_label]},
+                {"field_name": "周期", "operator": "is", "value": [period]},
+            ]}},
+        )
+        if sr.status_code == 200 and sr.json().get("code") == 0:
+            existing_ids = [it["record_id"] for it in (sr.json().get("data", {}).get("items") or [])]
+        if existing_ids:
+            dr = await client.post(
+                f"https://open.feishu.cn/open-apis/bitable/v1/apps/{FEISHU_BASE_APP_TOKEN}/tables/{FEISHU_BASE_TABLE_ID}/records/batch_delete",
+                headers={"Authorization": f"Bearer {feishu_token}", "Content-Type": "application/json"},
+                json={"records": existing_ids},
+            )
+            # Soft-fail on delete: if it errors we still insert and accept duplicate risk this run
+            _ = dr.status_code  # noqa: F841
+
+        # Insert fresh rows
         r = await client.post(
             f"https://open.feishu.cn/open-apis/bitable/v1/apps/{FEISHU_BASE_APP_TOKEN}/tables/{FEISHU_BASE_TABLE_ID}/records/batch_create",
             headers={"Authorization": f"Bearer {feishu_token}", "Content-Type": "application/json"},
@@ -1164,13 +1202,14 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
 
     return {"status": "synced", "seller_id": seller_id, "shop": SHOP_LABEL[seller_id],
             "month": month, "period": period, "rows_written": len(records),
+            "rows_replaced": len(existing_ids),
             "cached_orders_total": len(cached_rows), "unique_skus": len(rows),
             "lingxing_products_loaded": len(products),
             "lingxing_error": lingxing_error,
             "skus_missing_cost": skus_missing_cost,
             "advertiser_id": ad_advertiser_id,
             "ad_currency": ad_currency,
-            "ad_attributed_skus": len(ad_sku_cost),
+            "ad_attributed_skus": len(ad_sku_metrics),
             "ad_unallocated_local": round(ad_unallocated_cost, 2),
             "vat_rate": vat_rate,
             "site_id_inferred": site_id_for_vat,
