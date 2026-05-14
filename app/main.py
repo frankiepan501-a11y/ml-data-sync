@@ -932,13 +932,17 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
         return {"status": "no_cache", "seller_id": seller_id, "month": month,
                 "hint": "Run /admin/backfill-orders to fill cache, or wait for webhook to populate."}
 
-    # Aggregate by SKU — mirrors _report_sku_recent_impl logic, dual-schema aware
-    # Phase B1: also extract order_items[].sale_fee (ML commission in seller currency)
-    # Phase B1.1: also build item_id_to_sku map for downstream ad attribution
+    # Aggregate by SKU — Phase B2: also extract shipment_id + refund amount per order
     by_sku: dict[str, dict] = {}
     item_id_to_sku: dict[str, str] = {}
+    # Order-level shipment + refund data for later allocation
+    order_shipments: list[tuple[int, int, int]] = []  # (shipment_id, seller_id, order_id)
+    order_to_sku: dict[int, list[tuple[str, int]]] = {}  # order_id → [(sku, units), ...]
+    refunds_by_order: dict[int, float] = {}  # order_id → total refunded amount in order currency
     for cr in cached_rows:
         od = cr.get("_payload") or {}
+        order_id = int(od.get("id") or 0)
+        order_items_skus: list[tuple[str, int]] = []
         for item in (od.get("order_items") or []):
             it = item.get("item") or {}
             sku = it.get("seller_sku") or it.get("seller_custom_field") or "(no_sku)"
@@ -953,21 +957,34 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
                 currency = item.get("currency_id") or od.get("currency_id") or "?"
                 amount = float(item.get("unit_price") or 0)
             quantity = int(item.get("quantity") or 1)
-            sale_fee = float(item.get("sale_fee") or 0)  # ML commission per line item (seller currency)
+            sale_fee = float(item.get("sale_fee") or 0)
             cell = by_sku.setdefault(sku, {
                 "sku": sku, "orders_count": 0, "units": 0, "revenue_total": 0.0,
-                "commission_total": 0.0,
+                "commission_total": 0.0, "shipping_total": 0.0, "refund_total": 0.0, "refund_units": 0,
                 "currency": currency, "sample_title": it.get("title"),
                 "first_seen": None, "last_seen": None,
             })
             cell["orders_count"] += 1
             cell["units"] += quantity
             cell["revenue_total"] += amount * quantity
-            cell["commission_total"] += sale_fee  # sale_fee is already per-line total
+            cell["commission_total"] += sale_fee
+            order_items_skus.append((sku, quantity))
             dc = (od.get("date_created") or "")[:10]
             if dc:
                 cell["first_seen"] = min(cell["first_seen"] or dc, dc)
                 cell["last_seen"] = max(cell["last_seen"] or dc, dc)
+        # Shipment id (for shipping cost lookup)
+        ship = od.get("shipping") or {}
+        sid = ship.get("id")
+        if sid and order_id:
+            order_shipments.append((int(sid), seller_id, order_id))
+            order_to_sku[order_id] = order_items_skus
+        # Refund total (sum across payments)
+        refunded = 0.0
+        for p in (od.get("payments") or []):
+            refunded += float(p.get("transaction_amount_refunded") or 0)
+        if refunded > 0 and order_id:
+            refunds_by_order[order_id] = refunded
 
     rows = sorted(by_sku.values(), key=lambda x: x["revenue_total"], reverse=True)
     if not rows:
@@ -1010,6 +1027,46 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
     total_units_in_shop = sum(r["units"] for r in rows)
     shop_cvr = (total_units_in_shop / shop_visits) if (shop_visits and shop_visits > 0) else 0
 
+    # Phase B2: fetch shipping costs (cache-first) + allocate per SKU
+    # Each shipment.sender_cost is allocated to the order's SKUs by units share.
+    shipping_costs_fetched = 0
+    shipping_skipped = 0
+    if order_shipments:
+        from app import shipping
+        ship_token_user = shipping.SHIPPING_TOKEN_USER.get(seller_id, seller_id)
+        ship_results = await shipping.fetch_many_shipping_costs(order_shipments, ship_token_user, concurrency=5)
+        for sid, seller, oid in order_shipments:
+            r = ship_results.get(sid)
+            if not r:
+                shipping_skipped += 1
+                continue
+            shipping_costs_fetched += 1
+            sender_cost = r.get("sender_cost") or 0
+            sku_units = order_to_sku.get(oid) or []
+            total_units = sum(u for _, u in sku_units)
+            if total_units <= 0 or sender_cost <= 0:
+                continue
+            for sku, u in sku_units:
+                share = sender_cost * (u / total_units)
+                if sku in by_sku:
+                    by_sku[sku]["shipping_total"] = by_sku[sku].get("shipping_total", 0) + share
+
+    # Phase B2: allocate refunds per order to SKUs (by revenue share)
+    for oid, refund_amt in refunds_by_order.items():
+        sku_units = order_to_sku.get(oid) or []
+        if not sku_units:
+            continue
+        # refund is in the order's currency (USD for CBT, MXN for local MX, BRL for BR)
+        # Distribute proportional to SKU units in the order
+        total_units = sum(u for _, u in sku_units)
+        if total_units <= 0:
+            continue
+        for sku, u in sku_units:
+            share = refund_amt * (u / total_units)
+            if sku in by_sku:
+                by_sku[sku]["refund_total"] = by_sku[sku].get("refund_total", 0) + share
+                by_sku[sku]["refund_units"] = by_sku[sku].get("refund_units", 0) + u  # treat fully refunded as fully returned units
+
     # VAT rate by site_id (from any cached order's currency context: MLM/MLB/CBT)
     # Use first cached row to infer site_id; CBT uses USD revenue but seller site is CBT
     site_id_for_vat = "?"
@@ -1032,6 +1089,11 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
         rev = r["revenue_total"]; cnt = r["orders_count"]
         currency = r.get("currency") or "?"
         commission_local = r.get("commission_total") or 0
+        # Phase B2: shipping (seller cost) + refunds, both in seller currency
+        shipping_local = r.get("shipping_total") or 0
+        refund_local = r.get("refund_total") or 0
+        refund_units = int(r.get("refund_units") or 0)
+        refund_rate = (refund_units / r["units"]) if r["units"] else 0
         # Phase B1.3: pull full ad metrics dict for this SKU
         ad_m = ad_sku_metrics.get(r["sku"], {})
         ad_cost_local = ad_m.get("cost", 0.0)
@@ -1056,6 +1118,9 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
             "ML佣金(原币)": round(commission_local, 2),
             "广告费(原币)": round(ad_cost_local, 2),
             "VAT估算(原币)": round(vat_estimate_local, 2),
+            "物流费(原币)": round(shipping_local, 2),
+            "退款金额(原币)": round(refund_local, 2),
+            "退款率": round(refund_rate, 4),
             "广告展示": ad_prints,
             "广告点击": ad_clicks,
             "CTR": round(ctr, 4),
@@ -1077,10 +1142,14 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
             ad_cost_rmb = ad_cost_local * fx
             vat_rmb = vat_estimate_local * fx
             ad_direct_rmb = ad_direct_local * fx
+            shipping_rmb = shipping_local * fx
+            refund_rmb = refund_local * fx
             fields["营收(RMB)"] = round(rev_rmb, 2)
             fields["ML佣金(RMB)"] = round(commission_rmb, 2)
             fields["广告费(RMB)"] = round(ad_cost_rmb, 2)
             fields["VAT估算(RMB)"] = round(vat_rmb, 2)
+            fields["物流费(RMB)"] = round(shipping_rmb, 2)
+            fields["退款金额(RMB)"] = round(refund_rmb, 2)
             # Phase B1.3 业务级指标
             tacos = (ad_cost_rmb / rev_rmb) if rev_rmb else 0
             natural_rmb = rev_rmb - ad_direct_rmb
@@ -1096,7 +1165,9 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
                     cost_rmb = cgp * r["units"]
                     fields["采购成本(RMB)"] = round(cost_rmb, 2)
                     fields["简易毛利(RMB)"] = round(rev_rmb - cost_rmb, 2)
-                    full_profit = rev_rmb - cost_rmb - commission_rmb - ad_cost_rmb - vat_rmb
+                    # Phase B2: full profit = 营收 - 采购 - 佣金 - 广告 - VAT - 物流 - 退款
+                    full_profit = (rev_rmb - cost_rmb - commission_rmb - ad_cost_rmb
+                                   - vat_rmb - shipping_rmb - refund_rmb)
                     fields["全额毛利(RMB)"] = round(full_profit, 2)
                 except (TypeError, ValueError):
                     skus_missing_cost.append(r["sku"])

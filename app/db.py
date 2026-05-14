@@ -63,6 +63,19 @@ CREATE TABLE IF NOT EXISTS ml_order_cache (
 CREATE INDEX IF NOT EXISTS idx_ml_order_cache_seller ON ml_order_cache(seller_id);
 CREATE INDEX IF NOT EXISTS idx_ml_order_cache_date ON ml_order_cache(date_created);
 
+CREATE TABLE IF NOT EXISTS ml_shipping_cache (
+    shipment_id     INTEGER PRIMARY KEY,
+    seller_id       INTEGER,
+    order_id        INTEGER,
+    sender_cost     REAL,             -- seller actual logistics cost
+    gross_amount    REAL,
+    currency        TEXT,
+    payload         TEXT NOT NULL,
+    fetched_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ml_shipping_seller ON ml_shipping_cache(seller_id);
+CREATE INDEX IF NOT EXISTS idx_ml_shipping_order ON ml_shipping_cache(order_id);
+
 CREATE TABLE IF NOT EXISTS ml_item_cache (
     item_id         TEXT PRIMARY KEY,
     seller_id       INTEGER,
@@ -298,6 +311,48 @@ async def cache_put_order(order_id: int, seller_id: int, payload: dict[str, Any]
                 _j.dumps(payload, ensure_ascii=False),
                 now,
             ),
+        )
+        await db.commit()
+
+
+async def cache_get_shipping(shipment_id: int) -> dict[str, Any] | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM ml_shipping_cache WHERE shipment_id = ?", (shipment_id,))
+        row = await cur.fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        import json as _j
+        try:
+            d["_payload"] = _j.loads(d.pop("payload"))
+        except Exception:
+            d["_payload"] = None
+        return d
+
+
+async def cache_put_shipping(shipment_id: int, seller_id: int, order_id: int,
+                              sender_cost: float, gross_amount: float, currency: str,
+                              payload: dict[str, Any]) -> None:
+    import json as _j
+    now = int(time.time())
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO ml_shipping_cache (shipment_id, seller_id, order_id, sender_cost,
+                                            gross_amount, currency, payload, fetched_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(shipment_id) DO UPDATE SET
+                seller_id = excluded.seller_id,
+                order_id = excluded.order_id,
+                sender_cost = excluded.sender_cost,
+                gross_amount = excluded.gross_amount,
+                currency = excluded.currency,
+                payload = excluded.payload,
+                fetched_at = excluded.fetched_at
+            """,
+            (shipment_id, seller_id, order_id, sender_cost, gross_amount, currency,
+             _j.dumps(payload, ensure_ascii=False), now),
         )
         await db.commit()
 
