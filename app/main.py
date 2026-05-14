@@ -1165,9 +1165,11 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
                     cost_rmb = cgp * r["units"]
                     fields["采购成本(RMB)"] = round(cost_rmb, 2)
                     fields["简易毛利(RMB)"] = round(rev_rmb - cost_rmb, 2)
-                    # Phase B2: full profit = 营收 - 采购 - 佣金 - 广告 - VAT - 物流 - 退款
+                    # Phase B2: full profit = 营收 - 采购 - 佣金 - 广告 - VAT - 物流
+                    # NOTE: refund 数据待运营 verify (CBT-FULL FF05-2 退款字段疑似累计/stale,
+                    # 与营收量级不符). 先只显示, 不进毛利公式. 等 Phase B2.1 verify 后启用.
                     full_profit = (rev_rmb - cost_rmb - commission_rmb - ad_cost_rmb
-                                   - vat_rmb - shipping_rmb - refund_rmb)
+                                   - vat_rmb - shipping_rmb)
                     fields["全额毛利(RMB)"] = round(full_profit, 2)
                 except (TypeError, ValueError):
                     skus_missing_cost.append(r["sku"])
