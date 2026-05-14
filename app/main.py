@@ -883,10 +883,10 @@ async def report_sync_feishu(
 
 @app.post("/report/sync-feishu-monthly", dependencies=[Depends(require_service_token)])
 async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: str = ""):
-    """Aggregate seller_id's `month` orders FROM SQLite CACHE and write to Feishu.
+    """Aggregate seller_id's `month` orders FROM SQLite CACHE + Lingxing cost/FX → Feishu.
 
-    Reads only from ml_order_cache — does NOT call ML. Pair with /admin/backfill-orders
-    for one-time historical filling, and rely on webhook + missed-feeds for ongoing freshness.
+    Reads ml_order_cache, enriches with Lingxing cg_price (RMB cost) and monthly FX rate
+    to compute 营收(RMB), 采购成本(RMB), 简易毛利(RMB). Does NOT call ML.
 
     Args:
       seller_id: ML child seller id (must be in SHOP_LABEL)
@@ -935,25 +935,57 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
         return {"status": "no_data", "seller_id": seller_id, "month": month,
                 "cached_orders": len(cached_rows)}
 
+    # Enrich with Lingxing cost (cg_price) + monthly FX rate → compute RMB revenue/cost/profit
+    from app import lingxing
+    try:
+        products = await lingxing.fetch_all_products()
+        fx_map = await lingxing.fetch_fx_rate(month)
+    except Exception as e:
+        # If Lingxing fails, still write sales data; cost columns left blank
+        products, fx_map = {}, {}
+        lingxing_error = str(e)[:200]
+    else:
+        lingxing_error = None
+
     feishu_token = await _feishu_tenant_token()
     import time as _t
     pulled_at_ms = int(_t.time() * 1000)
     records: list[dict] = []
+    skus_missing_cost: list[str] = []
     for r in rows:
         rev = r["revenue_total"]; cnt = r["orders_count"]
-        record: dict = {"fields": {
+        currency = r.get("currency") or "?"
+        fields: dict = {
             "SKU": r["sku"], "平台": "Mercado Libre", "店铺": SHOP_LABEL[seller_id],
             "周期": period, "订单数": cnt, "件数": r["units"],
-            "币种": r.get("currency") or "?",
+            "币种": currency,
             "营收(原币)": round(rev, 2),
             "客单价(原币)": round(rev / cnt, 2) if cnt else 0,
             "商品标题": r.get("sample_title") or "",
             "数据拉取时间": pulled_at_ms,
-        }}
+        }
+        # FX-aware RMB columns
+        fx = fx_map.get(currency)
+        if fx:
+            fields["我的汇率"] = round(fx, 4)
+            rev_rmb = rev * fx
+            fields["营收(RMB)"] = round(rev_rmb, 2)
+            # cg_price from Lingxing (RMB, no FX needed)
+            prod = products.get(r["sku"])
+            if prod and prod.get("cg_price") is not None:
+                try:
+                    cgp = float(prod["cg_price"])
+                    cost_rmb = cgp * r["units"]
+                    fields["采购成本(RMB)"] = round(cost_rmb, 2)
+                    fields["简易毛利(RMB)"] = round(rev_rmb - cost_rmb, 2)
+                except (TypeError, ValueError):
+                    skus_missing_cost.append(r["sku"])
+            else:
+                skus_missing_cost.append(r["sku"])
         fs = _to_ms(r.get("first_seen")); ls = _to_ms(r.get("last_seen"))
-        if fs: record["fields"]["首次销售日"] = fs
-        if ls: record["fields"]["最后销售日"] = ls
-        records.append(record)
+        if fs: fields["首次销售日"] = fs
+        if ls: fields["最后销售日"] = ls
+        records.append({"fields": fields})
 
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(
@@ -967,6 +999,9 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
     return {"status": "synced", "seller_id": seller_id, "shop": SHOP_LABEL[seller_id],
             "month": month, "period": period, "rows_written": len(records),
             "cached_orders_total": len(cached_rows), "unique_skus": len(rows),
+            "lingxing_products_loaded": len(products),
+            "lingxing_error": lingxing_error,
+            "skus_missing_cost": skus_missing_cost,
             "bitable_url": f"https://u1wpma3xuhr.feishu.cn/base/{FEISHU_BASE_APP_TOKEN}"}
 
 
