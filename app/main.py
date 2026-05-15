@@ -4,6 +4,7 @@ M2: tokens persisted to SQLite; admin endpoints for seed/list/refresh.
 """
 
 import os
+import json
 import secrets
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Depends, Header
@@ -306,6 +307,111 @@ async def admin_refresh_expiring(within_seconds: int = 1800):
 
 
 # ---------- M3 reporting ----------
+
+@app.post("/admin/sku-audit", dependencies=[Depends(require_service_token)])
+async def admin_sku_audit(month: str | None = None):
+    """Audit ML SKU vs Lingxing ERP SKU vs alias map. Returns list of unmapped SKUs.
+
+    Lightweight: reads from ml_order_cache (no new ML calls). For each seller, lists
+    distinct seller_sku from cached orders within `month` (default = current month),
+    cross-references against Lingxing productList + alias map. Returns SKUs that:
+      - appear in cached ML orders
+      - but NOT in Lingxing productList (after alias resolution)
+
+    Intended as weekly n8n cron target →飞书 alert.
+    """
+    from datetime import date
+    if not month:
+        today = date.today()
+        month = f"{today.year}-{today.month:02d}"
+
+    from app import lingxing as lx
+    products = await lx.fetch_all_products()
+    erp_skus = set(products.keys())
+
+    import time as _t
+    result = {"month": month, "checked_at": int(_t.time()), "by_seller": {}, "total_unmapped": 0}
+    for seller_id, label in SHOP_LABEL.items():
+        cached = await db.cache_list_orders_for_month(seller_id, month)
+        ml_skus_in_use: dict[str, int] = {}  # sku → unit count
+        for cr in cached:
+            od = cr.get("_payload") or {}
+            for item in (od.get("order_items") or []):
+                it = item.get("item") or {}
+                sku = it.get("seller_sku") or it.get("seller_custom_field") or ""
+                if not sku:
+                    continue
+                qty = int(item.get("quantity") or 1)
+                ml_skus_in_use[sku] = ml_skus_in_use.get(sku, 0) + qty
+
+        unmapped: list[dict] = []
+        in_alias: list[dict] = []
+        clean: int = 0
+        for sku, qty in ml_skus_in_use.items():
+            erp_sku = lx.resolve_erp_sku(sku)
+            if erp_sku == sku and sku in erp_skus:
+                clean += 1
+                continue
+            if erp_sku != sku and erp_sku in erp_skus:
+                in_alias.append({"ml_sku": sku, "resolved_erp_sku": erp_sku, "units": qty})
+                continue
+            # NEW unmapped — needs attention
+            unmapped.append({"ml_sku": sku, "units": qty})
+
+        result["by_seller"][str(seller_id)] = {
+            "shop": label,
+            "ml_skus_total": len(ml_skus_in_use),
+            "clean_match": clean,
+            "in_alias_table": len(in_alias),
+            "alias_details": in_alias,
+            "unmapped_count": len(unmapped),
+            "unmapped_skus": unmapped,
+        }
+        result["total_unmapped"] += len(unmapped)
+    return result
+
+
+@app.post("/admin/sku-audit-alert", dependencies=[Depends(require_service_token)])
+async def admin_sku_audit_alert(month: str | None = None):
+    """Audit + send Feishu alert if unmapped SKUs found. n8n cron target."""
+    audit = await admin_sku_audit(month=month)
+    total = audit.get("total_unmapped", 0)
+    if total == 0:
+        return {"status": "ok", "total_unmapped": 0, "message": "All ML SKUs mapped"}
+
+    # Build alert message
+    lines = [f"⚠️ ML SKU 审计发现 {total} 个未映射 SKU ({audit['month']})", ""]
+    for sid, info in audit["by_seller"].items():
+        if info["unmapped_count"] == 0:
+            continue
+        lines.append(f"【{info['shop']}】未映射 {info['unmapped_count']} 个:")
+        for u in info["unmapped_skus"]:
+            lines.append(f"  - {u['ml_sku']} ({u['units']} 件)")
+        lines.append("")
+    lines.append("→ 处理：让运营在 ML 后台改 seller_sku 字段成对应 ERP_SKU，或私聊 Claude 加 alias map")
+    msg_text = "\n".join(lines)
+
+    # Send to Frankie + 俊辉
+    feishu_token = await _feishu_tenant_token()
+    import httpx
+    sent = []
+    for receiver in ("ou_629ce01f4bc31de078e10fcb038dbf78",   # Frankie
+                     "ou_b9dd2272e72908fe68964d7bba53109f"):  # 俊辉
+        try:
+            async with httpx.AsyncClient(timeout=15) as c:
+                r = await c.post(
+                    "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id",
+                    headers={"Authorization": f"Bearer {feishu_token}", "Content-Type": "application/json"},
+                    json={"receive_id": receiver, "msg_type": "text",
+                          "content": json.dumps({"text": msg_text}, ensure_ascii=False)},
+                )
+                sent.append({"receiver": receiver, "ok": r.status_code == 200,
+                             "message_id": (r.json().get("data") or {}).get("message_id") if r.status_code == 200 else None})
+        except Exception as e:
+            sent.append({"receiver": receiver, "ok": False, "error": str(e)[:100]})
+
+    return {"status": "alerted", "total_unmapped": total, "audit": audit, "feishu_sent": sent}
+
 
 @app.get("/admin/debug-sku-cache", dependencies=[Depends(require_service_token)])
 async def admin_debug_sku_cache(seller_id: int, sku: str, month: str):
