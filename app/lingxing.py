@@ -29,6 +29,24 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 _LX_BASE = "https://openapi.lingxing.com"
 
+# ML seller_sku (运营在 ML listing 后台填的非规范 SKU) → 领星 ERP SKU 映射。
+# 当 ML 后台 listing 命名跟领星产品库不一致时（通常是 CBT 站定制 listing），
+# 用这个表把 ML SKU 转回领星 SKU 以查询 cg_price。
+#
+# 加新映射: 1) Frankie/俊辉确认对应关系 2) 在 Lingxing 里 verify ERP SKU 存在
+# 3) 在这里加一行 4) 下次 sync-feishu-monthly 自动生效
+SKU_ALIAS_TO_ERP: dict[str, str] = {
+    # CBT-FULL Switch YS11pro 手柄系列 — 2026-05-15 俊辉确认
+    "MXCFFLFFSCP-TOTKW01": "FF01B-01",  # YS11pro 手柄-白眼款（霍尔摇杆）
+    "MXCFFLFFSCP-TOTK":    "FF01A-04",  # YS11pro 手柄-波纹款（霍尔摇杆）
+    "MXCFFLFFSCP-TOTKB02": "FF01A-05",  # YS11pro 手柄-魔法阵款（霍尔摇杆）
+}
+
+
+def resolve_erp_sku(ml_sku: str) -> str:
+    """Translate ML seller_sku to Lingxing ERP SKU if aliased, else return as-is."""
+    return SKU_ALIAS_TO_ERP.get(ml_sku, ml_sku)
+
 # In-memory caches
 _token_cache: dict[str, Any] = {"token": None, "expires_at": 0}
 _products_cache: dict[str, Any] = {"items": None, "expires_at": 0}

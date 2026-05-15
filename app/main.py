@@ -1205,8 +1205,9 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
             fields["TACOS"] = round(tacos, 4)
             fields["自然销售(RMB)"] = round(natural_rmb, 2)
             fields["自然销售占比"] = round(natural_ratio, 4)
-            # cg_price from Lingxing
-            prod = products.get(r["sku"])
+            # cg_price from Lingxing. Resolve ML→ERP alias if any (e.g. CBT custom SKU).
+            erp_sku = lingxing.resolve_erp_sku(r["sku"])
+            prod = products.get(erp_sku)
             if prod and prod.get("cg_price") is not None:
                 try:
                     cgp = float(prod["cg_price"])
@@ -1240,7 +1241,7 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
         total_local = m.get("total_amount", 0.0)
         fx_ad = fx_map.get(ad_currency) or 0
         cost_rmb = cost_local * fx_ad if fx_ad else 0
-        prod = products.get(sku) or {}
+        prod = products.get(lingxing.resolve_erp_sku(sku)) or {}
         title = prod.get("product_name") or "(advertised but no sale)"
         fields = {
             "SKU": sku,
