@@ -1140,6 +1140,15 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
             refunded += float(p.get("transaction_amount_refunded") or 0)
         if refunded > 0 and order_id:
             refunds_by_order[order_id] = refunded
+            # P2.4 (2026-05-18, verified 9 samples): cancelled orders are skipped
+            # above (line ~1097), so any refund reaching here is a NON-cancelled
+            # partial refund. For CBT, transaction_amount_refunded is buyer currency
+            # (MXN), NOT seller USD — biggest deduction risk ~17x. Observed count is
+            # currently 0; warn loudly so we catch the first one and add FX conversion
+            # before trusting refund_total. (Frankie decision: keep formula as-is + warn)
+            print(f"[WARN] P2.4 non-cancelled refund: order={order_id} seller={seller_id} "
+                  f"status={od.get('status')} refunded={refunded} order_cur={od.get('currency_id')} "
+                  f"— verify currency (CBT refunded=MXN buyer ccy) before trusting refund_total")
 
     rows = sorted(by_sku.values(), key=lambda x: x["revenue_total"], reverse=True)
     if not rows:
