@@ -413,6 +413,31 @@ async def admin_sku_audit_alert(month: str | None = None):
     return {"status": "alerted", "total_unmapped": total, "audit": audit, "feishu_sent": sent}
 
 
+@app.get("/admin/debug-shipping-cache", dependencies=[Depends(require_service_token)])
+async def admin_debug_shipping_cache(seller_id: int | None = None, shipment_id: int | None = None):
+    """Cache-only probe: inspect ml_shipping_cache. No ML calls.
+
+    ?shipment_id=X            -> the single cached row (incl payload)
+    ?seller_id=Y              -> per-seller summary: how many rows have
+                                 sender_cost<=0 (dirty/unsettled) vs >0
+    """
+    if shipment_id:
+        return {"shipment_id": shipment_id, "row": await db.cache_get_shipping(shipment_id)}
+    if seller_id:
+        rows = await db.cache_list_shipping_for_seller(seller_id)
+        zero = [r for r in rows if (r.get("sender_cost") or 0) <= 0]
+        pos = [r for r in rows if (r.get("sender_cost") or 0) > 0]
+        return {
+            "seller_id": seller_id,
+            "total_rows": len(rows),
+            "sender_cost_zero_or_neg": len(zero),
+            "sender_cost_positive": len(pos),
+            "sample_zero": zero[:10],
+            "sample_pos": pos[:5],
+        }
+    return {"error": "pass seller_id or shipment_id"}
+
+
 @app.get("/admin/debug-sku-cache", dependencies=[Depends(require_service_token)])
 async def admin_debug_sku_cache(seller_id: int, sku: str, month: str):
     """Debug: list cached orders for a (seller, month) containing the given SKU,

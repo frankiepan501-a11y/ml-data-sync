@@ -375,6 +375,18 @@ async def cache_list_orders_for_month(seller_id: int, month: str) -> list[dict[s
     return rows
 
 
+async def cache_list_shipping_for_seller(seller_id: int) -> list[dict[str, Any]]:
+    """Cache-only probe: all ml_shipping_cache rows for a seller (no payload)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT shipment_id, seller_id, order_id, sender_cost, gross_amount, "
+            "currency, fetched_at FROM ml_shipping_cache WHERE seller_id = ?",
+            (seller_id,),
+        )
+        return [dict(r) for r in await cur.fetchall()]
+
+
 async def cache_get_item(item_id: str) -> dict[str, Any] | None:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
