@@ -453,7 +453,7 @@ async def admin_debug_sku_cache(seller_id: int, sku: str, month: str):
 
 
 @app.get("/admin/raw-ml-get", dependencies=[Depends(require_service_token)])
-async def admin_raw_ml_get(user_id: int, path: str, api_version: str | None = None):
+async def admin_raw_ml_get(user_id: int, path: str, api_version: str | None = None, max_bytes: int = 6000):
     """Temporary probe: GET any ML endpoint with the given user_id's token.
 
     api_version: optional, sent as 'Api-Version' / 'api-version' header. ML's marketplace
@@ -477,7 +477,7 @@ async def admin_raw_ml_get(user_id: int, path: str, api_version: str | None = No
     return {
         "url": url,
         "status": r.status_code,
-        "body": r.text[:6000] if r.headers.get("content-type", "").startswith("application/json") else r.text[:1500],
+        "body": r.text[:max_bytes] if r.headers.get("content-type", "").startswith("application/json") else r.text[:1500],
         "headers": {k: v for k, v in r.headers.items() if k.lower() in ("content-type", "x-request-id", "retry-after")},
     }
 
