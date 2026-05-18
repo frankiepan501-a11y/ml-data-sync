@@ -424,11 +424,12 @@ async def admin_debug_sku_cache(seller_id: int, sku: str, month: str):
         for item in (od.get("order_items") or []):
             it = item.get("item") or {}
             sku_v = it.get("seller_sku") or it.get("seller_custom_field") or ""
-            if sku_v != sku:
+            if sku != "*" and sku_v != sku:
                 continue
             payments = od.get("payments") or []
             matches.append({
                 "order_id": od.get("id"),
+                "sku": sku_v,
                 "date_created": od.get("date_created"),
                 "status": od.get("status"),
                 "paid_amount": od.get("paid_amount"),
@@ -448,7 +449,7 @@ async def admin_debug_sku_cache(seller_id: int, sku: str, month: str):
         "seller_id": seller_id, "sku": sku, "month": month,
         "matched_orders": len(matches),
         "total_refunded_summed": total_refunded,
-        "orders": matches[:30],
+        "orders": matches[:200],
     }
 
 
