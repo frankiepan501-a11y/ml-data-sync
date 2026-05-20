@@ -10,6 +10,13 @@ Discoveries (probed 2026-05-14):
   - One ML call per shipment. 5 sellers × ~150 orders/month = ~750 calls/month — heavy.
     Mitigation: SQLite cache (immutable once shipped) + skip-on-error.
 
+CBT specifics (probed 2026-05-20, P2.3 专项):
+  - Plain /shipments/{id}/costs with CBT parent token returns 401 invalid_caller_id.
+  - CBT must use /marketplace/shipments/{id}/costs + header `api-version: 2`
+    (same pattern as orders/items/advertising — see坑 #3 #9 in project memory).
+  - CBT parent token 1502520822 is shared across orders/shipping/ads → easy 429.
+    fetch_many caps concurrency at 2 and retries 429 with exponential backoff.
+
 Used in sync-feishu-monthly:
   - For each cached order with shipping.id, fetch shipping cost via cache-first.
   - Sum senders.cost per SKU as 物流费(原币).
@@ -33,6 +40,11 @@ SHIPPING_TOKEN_USER: dict[int, int] = {
     2378517428: 2378517428,
 }
 
+# CBT parent token user_ids — these need /marketplace/ + api-version:2
+_CBT_TOKEN_USERS: set[int] = {1502520822}
+
+_429_BACKOFFS = (2.0, 5.0, 12.0)
+
 
 async def fetch_shipping_cost(
     shipment_id: int,
@@ -41,13 +53,14 @@ async def fetch_shipping_cost(
     token_user_id: int,
     client: httpx.AsyncClient | None = None,
 ) -> dict | None:
-    """Fetch /shipments/{id}/costs, cache, return sender cost details.
+    """Fetch shipping costs, cache, return sender cost details.
 
     Returns {sender_cost, gross_amount, currency} or None on failure.
-    Cache-first; only hits ML on cache miss.
+    Cache-first; treats cached sender_cost<=0 as miss so dirty/empty rows get refetched.
+    Retries on 429 with exponential backoff; returns None on other non-200.
     """
     cached = await db.cache_get_shipping(shipment_id)
-    if cached:
+    if cached and float(cached.get("sender_cost") or 0) > 0:
         return {
             "sender_cost": cached.get("sender_cost") or 0,
             "gross_amount": cached.get("gross_amount") or 0,
@@ -58,34 +71,44 @@ async def fetch_shipping_cost(
     row = await db.get_token(token_user_id)
     if not row:
         return None
+    is_cbt = token_user_id in _CBT_TOKEN_USERS
     headers = {"Authorization": f"Bearer {row['access_token']}"}
-    url = f"https://api.mercadolibre.com/shipments/{shipment_id}/costs"
+    if is_cbt:
+        url = f"https://api.mercadolibre.com/marketplace/shipments/{shipment_id}/costs"
+        headers["api-version"] = "2"
+    else:
+        url = f"https://api.mercadolibre.com/shipments/{shipment_id}/costs"
 
     own_client = client is None
     if own_client:
         client = httpx.AsyncClient(timeout=20)
     try:
-        r = await client.get(url, headers=headers)
-        if r.status_code != 200:
+        for attempt in range(len(_429_BACKOFFS) + 1):
+            try:
+                r = await client.get(url, headers=headers)
+            except Exception:
+                return None
+            if r.status_code == 200:
+                payload = r.json()
+                senders = payload.get("senders") or [{}]
+                sender_cost = float(senders[0].get("cost") or 0)
+                gross_amount = float(payload.get("gross_amount") or 0)
+                currency = payload.get("currency_id") or ""
+                await db.cache_put_shipping(
+                    shipment_id, seller_id, order_id,
+                    sender_cost, gross_amount, currency, payload,
+                )
+                return {
+                    "sender_cost": sender_cost,
+                    "gross_amount": gross_amount,
+                    "currency": currency,
+                    "from_cache": False,
+                }
+            if r.status_code == 429 and attempt < len(_429_BACKOFFS):
+                await asyncio.sleep(_429_BACKOFFS[attempt])
+                continue
+            # other non-200 (401/403/404/...) — endpoint/permission issue, not retryable
             return None
-        payload = r.json()
-        senders = payload.get("senders") or [{}]
-        sender_cost = float(senders[0].get("cost") or 0)
-        gross_amount = float(payload.get("gross_amount") or 0)
-        # currency: shipment payload has no top-level currency but shipping is in seller country
-        # We infer from order context — caller passes via separate channel; default empty
-        currency = ""
-        await db.cache_put_shipping(
-            shipment_id, seller_id, order_id,
-            sender_cost, gross_amount, currency, payload,
-        )
-        return {
-            "sender_cost": sender_cost,
-            "gross_amount": gross_amount,
-            "currency": currency,
-            "from_cache": False,
-        }
-    except Exception:
         return None
     finally:
         if own_client:
@@ -97,7 +120,12 @@ async def fetch_many_shipping_costs(
     token_user_id: int,
     concurrency: int = 5,
 ) -> dict[int, dict]:
-    """Bulk fetch shipping costs with bounded concurrency, returning {shipment_id: {sender_cost, ...}}."""
+    """Bulk fetch shipping costs with bounded concurrency, returning {shipment_id: {sender_cost, ...}}.
+
+    CBT parent token is shared across all CBT operations → cap concurrency at 2 to avoid 429 storms.
+    """
+    if token_user_id in _CBT_TOKEN_USERS:
+        concurrency = min(concurrency, 2)
     out: dict[int, dict] = {}
     sem = asyncio.Semaphore(concurrency)
     async with httpx.AsyncClient(timeout=20) as client:
