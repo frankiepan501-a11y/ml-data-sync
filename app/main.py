@@ -464,6 +464,9 @@ async def admin_debug_sku_cache(seller_id: int, sku: str, month: str):
                 "unit_price": item.get("unit_price"),
                 "sale_fee": item.get("sale_fee"),
                 "discounts": item.get("discounts"),  # P2.5 probe
+                "_item_keys": sorted(item.keys()),  # P2.5 probe
+                "_payload_size": len(str(od)),  # P2.5 probe (rough)
+                "fetched_at": cr.get("fetched_at"),  # P2.5 probe
                 "shipping_id": (od.get("shipping") or {}).get("id"),
                 "payments_refunded": [p.get("transaction_amount_refunded") for p in payments],
                 "payments_transaction_amount": [p.get("transaction_amount") for p in payments],
