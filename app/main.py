@@ -1124,6 +1124,15 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
             cancelled_count += 1
             continue
         order_items_skus: list[tuple[str, int]] = []
+        # P2.5 (2026-05-21): order-level buyer→seller currency ratio.
+        # CBT: paid_amount(USD 卖家币) vs total_amount(MXN 买家币) → ratio ≈ 1/17
+        # 本土店: paid_amount == total_amount (同币种) → ratio = 1.0
+        # 用 ratio 把 discounts.amounts.seller (MXN 买家币) 换回订单卖家币
+        o_paid = float(od.get("paid_amount") or 0)
+        o_total = float(od.get("total_amount") or 0)
+        buyer_to_seller_ratio = 1.0
+        if o_total > 0 and o_paid > 0 and abs(o_paid - o_total) / o_total > 0.05:
+            buyer_to_seller_ratio = o_paid / o_total
         for item in (od.get("order_items") or []):
             it = item.get("item") or {}
             sku = it.get("seller_sku") or it.get("seller_custom_field") or "(no_sku)"
@@ -1139,9 +1148,17 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
                 amount = float(item.get("unit_price") or 0)
             quantity = int(item.get("quantity") or 1)
             sale_fee = float(item.get("sale_fee") or 0)
+            # P2.5: seller-funded discount per item. amounts.seller 是买家币种,
+            # 用 order-level ratio 换成卖家币种 (CBT 必换/本土 ratio=1 无影响)
+            seller_discount_buyer_cur = sum(
+                float((d.get("amounts") or {}).get("seller") or 0)
+                for d in (item.get("discounts") or [])
+            )
+            seller_discount_local = seller_discount_buyer_cur * buyer_to_seller_ratio
             cell = by_sku.setdefault(sku, {
                 "sku": sku, "orders_count": 0, "units": 0, "revenue_total": 0.0,
                 "commission_total": 0.0, "shipping_total": 0.0, "refund_total": 0.0, "refund_units": 0,
+                "discount_total": 0.0,
                 "currency": currency, "sample_title": it.get("title"),
                 "first_seen": None, "last_seen": None,
             })
@@ -1149,6 +1166,7 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
             cell["units"] += quantity
             cell["revenue_total"] += amount * quantity
             cell["commission_total"] += sale_fee
+            cell["discount_total"] = cell.get("discount_total", 0) + seller_discount_local
             order_items_skus.append((sku, quantity))
             dc = (od.get("date_created") or "")[:10]
             if dc:
@@ -1282,6 +1300,8 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
         # Phase B2: shipping (seller cost) + refunds, both in seller currency
         shipping_local = r.get("shipping_total") or 0
         refund_local = r.get("refund_total") or 0
+        # P2.5: seller-funded discount (already converted to seller currency in order loop)
+        discount_local = r.get("discount_total") or 0
         refund_units = int(r.get("refund_units") or 0)
         refund_rate = (refund_units / r["units"]) if r["units"] else 0
         # Phase B1.3: pull full ad metrics dict for this SKU
@@ -1310,6 +1330,7 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
             "VAT估算(原币)": round(vat_estimate_local, 2),
             "物流费(原币)": round(shipping_local, 2),
             "退款金额(原币)": round(refund_local, 2),
+            "卖家折扣(原币)": round(discount_local, 2),
             "退款率": round(refund_rate, 4),
             "广告展示": ad_prints,
             "广告点击": ad_clicks,
@@ -1334,12 +1355,14 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
             ad_direct_rmb = ad_direct_local * fx
             shipping_rmb = shipping_local * fx
             refund_rmb = refund_local * fx
+            discount_rmb = discount_local * fx
             fields["营收(RMB)"] = round(rev_rmb, 2)
             fields["ML佣金(RMB)"] = round(commission_rmb, 2)
             fields["广告费(RMB)"] = round(ad_cost_rmb, 2)
             fields["VAT估算(RMB)"] = round(vat_rmb, 2)
             fields["物流费(RMB)"] = round(shipping_rmb, 2)
             fields["退款金额(RMB)"] = round(refund_rmb, 2)
+            fields["卖家折扣(RMB)"] = round(discount_rmb, 2)
             # Phase B1.3 业务级指标
             tacos = (ad_cost_rmb / rev_rmb) if rev_rmb else 0
             natural_rmb = rev_rmb - ad_direct_rmb
@@ -1356,11 +1379,12 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: s
                     cost_rmb = cgp * r["units"]
                     fields["采购成本(RMB)"] = round(cost_rmb, 2)
                     fields["简易毛利(RMB)"] = round(rev_rmb - cost_rmb, 2)
-                    # Phase B2: full profit = 营收 - 采购 - 佣金 - 广告 - VAT - 物流
+                    # Phase B2 + P2.5: full profit = 营收 - 采购 - 佣金 - 广告 - VAT - 物流 - 卖家折扣
                     # NOTE: refund 数据待运营 verify (CBT-FULL FF05-2 退款字段疑似累计/stale,
                     # 与营收量级不符). 先只显示, 不进毛利公式. 等 Phase B2.1 verify 后启用.
+                    # 头程/海外仓/ML FULL fee 待 5/21 俊辉确认数据源
                     full_profit = (rev_rmb - cost_rmb - commission_rmb - ad_cost_rmb
-                                   - vat_rmb - shipping_rmb)
+                                   - vat_rmb - shipping_rmb - discount_rmb)
                     fields["全额毛利(RMB)"] = round(full_profit, 2)
                 except (TypeError, ValueError):
                     skus_missing_cost.append(r["sku"])
