@@ -32,6 +32,7 @@ ADVERTISER_BY_SELLER: dict[int, int | None] = {
     1407362838: 38602,   # 本土 1 MX FUNLABDIRECTMX
     1436420028: 380587,  # 本土 2 MX FUNLAB_MX
     2378517428: 683851,  # 巴西 AIRSOFT (MLB)
+    3383185411: None,    # 本土 3 MX DISTRIBUIDOR VALMIGOZ — 新店 advertiser_id 待俊辉确认
 }
 
 # Auth-via: which user_id's token to use when calling /advertising for this seller.
@@ -42,6 +43,7 @@ TOKEN_USER_FOR_ADVERTISING: dict[int, int] = {
     1407362838: 1407362838,
     1436420028: 1436420028,
     2378517428: 2378517428,
+    3383185411: 3383185411,
 }
 
 # Visits API auth: which user_id's token to use for /users/{seller}/items_visits.
@@ -54,6 +56,7 @@ VISITS_TOKEN_USER: dict[int, int | None] = {
     1407362838: 1407362838,
     1436420028: 1436420028,
     2378517428: 2378517428,
+    3383185411: 3383185411,
 }
 
 _visits_cache: dict[tuple[int, str], dict] = {}  # (seller_id, month) → {total, _expires_at}

@@ -38,6 +38,7 @@ SHIPPING_TOKEN_USER: dict[int, int] = {
     1407362838: 1407362838,
     1436420028: 1436420028,
     2378517428: 2378517428,
+    3383185411: 3383185411,
 }
 
 # CBT parent token user_ids — these need /marketplace/ + api-version:2
