@@ -375,6 +375,25 @@ async def cache_list_orders_for_month(seller_id: int, month: str) -> list[dict[s
     return rows
 
 
+async def cache_list_orders_since(seller_id: int, since_iso: str) -> list[dict[str, Any]]:
+    """Return all cached orders for seller with date_created >= since_iso (YYYY-MM-DD).
+    Used by /procurement/ml-stock for 30d/14d sales windows."""
+    import json as _j
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT * FROM ml_order_cache WHERE seller_id = ? AND date_created >= ?",
+            (seller_id, since_iso),
+        )
+        rows = [dict(r) for r in await cur.fetchall()]
+    for d in rows:
+        try:
+            d["_payload"] = _j.loads(d.pop("payload"))
+        except Exception:
+            d["_payload"] = None
+    return rows
+
+
 async def cache_list_shipping_for_seller(seller_id: int) -> list[dict[str, Any]]:
     """Cache-only probe: all ml_shipping_cache rows for a seller (no payload)."""
     async with aiosqlite.connect(DB_PATH) as db:

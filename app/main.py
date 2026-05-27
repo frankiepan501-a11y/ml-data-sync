@@ -789,6 +789,93 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
     }
 
 
+# ---------- 采购计划: 美客多库存 + 30d/14d 销量 (按 ERP 仓库组聚合) ----------
+# seller → {取数用 token_uid, 是否走 CBT(/marketplace 前缀 + 父 token + api-version:2)}
+_ML_PROC_SELLER = {
+    1407362838: {"token_uid": 1407362838, "cbt": False},   # 本土 FUNLABDIRECTMX
+    1436420028: {"token_uid": 1436420028, "cbt": False},   # 本土 FUNLAB_MX
+    1502236229: {"token_uid": 1502520822, "cbt": True},    # CBT-FULL (走 CBT 父 token 1502520822)
+    2378517428: {"token_uid": 2378517428, "cbt": False},   # 巴西本土
+}
+# ERP 仓库组 (梁俊辉 2026-05-27 确认): 墨西哥 = 本土MX×2 + CBT-FULL → wid4928; 巴西 → wid12357
+# CBT-自发货 1510203792 国内直发不预备货 → 排除
+_ML_PROC_GROUPS = {
+    "美客多-墨西哥": {"wid": 4928, "sellers": [1407362838, 1436420028, 1502236229]},
+    "美客多-巴西":   {"wid": 12357, "sellers": [2378517428]},
+}
+
+
+async def _ml_sku_available(client, headers, seller_id: int, sku: str, is_cbt: bool):
+    """该 seller 下 sku 的 available_quantity(匹配 items 求和, 含变体)。?seller_sku= 过滤(实测有效)。"""
+    base = "https://api.mercadolibre.com"
+    search = (f"{base}/marketplace/users/{seller_id}/items/search" if is_cbt
+              else f"{base}/users/{seller_id}/items/search")
+    r = await _ml_get(client, search, headers, {"seller_sku": sku, "limit": 20})
+    if r.status_code != 200:
+        return 0, f"search_{r.status_code}"
+    ids = (r.json() or {}).get("results") or []
+    avail = 0
+    for iid in ids:
+        idet = (f"{base}/marketplace/items/{iid}" if is_cbt else f"{base}/items/{iid}")
+        hdr = {**headers, "api-version": "2"} if is_cbt else headers
+        rd = await _ml_get(client, idet, hdr, {"attributes": "available_quantity,variations,status"})
+        if rd.status_code != 200:
+            continue
+        it = rd.json()
+        a = it.get("available_quantity")
+        if not a:  # None 或 0 → 用变体求和
+            a = sum(int(v.get("available_quantity") or 0) for v in (it.get("variations") or []))
+        avail += int(a or 0)
+    return avail, None
+
+
+@app.get("/procurement/ml-stock", dependencies=[Depends(require_service_token)])
+async def procurement_ml_stock(skus: str):
+    """采购计划用: 给定 ERP SKU 列表(逗号分隔), 返回美客多各 ERP 仓库组的
+    available_quantity + 30d/14d 销量(订单缓存)。CBT-自发货已排除。
+    返回 {as_of, groups: {组名: {wid, skus: {sku: {available, sales_30d, sales_14d}}}}}。"""
+    import datetime, traceback
+    sku_list = [s.strip() for s in skus.split(",") if s.strip()]
+    today = datetime.date.today()
+    since30 = (today - datetime.timedelta(days=30)).isoformat()
+    since14 = (today - datetime.timedelta(days=14)).isoformat()
+    try:
+        out = {}
+        tok_cache: dict[int, dict | None] = {}
+        async def hdr_for(token_uid: int):
+            if token_uid not in tok_cache:
+                row = await db.get_token(token_uid)
+                tok_cache[token_uid] = {"Authorization": f"Bearer {row['access_token']}"} if row else None
+            return tok_cache[token_uid]
+        async with httpx.AsyncClient(timeout=180) as client:
+            for gname, g in _ML_PROC_GROUPS.items():
+                grp = {"wid": g["wid"], "skus": {s: {"available": 0, "sales_30d": 0, "sales_14d": 0} for s in sku_list}}
+                for seller_id in g["sellers"]:
+                    cfg = _ML_PROC_SELLER[seller_id]
+                    headers = await hdr_for(cfg["token_uid"])
+                    if not headers:
+                        continue
+                    # 销量: 一次拉该 seller 近30天订单缓存, 按 SKU+日期窗聚合 units
+                    for od in await db.cache_list_orders_since(seller_id, since30):
+                        dc = (od.get("date_created") or "")[:10]
+                        for item in ((od.get("_payload") or {}).get("order_items") or []):
+                            it = item.get("item") or {}
+                            isku = it.get("seller_sku") or it.get("seller_custom_field") or ""
+                            if isku in grp["skus"]:
+                                q = int(item.get("quantity") or 0)
+                                grp["skus"][isku]["sales_30d"] += q
+                                if dc >= since14:
+                                    grp["skus"][isku]["sales_14d"] += q
+                    # 库存: 每 SKU 1 搜 + 命中 items detail (便宜, CBT 负载小)
+                    for sku in sku_list:
+                        av, _err = await _ml_sku_available(client, headers, seller_id, sku, cfg["cbt"])
+                        grp["skus"][sku]["available"] += av
+                out[gname] = grp
+        return {"as_of": today.isoformat(), "groups": out}
+    except Exception as e:
+        return {"status": "error", "exc": type(e).__name__, "msg": str(e), "traceback": traceback.format_exc()}
+
+
 @app.get("/admin/cache-stats", dependencies=[Depends(require_service_token)])
 async def admin_cache_stats():
     return await db.cache_stats()
