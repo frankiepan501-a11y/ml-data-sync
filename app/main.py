@@ -876,6 +876,20 @@ async def procurement_ml_stock(skus: str):
         return {"status": "error", "exc": type(e).__name__, "msg": str(e), "traceback": traceback.format_exc()}
 
 
+@app.post("/report/sync-meitong-cost", dependencies=[Depends(require_service_token)])
+def sync_meitong_cost(period: str, months: int = 12, commit: bool = False):
+    """美通中转 头程/海外仓成本 → ML报表两列(方案A: 只灌经美通中转SKU, 其余留空)。
+    源: 美通订单API(头程=收费重×费率快照) + 指令明细(海外仓=换标箱数×单箱费快照), 不碰美通账单。
+    period 如 month_2026-04; months=单价滚动窗口(默认12); commit=False 只预览不写。
+    月度 cron 应在 sync-feishu-monthly 之后调(当月行先生成)。sync 同步(urllib), FastAPI 自动 threadpool。"""
+    import traceback
+    from app import meitong_cost
+    try:
+        return meitong_cost.run(period, months, commit)
+    except Exception as e:
+        return {"status": "error", "exc": type(e).__name__, "msg": str(e), "traceback": traceback.format_exc()}
+
+
 @app.get("/admin/cache-stats", dependencies=[Depends(require_service_token)])
 async def admin_cache_stats():
     return await db.cache_stats()
