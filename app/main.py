@@ -7,7 +7,7 @@ import os
 import json
 import secrets
 import httpx
-from fastapi import FastAPI, HTTPException, Request, Depends, Header
+from fastapi import FastAPI, HTTPException, Request, Depends, Header, BackgroundTasks
 from dotenv import load_dotenv
 
 from app import db
@@ -1189,7 +1189,22 @@ async def report_sync_feishu(
 
 
 @app.post("/report/sync-feishu-monthly", dependencies=[Depends(require_service_token)])
-async def report_sync_feishu_monthly(seller_id: int, month: str, period_label: str = ""):
+async def report_sync_feishu_monthly(seller_id: int, month: str, background_tasks: BackgroundTasks,
+                                     period_label: str = "", nowait: bool = False):
+    """Dispatcher. nowait=true → schedule aggregation in background, return 202 immediately
+    (avoids Zeabur gateway ~150s connection reset on heavy sellers like CBT-FULL 1502236229,
+    which made the monthly cron 9ZvARULB0wIp19yp false-alarm even though data lands fine).
+    Default nowait=false → synchronous; behavior unchanged for every existing caller."""
+    if seller_id not in SHOP_LABEL:
+        raise HTTPException(400, f"unknown seller_id {seller_id}; allowed: {list(SHOP_LABEL.keys())}")
+    if nowait:
+        background_tasks.add_task(_sync_feishu_monthly_impl, seller_id, month, period_label)
+        return {"status": "accepted", "mode": "background", "seller_id": seller_id, "month": month,
+                "note": "Aggregation runs in background; verify via Feishu 数据拉取时间 in ~3-5min."}
+    return await _sync_feishu_monthly_impl(seller_id, month, period_label)
+
+
+async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: str = ""):
     """Aggregate seller_id's `month` orders FROM SQLite CACHE + Lingxing cost/FX → Feishu.
 
     Reads ml_order_cache, enriches with Lingxing cg_price (RMB cost) and monthly FX rate
