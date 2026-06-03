@@ -1000,28 +1000,53 @@ async def admin_process_webhook_queue(limit: int = 50, parent_user_id: int = 150
 
     Run via n8n cron every 5 minutes.
     """
-    row = await db.get_token(parent_user_id)
-    if not row:
+    parent_row = await db.get_token(parent_user_id)
+    if not parent_row:
         raise HTTPException(404, "parent token not found")
-    headers = {"Authorization": f"Bearer {row['access_token']}"}
     events = await db.claim_pending_events(limit)
     if not events:
         return {"processed": 0, "events": []}
+
+    # Per-app routing: CBT events use the CBT parent token + /marketplace prefix; local-store
+    # events (local_mx / local_br apps) use the seller's OWN token + the plain /orders path.
+    # Determine CBT-vs-local from the event's application_id → ml_apps.account_type, defaulting
+    # to CBT for legacy/unknown events so existing CBT behavior is unchanged. Tokens and app
+    # rows are cached per request to avoid re-querying the DB for every event.
+    _token_cache: dict[int, dict | None] = {parent_user_id: parent_row}
+    _app_cache: dict[str, dict | None] = {}
+
+    async def _token_for(user_id: int) -> dict | None:
+        if user_id not in _token_cache:
+            _token_cache[user_id] = await db.get_token(user_id)
+        return _token_cache[user_id]
+
+    async def _app_for(client_id: str) -> dict | None:
+        if client_id not in _app_cache:
+            _app_cache[client_id] = await db.get_app_by_client_id(client_id) if client_id else None
+        return _app_cache[client_id]
 
     results: list[dict] = []
     async with httpx.AsyncClient(timeout=30) as client:
         for ev in events:
             topic = ev["topic"] or ""
             resource = ev["resource"] or ""
-            # Decide URL + cache target by resource path (more robust than topic name)
-            # ML 2026 UI uses topics: items / marketplace_items / marketplace_questions /
-            #   marketplace_orders / marketplace_shipments / marketplace_orders_on_site / ...
+            ev_user = int(ev.get("user_id") or 0)
+            app_row = await _app_for(str(ev.get("application_id") or ""))
+            # default CBT for legacy/unknown events (preserves original behavior)
+            is_cbt = (app_row.get("account_type") == "cbt") if app_row else True
+            tok_row = parent_row if is_cbt else (await _token_for(ev_user) or parent_row)
+            if not tok_row:
+                await db.mark_event_failed(ev["id"], "no token for event")
+                results.append({"id": ev["id"], "ok": False, "error": "no token", "resource": resource})
+                continue
+            headers = {"Authorization": f"Bearer {tok_row['access_token']}"}
+            # Decide URL + cache target by resource path (more robust than topic name).
             # resource path is canonical (e.g. /orders/<id>, /items/<id>, /questions/<id>)
             is_order = resource.startswith("/orders/") or "orders" in topic
             is_item = resource.startswith("/items/") or topic == "items"
-            # For CBT parent token: orders need /marketplace prefix to be readable
             url = f"https://api.mercadolibre.com{resource}"
-            if is_order and "/marketplace/" not in url:
+            # CBT order detail needs the /marketplace prefix; local orders use the plain path.
+            if is_order and is_cbt and "/marketplace/" not in url:
                 url = f"https://api.mercadolibre.com/marketplace{resource}"
             try:
                 r = await _ml_get(client, url, headers)
@@ -1030,7 +1055,7 @@ async def admin_process_webhook_queue(limit: int = 50, parent_user_id: int = 150
                     if is_order:
                         seller_id = ((detail.get("seller") or {}).get("id")
                                      or (detail.get("orders") or [{}])[0].get("seller", {}).get("id")
-                                     or ev.get("user_id") or 0)
+                                     or ev_user or 0)
                         await db.cache_put_order(int(detail.get("id") or 0), int(seller_id or 0), detail)
                     elif is_item:
                         await db.cache_put_item(detail.get("id"), detail)
