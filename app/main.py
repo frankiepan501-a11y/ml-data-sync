@@ -674,7 +674,9 @@ async def report_sku_recent(
         return {"status": "error", "exc": type(e).__name__, "msg": str(e), "traceback": traceback.format_exc()}
 
 
-async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id: int):
+async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id: int,
+                                  date_from: str | None = None, date_to: str | None = None,
+                                  max_detail_fetch: int | None = None):
     row = await db.get_token(parent_user_id)
     if not row:
         raise HTTPException(404, "parent token not found in DB; seed first")
@@ -693,11 +695,20 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
 
     async with httpx.AsyncClient(timeout=120) as client:
         # 1. pull pack list (last N) — orders/search is critical; allow ONE 30s retry on 429
+        windowed = bool(date_from and date_to)
         packs: list[dict] = []
         offset = 0
-        while len(packs) < recent_n:
-            page_size = min(50, recent_n - len(packs))
+        while True:
+            if windowed:
+                page_size = 50
+            else:
+                if len(packs) >= recent_n:
+                    break
+                page_size = min(50, recent_n - len(packs))
             params = {"seller": seller_id, "limit": page_size, "offset": offset, "sort": "date_desc"}
+            if windowed:
+                params["order.date_created.from"] = date_from
+                params["order.date_created.to"] = date_to
             r = await _ml_get(client, orders_search_url, headers, params)
             if r.status_code == 429:
                 await _asyncio.sleep(30)
@@ -717,7 +728,11 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
         skipped_429 = 0
         skipped_other = 0
         cache_hits = 0
+        new_fetches = 0
+        capped = False
         for pack in packs:
+            if capped:
+                break
             # CBT packs have inner `orders[]`; local search may return flat orders directly
             inner = pack.get("orders") or [pack]
             for sub in inner:
@@ -730,7 +745,13 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
                     order_details.append(cached["_payload"])
                     cache_hits += 1
                     continue
+                # Bound NEW detail fetches per call (paced backfill of a large past month).
+                # Cache-hits are free, so repeated calls converge as the cache warms.
+                if max_detail_fetch is not None and new_fetches >= max_detail_fetch:
+                    capped = True
+                    break
                 rd = await _ml_get(client, f"{orders_detail_prefix}/{order_id}", headers)
+                new_fetches += 1
                 if rd.status_code == 200:
                     detail = rd.json()
                     order_details.append(detail)
@@ -781,6 +802,8 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
         "packs_returned": len(packs),
         "orders_with_detail": len(order_details),
         "cache_hits": cache_hits,
+        "new_fetches": new_fetches,
+        "capped": capped,
         "skipped_429": skipped_429,
         "skipped_other": skipped_other,
         "unique_skus": len(rows),
@@ -1697,19 +1720,41 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
 
 
 @app.post("/admin/backfill-orders", dependencies=[Depends(require_service_token)])
-async def admin_backfill_orders(seller_id: int, recent_n: int = 200, parent_user_id: int = 0):
-    """One-time historical fill: pull recent N orders into ml_order_cache, no Feishu write.
+async def admin_backfill_orders(seller_id: int, recent_n: int = 200, parent_user_id: int = 0,
+                                month: str | None = None, max_detail_fetch: int = 40):
+    """One-time historical fill: pull orders into ml_order_cache, no Feishu write.
 
-    Useful for filling pre-webhook history before running /report/sync-feishu-monthly.
-    Reuses _report_sku_recent_impl which already caches detail responses.
+    Two modes:
+      - recent_n (default): pull the most-recent N orders. Good for live / near-now.
+      - month=YYYY-MM: DATE-WINDOWED — page ALL orders in that month, fetching up to
+        max_detail_fetch NEW details per call (cache-hits are free). recent_n cannot reach a
+        past high-volume month's early orders (they are no longer "recent"); the window can.
+        Call repeatedly across ML cooldowns until new_fetches=0 & capped=false to fully warm
+        the cache, then run /report/sync-feishu-monthly.
+    Reuses _report_sku_recent_impl which already routes CBT vs local endpoints + caches detail.
     """
     parent = parent_user_id or seller_id
-    agg = await _report_sku_recent_impl(seller_id, recent_n, parent)
+    date_from = date_to = None
+    if month:
+        yyyy, mm = (int(x) for x in month.split("-"))
+        date_from = f"{yyyy}-{mm:02d}-01T00:00:00.000-00:00"
+        ty, tm = (yyyy + 1, 1) if mm == 12 else (yyyy, mm + 1)
+        date_to = f"{ty}-{tm:02d}-01T00:00:00.000-00:00"
+    agg = await _report_sku_recent_impl(
+        seller_id, recent_n, parent,
+        date_from=date_from, date_to=date_to,
+        max_detail_fetch=(max_detail_fetch if month else None),
+    )
     # Discard aggregation; the side-effect of cache_put_order is what we want.
     return {"status": "backfilled", "seller_id": seller_id, "parent_user_id": parent,
-            "packs": agg.get("packs_returned"), "orders_with_detail": agg.get("orders_with_detail"),
-            "unique_skus": agg.get("unique_skus"),
-            "note": "Orders cached in SQLite. Now call /report/sync-feishu-monthly to write Feishu."}
+            "mode": ("month:" + month) if month else f"recent_{recent_n}",
+            "window_orders": agg.get("packs_returned"),
+            "orders_with_detail": agg.get("orders_with_detail"),
+            "cache_hits": agg.get("cache_hits"),
+            "new_fetches": agg.get("new_fetches"),
+            "skipped_429": agg.get("skipped_429"),
+            "capped": agg.get("capped"),
+            "note": "Repeat until new_fetches=0 & capped=false, then /report/sync-feishu-monthly."}
 
 
 async def _report_sku_monthly_impl(seller_id: int, month: str, parent_user_id: int):
