@@ -1050,28 +1050,68 @@ async def admin_process_webhook_queue(limit: int = 50, parent_user_id: int = 150
 
 @app.post("/admin/missed-feeds", dependencies=[Depends(require_service_token)])
 async def admin_missed_feeds(parent_user_id: int = 1502520822):
-    """Backfill via ML missed_feeds endpoint — for events ML retried 8x without our 200.
+    """Backfill via ML missed_feeds for EVERY registered app (CBT + local_mx + local_br + ...),
+    not just CBT. Each app's missed feed is queried with that app's client_id plus any token
+    authorized under it. One app erroring (e.g. 429) does not block the others.
 
     Run daily via n8n cron.
     """
-    row = await db.get_token(parent_user_id)
-    if not row:
-        raise HTTPException(404, "parent token not found")
-    headers = {"Authorization": f"Bearer {row['access_token']}"}
-    app_id = os.getenv("ML_APP_ID")
-    if not app_id:
-        raise HTTPException(500, "ML_APP_ID not configured")
+    apps = await db.list_apps()
+    tokens = await db.list_tokens()
+    # app_key → first token (access_token) authorized under that app
+    token_by_appkey: dict[str, dict] = {}
+    for t in tokens:
+        ak = t.get("app_key")
+        if ak and ak not in token_by_appkey and t.get("access_token"):
+            token_by_appkey[ak] = t
 
+    # Build (client_id, access_token, app_key) jobs, deduped by client_id.
+    jobs: list[tuple[str, str, str]] = []
+    seen_client_ids: set[str] = set()
+    for a in apps:
+        cid = str(a.get("client_id") or "")
+        ak = a.get("app_key") or ""
+        if not cid or cid in seen_client_ids:
+            continue
+        tok = token_by_appkey.get(ak)
+        if not tok:
+            continue  # no token authorized this app yet → nothing to query
+        jobs.append((cid, tok["access_token"], ak))
+        seen_client_ids.add(cid)
+
+    # Legacy CBT fallback: guarantee CBT is covered even if its token row has no app_key link.
+    legacy_cid = os.getenv("ML_APP_ID")
+    if legacy_cid and legacy_cid not in seen_client_ids:
+        prow = await db.get_token(parent_user_id)
+        if prow:
+            jobs.append((legacy_cid, prow["access_token"], "cbt(legacy)"))
+            seen_client_ids.add(legacy_cid)
+
+    by_app: list[dict] = []
+    total_missed = 0
+    total_enqueued = 0
     async with httpx.AsyncClient(timeout=30) as client:
-        r = await _ml_get(client, f"https://api.mercadolibre.com/missed_feeds?app_id={app_id}", headers)
-    if r.status_code != 200:
-        raise HTTPException(r.status_code, f"missed_feeds failed: {r.text[:300]}")
-    missed = r.json() if isinstance(r.json(), list) else r.json().get("missed_feeds") or []
-    enqueued = 0
-    for n in missed:
-        if await db.enqueue_event(n):
-            enqueued += 1
-    return {"missed_total": len(missed), "newly_enqueued": enqueued}
+        for cid, access_token, ak in jobs:
+            headers = {"Authorization": f"Bearer {access_token}"}
+            try:
+                r = await _ml_get(client, f"https://api.mercadolibre.com/missed_feeds?app_id={cid}", headers)
+            except Exception as e:
+                by_app.append({"app_key": ak, "client_id": cid, "error": f"{type(e).__name__}: {str(e)[:120]}"})
+                continue
+            if r.status_code != 200:
+                by_app.append({"app_key": ak, "client_id": cid, "http": r.status_code, "body": r.text[:160]})
+                continue
+            payload = r.json()
+            missed = payload if isinstance(payload, list) else (payload.get("missed_feeds") or [])
+            enq = 0
+            for n in missed:
+                if await db.enqueue_event(n):
+                    enq += 1
+            total_missed += len(missed)
+            total_enqueued += enq
+            by_app.append({"app_key": ak, "client_id": cid, "missed": len(missed), "enqueued": enq})
+    return {"apps_checked": len(jobs), "missed_total": total_missed,
+            "newly_enqueued": total_enqueued, "by_app": by_app}
 
 
 # ---------- M3 → Feishu Bitable writer ----------
