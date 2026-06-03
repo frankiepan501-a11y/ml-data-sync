@@ -120,14 +120,37 @@ async def fetch_many_shipping_costs(
     shipment_keys: list[tuple[int, int, int]],  # [(shipment_id, seller_id, order_id), ...]
     token_user_id: int,
     concurrency: int = 5,
+    budget_s: float | None = None,
 ) -> dict[int, dict]:
     """Bulk fetch shipping costs with bounded concurrency, returning {shipment_id: {sender_cost, ...}}.
 
     CBT parent token is shared across all CBT operations → cap concurrency at 2 to avoid 429 storms.
+
+    budget_s: optional wall-clock budget for the LIVE-fetch phase. Already-cached shipments
+    (sender_cost>0) are seeded instantly with zero ML calls; only the rest are fetched live,
+    bounded by budget_s. On timeout we keep whatever completed (each is also persisted to cache)
+    and return — so the caller (sync-feishu-monthly) always finishes within bounded time instead
+    of hanging indefinitely on CBT's rate-limited shipment endpoint. Uncached shipments fill in
+    on subsequent runs from the warmed cache. Without budget_s, behavior is unchanged (full wait).
     """
     if token_user_id in _CBT_TOKEN_USERS:
         concurrency = min(concurrency, 2)
     out: dict[int, dict] = {}
+    # Cache-only seed: include already-cached shipments instantly, no ML calls.
+    need_live: list[tuple[int, int, int]] = []
+    for sid, seller_id, order_id in shipment_keys:
+        cached = await db.cache_get_shipping(sid)
+        if cached and float(cached.get("sender_cost") or 0) > 0:
+            out[sid] = {
+                "sender_cost": cached.get("sender_cost") or 0,
+                "gross_amount": cached.get("gross_amount") or 0,
+                "currency": cached.get("currency") or "",
+                "from_cache": True,
+            }
+        else:
+            need_live.append((sid, seller_id, order_id))
+    if not need_live:
+        return out
     sem = asyncio.Semaphore(concurrency)
     async with httpx.AsyncClient(timeout=20) as client:
         async def one(sid: int, seller_id: int, order_id: int):
@@ -136,5 +159,13 @@ async def fetch_many_shipping_costs(
                 if r:
                     out[sid] = r
 
-        await asyncio.gather(*[one(*k) for k in shipment_keys], return_exceptions=False)
+        gathered = asyncio.gather(*[one(*k) for k in need_live], return_exceptions=False)
+        if budget_s:
+            try:
+                await asyncio.wait_for(gathered, timeout=budget_s)
+            except asyncio.TimeoutError:
+                # Bounded: keep whatever completed (already in `out` + cached); rest fill next run.
+                pass
+        else:
+            await gathered
     return out

@@ -1362,7 +1362,14 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
     if order_shipments:
         from app import shipping
         ship_token_user = shipping.SHIPPING_TOKEN_USER.get(seller_id, seller_id)
-        ship_results = await shipping.fetch_many_shipping_costs(order_shipments, ship_token_user, concurrency=5)
+        # Wall-clock budget for the live shipment-cost fetch. CBT-FULL has 147+ shipments on a
+        # shared, rate-limited parent token; without a bound the fetch can run 20+ min, the
+        # Zeabur gateway resets the connection, and the function never reaches the Feishu write
+        # (数据拉取时间 stays stale → monthly cron false-alarms). Cached shipments seed instantly;
+        # uncached ones fetch up to the budget, the rest fill in on later runs.
+        ship_budget = float(os.environ.get("SHIP_FETCH_BUDGET_S", "75"))
+        ship_results = await shipping.fetch_many_shipping_costs(
+            order_shipments, ship_token_user, concurrency=5, budget_s=ship_budget)
         for sid, seller, oid in order_shipments:
             r = ship_results.get(sid)
             if not r:
