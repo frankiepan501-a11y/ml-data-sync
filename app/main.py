@@ -1170,7 +1170,8 @@ FEISHU_BASE_TABLE_ID = os.getenv("FEISHU_BASE_TABLE_ID", "tbl09sRPkX35PDfU")
 
 # Map child seller_id → store option label (must match Bitable single-select option)
 SHOP_LABEL: dict[int, str] = {
-    1510203792: "ML CBT-自发货 (1510203792)",
+    # 1510203792 (CBT-自发货) 已剔除 (2026-06-16): 幽灵店, marketplace/orders/search?seller=1510203792
+    # 返回的订单内层 seller 全是 1502236229(CBT-FULL) → 双重计数 CBT-FULL (~$1,438/月). 俊辉确认该店无真实订单.
     1502236229: "ML CBT-FULL (1502236229)",
     1407362838: "ML 本土1店 FUNLABDIRECTMX",
     1436420028: "ML 本土2店 FUNLAB_MX",
