@@ -630,6 +630,9 @@ async def cbt_pnl_api(seller_id: int, month: str, parent_user_id: int = 15025208
                 sku = item.get("seller_sku") or item.get("seller_custom_field") or "(no_sku)"
                 qty = int(it.get("quantity") or 1)
                 K = float(it.get("unit_price") or 0) * qty
+                # 🚨 CBT /marketplace/orders/ 的 sale_fee 是 PER-LINE 总额(实测 order 2000016704287954
+                # qty=2/unit_price=4.8/sale_fee=0.72=整行2单佣金, =导出L佣金), 不乘qty! (本土店原生
+                # /orders/ 的 sale_fee 才是 per-unit 要×qty — 两端点语义相反, 别混)
                 L = float(it.get("sale_fee") or 0)
                 Q = K * CBT_TAX_RATE; M = K * CBT_FX_RATE
                 a = agg.setdefault(sku, dict(K=0.0, L=0.0, Q=0.0, M=0.0, units=0))
@@ -1457,7 +1460,12 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
             cell["orders_count"] += 1
             cell["units"] += quantity
             cell["revenue_total"] += amount * quantity
-            cell["commission_total"] += sale_fee
+            # 🚨 sale_fee 语义按端点相反(2026-06-17 实测):
+            #   CBT /marketplace(有global_price): sale_fee=PER-LINE总额(order 2000016704287954 qty=2/
+            #     unit_price=4.8/sale_fee=0.72=整行2单佣金=导出L) → 不×qty.
+            #   本土店原生 /orders(无global_price): sale_fee=PER-UNIT(qty=2单 sale_fee=100.69=1单16%) →
+            #     必须×qty, 否则多件单漏算佣金(本土店实测漏100.69=billing 2189.95-API 2089.26).
+            cell["commission_total"] += sale_fee if gp else sale_fee * quantity
             cell["discount_total"] = cell.get("discount_total", 0) + seller_discount_local
             order_items_skus.append((sku, quantity))
             dc = (od.get("date_created") or "")[:10]
@@ -1678,12 +1686,13 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
                     cost_rmb = cgp * r["units"]
                     fields["采购成本(RMB)"] = round(cost_rmb, 2)
                     fields["简易毛利(RMB)"] = round(rev_rmb - cost_rmb, 2)
-                    # Phase B2 + P2.5: full profit = 营收 - 采购 - 佣金 - 广告 - VAT - 物流 - 卖家折扣
-                    # NOTE: refund 数据待运营 verify (CBT-FULL FF05-2 退款字段疑似累计/stale,
-                    # 与营收量级不符). 先只显示, 不进毛利公式. 等 Phase B2.1 verify 后启用.
-                    # 头程/海外仓/ML FULL fee 待 5/21 俊辉确认数据源
+                    # full profit = 营收 - 采购 - 佣金 - 广告 - VAT(税) - 物流
+                    # 🚨 卖家折扣绝不扣(2026-06-17 收口): unit_price/global_price 已是官方"产品收入K"折后净额,
+                    #   discounts.amounts.seller 只是促销信息非成本. 历史误扣→总表-1.89万假亏根源. 折扣字段仅显示不进公式.
+                    # NOTE: refund 先只显示不进公式(CBT-FULL 退款字段疑累计/stale 待 verify).
+                    #   头程/海外仓/Full仓储 待接(task4 美通摊分已部分灌另2列). VAT: 本土9.05%/CBT13.8%(vat_for_site).
                     full_profit = (rev_rmb - cost_rmb - commission_rmb - ad_cost_rmb
-                                   - vat_rmb - shipping_rmb - discount_rmb)
+                                   - vat_rmb - shipping_rmb)
                     fields["全额毛利(RMB)"] = round(full_profit, 2)
                 except (TypeError, ValueError):
                     skus_missing_cost.append(r["sku"])

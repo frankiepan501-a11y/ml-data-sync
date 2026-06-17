@@ -16,6 +16,7 @@ cost flows to a synthetic `_unallocated_ads` bucket Feishu row.
 
 from __future__ import annotations
 
+import os
 import re
 import time
 from typing import Any
@@ -356,13 +357,21 @@ def attribute_ad_cost_to_skus(campaigns: list[dict], known_skus: set[str]) -> tu
     return sku_cost, unallocated
 
 
-# Site_id → estimated VAT rate (Phase B1: informational, not deducted from profit yet)
-# MLM Mexico IVA 16%; MLB Brazil ICMS avg 18%; CBT-MX since ML withholds IVA upfront,
-# seller's net already excludes it → 0 here.
+# Site_id → 实际预扣税率 (deducted from profit). 2026-06-17 校准:
+#   🚨 MLM 本土店不是 16% IVA! 官方"Ventas"导出 I列(Cargo por venta e impuestos)=佣金+税合并;
+#      实测逐单 I/H 恒=25.05% = 佣金16%(API sale_fee, 随listing_type变) + 税9.05%(法定预扣).
+#      税 = ML 代墨西哥 SAT 预扣 IVA retención(~8%) + ISR retención(~1%), 按收入恒定%, 非 16% IVA.
+#      税**只在订单报表 I列**, order API(taxes.amount=null/taxes_amount=0) 和 billing API(账单只有
+#      佣金/运费/广告/仓储4类, 无 IVA 行) **都不暴露** → A 引擎只能用此校准率, B 用导出 I列−佣金 做真值,
+#      每月 A vs B 对账校准. 实测 13687.45 MXN 收入 → 税 1238.89(9.0512%). env MLM_TAX_RATE 可调.
+#   MLB Brazil ICMS avg 18% (待 Brazil 店实测校准); CBT-MX 走 cbt-pnl-api 单算(13.8%), 主sync不重复扣→0.
 VAT_RATE_BY_SITE: dict[str, float] = {
-    "MLM": 0.16,
+    "MLM": float(os.getenv("MLM_TAX_RATE", "0.0905")),
     "MLB": 0.18,
-    "CBT": 0.0,  # ML withholds IVA at CBT level
+    # CBT-MX 税(IVA 代扣)按 K×13.8% 扣(2026-06-17 收口校验: 官方 Orders report Q税列实测 13.82% ✓).
+    # 旧注释"seller's net already excludes it→0"是错的: 导出 Q税列是独立扣项, 从 S净受领中扣减.
+    # 与 main.py CBT_TAX_RATE 同 env 同默认, 保持主sync 与 cbt-pnl-api 口径一致.
+    "CBT": float(os.getenv("CBT_TAX_RATE", "0.138")),
 }
 
 
