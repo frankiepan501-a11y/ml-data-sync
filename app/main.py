@@ -567,6 +567,116 @@ async def debug_orders_first_page(
     }
 
 
+# ============ A 引擎: CBT 平台P&L 从 ML API 直算 (对账官方 Orders report, 2026-06-17) ============
+# 官方导出口径: S(净受领/回款) = K(收入) - L(佣金) - O(运费) - Q(税) - M(汇率差) - R(退款)
+#   K = order_item.unit_price*qty (=官方Income per product, 已折后净额) / L = sale_fee (=Selling fee)
+#   O = /marketplace/shipments/{id}/costs senders[].cost (=Shipping cost, 走 shipping.fetch_shipping_cost)
+#   R = payments[].transaction_amount_refunded (CBT为MXN买家币→/base_exchange_rate折USD)
+#   Q = K*CBT_TAX_RATE (CBT-MX税代扣无API, 实测~13.8%) / M = K*CBT_FX_RATE (汇率差结算端算, 粗估~0.18%)
+#   🚨 discounts.amounts.seller 不是成本(K已折后), 绝不扣! (这是历史-1.8万假账根源)
+# 缓存可续跑: 重复调直到 complete=true(pending=0)。GMT-6月边界 + date_created(无"order."前缀!) + 半月窗口避offset1000上限。
+CBT_TAX_RATE = float(os.getenv("CBT_TAX_RATE", "0.138"))
+CBT_FX_RATE = float(os.getenv("CBT_FX_RATE", "0.0018"))
+
+
+@app.get("/report/cbt-pnl-api", dependencies=[Depends(require_service_token)])
+async def cbt_pnl_api(seller_id: int, month: str, parent_user_id: int = 1502520822,
+                      max_detail_fetch: int = 500, max_ship_fetch: int = 500):
+    from app import shipping as _ship
+    import calendar as _cal
+    row = await db.get_token(parent_user_id)
+    if not row:
+        raise HTTPException(404, "parent token not found")
+    headers = {"Authorization": f"Bearer {row['access_token']}"}
+    yyyy, mm = [int(x) for x in month.split("-")]
+    last_day = _cal.monthrange(yyyy, mm)[1]
+    # 半月窗口(GMT-6墨西哥), 每窗<1000单避offset上限
+    windows = [(f"{yyyy}-{mm:02d}-01T00:00:00.000-06:00", f"{yyyy}-{mm:02d}-16T00:00:00.000-06:00"),
+               (f"{yyyy}-{mm:02d}-16T00:00:00.000-06:00",
+                (f"{yyyy}-{mm:02d}-{last_day:02d}T23:59:59.999-06:00"))]
+    order_ids: list[int] = []; seen = set()
+    async with httpx.AsyncClient(timeout=120) as client:
+        for dfrom, dto in windows:
+            offset = 0
+            while True:
+                params = {"seller": seller_id, "limit": 50, "offset": offset, "sort": "date_desc",
+                          "date_created.from": dfrom, "date_created.to": dto}
+                r = await _ml_get(client, "https://api.mercadolibre.com/marketplace/orders/search", headers, params)
+                if r.status_code != 200:
+                    raise HTTPException(502, f"orders/search status={r.status_code} {r.text[:200]}")
+                j = r.json(); results = j.get("results", [])
+                if not results:
+                    break
+                for pack in results:
+                    for sub in (pack.get("orders") or [pack]):
+                        oid = sub.get("id")
+                        if oid and oid not in seen:
+                            seen.add(oid); order_ids.append(int(oid))
+                offset += 50
+                if offset >= 1000 or len(results) < 50:
+                    break
+        agg: dict = {}
+        tot = dict(K=0.0, L=0.0, O=0.0, Q=0.0, M=0.0, R=0.0, units=0, orders=0, cancelled=0)
+        new_detail = 0; new_ship = 0; pending_detail = 0; pending_ship = 0
+        for oid in order_ids:
+            cached = await db.cache_get_order(oid)
+            od = cached.get("_payload") if cached else None
+            if not od:
+                if new_detail >= max_detail_fetch:
+                    pending_detail += 1; continue
+                rd = await _ml_get(client, f"https://api.mercadolibre.com/marketplace/orders/{oid}", headers)
+                new_detail += 1
+                if rd.status_code != 200:
+                    continue
+                od = rd.json(); await db.cache_put_order(oid, seller_id, od)
+            tot["orders"] += 1
+            if od.get("status") == "cancelled":
+                tot["cancelled"] += 1
+            items = od.get("order_items") or []
+            # base_exchange_rate(MXN/USD)用于把买家币退款折USD
+            ber = 0.0
+            for it in items:
+                ber = float(it.get("base_exchange_rate") or 0) or ber
+            refunded_buyer = sum(float(p.get("transaction_amount_refunded") or 0) for p in (od.get("payments") or []))
+            R_usd = (refunded_buyer / ber) if ber else 0.0
+            ship_id = (od.get("shipping") or {}).get("id")
+            O_usd = 0.0
+            if ship_id:
+                cs = await db.cache_get_shipping(int(ship_id))
+                if cs and float(cs.get("sender_cost") or 0) > 0:
+                    O_usd = float(cs["sender_cost"])
+                elif new_ship < max_ship_fetch:
+                    sc = await _ship.fetch_shipping_cost(int(ship_id), seller_id, oid, parent_user_id, client)
+                    new_ship += 1
+                    if sc:
+                        O_usd = float(sc.get("sender_cost") or 0)
+                else:
+                    pending_ship += 1
+            tot["O"] += O_usd; tot["R"] += R_usd
+            for it in items:
+                item = it.get("item") or {}
+                sku = item.get("seller_sku") or item.get("seller_custom_field") or "(no_sku)"
+                qty = int(it.get("quantity") or 1)
+                K = float(it.get("unit_price") or 0) * qty
+                L = float(it.get("sale_fee") or 0)
+                Q = K * CBT_TAX_RATE; M = K * CBT_FX_RATE
+                a = agg.setdefault(sku, dict(K=0.0, L=0.0, Q=0.0, M=0.0, units=0))
+                a["K"] += K; a["L"] += L; a["Q"] += Q; a["M"] += M; a["units"] += qty
+                tot["K"] += K; tot["L"] += L; tot["Q"] += Q; tot["M"] += M; tot["units"] += qty
+        S = tot["K"] - tot["L"] - tot["O"] - tot["Q"] - tot["M"] - tot["R"]
+    return {
+        "seller_id": seller_id, "month": month, "scope": "官方Orders report口径(全状态, R冲销取消单)",
+        "orders_in_scope": len(order_ids), "orders_processed": tot["orders"], "cancelled": tot["cancelled"],
+        "pending_detail": pending_detail, "pending_ship": pending_ship,
+        "new_detail_fetched": new_detail, "new_ship_fetched": new_ship,
+        "complete": pending_detail == 0 and pending_ship == 0,
+        "totals_usd": {**{k: round(v, 2) for k, v in tot.items()}, "S_net_payback": round(S, 2)},
+        "per_sku_top": {s: {k: round(v, 2) for k, v in a.items()}
+                        for s, a in sorted(agg.items(), key=lambda x: -x[1]["K"])[:30]},
+        "rates": {"tax": CBT_TAX_RATE, "fx": CBT_FX_RATE},
+    }
+
+
 import asyncio as _asyncio
 import random as _random
 from aiolimiter import AsyncLimiter
