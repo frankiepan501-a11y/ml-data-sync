@@ -1692,14 +1692,11 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
                     cost_rmb = cgp * r["units"]
                     fields["采购成本(RMB)"] = round(cost_rmb, 2)
                     fields["简易毛利(RMB)"] = round(rev_rmb - cost_rmb, 2)
-                    # full profit = 营收 - 采购 - 佣金 - 广告 - VAT(税) - 物流
-                    # 🚨 卖家折扣绝不扣(2026-06-17 收口): unit_price/global_price 已是官方"产品收入K"折后净额,
-                    #   discounts.amounts.seller 只是促销信息非成本. 历史误扣→总表-1.89万假亏根源. 折扣字段仅显示不进公式.
-                    # NOTE: refund 先只显示不进公式(CBT-FULL 退款字段疑累计/stale 待 verify).
-                    #   头程/海外仓/Full仓储 待接(task4 美通摊分已部分灌另2列). VAT: 本土9.05%/CBT13.8%(vat_for_site).
-                    full_profit = (rev_rmb - cost_rmb - commission_rmb - ad_cost_rmb
-                                   - vat_rmb - shipping_rmb)
-                    fields["全额毛利(RMB)"] = round(full_profit, 2)
+                    # 🚨 全额毛利(RMB) 2026-06-17 task4 改为飞书**公式字段**(不再代码写):
+                    #   = 营收 - SUM(采购,佣金,广告,VAT,物流,退款,Full仓储,头程,海外仓)
+                    #   各写入方(主sync/CBT导出解析/美通)只写自己的成本列, 公式自动重算 → 无排序/幂等问题.
+                    #   折扣绝不进公式(已是折后K净额); 退款/头程/海外仓/Full仓储统一由公式扣.
+                    #   故此处不再 fields["全额毛利(RMB)"]=... (写公式字段会报错).
                 except (TypeError, ValueError):
                     skus_missing_cost.append(r["sku"])
             else:
