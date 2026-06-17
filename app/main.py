@@ -589,46 +589,18 @@ async def cbt_pnl_api(seller_id: int, month: str, parent_user_id: int = 15025208
         raise HTTPException(404, "parent token not found")
     headers = {"Authorization": f"Bearer {row['access_token']}"}
     yyyy, mm = [int(x) for x in month.split("-")]
-    last_day = _cal.monthrange(yyyy, mm)[1]
-    # 半月窗口(GMT-6墨西哥), 每窗<1000单避offset上限
-    windows = [(f"{yyyy}-{mm:02d}-01T00:00:00.000-06:00", f"{yyyy}-{mm:02d}-16T00:00:00.000-06:00"),
-               (f"{yyyy}-{mm:02d}-16T00:00:00.000-06:00",
-                (f"{yyyy}-{mm:02d}-{last_day:02d}T23:59:59.999-06:00"))]
-    order_ids: list[int] = []; seen = set()
+    _ = _cal  # (windows 不再需要; 纯从缓存算避免 orders/search 限流)
+    # 🚨 纯从已缓存订单详情算(backfill/webhook 已缓存), 不调 orders/search → 无 429。
+    # 缓存补全靠 /admin/backfill-orders?month=(date 参数已修); 本端点只读缓存 + 拉运费(capped 可续跑)。
+    cached_orders = await db.cache_list_orders_for_month(seller_id, month)
+    agg: dict = {}
+    tot = dict(K=0.0, L=0.0, O=0.0, Q=0.0, M=0.0, R=0.0, units=0, orders=0, cancelled=0)
+    new_detail = 0; new_ship = 0; pending_detail = 0; pending_ship = 0
     async with httpx.AsyncClient(timeout=120) as client:
-        for dfrom, dto in windows:
-            offset = 0
-            while True:
-                params = {"seller": seller_id, "limit": 50, "offset": offset, "sort": "date_desc",
-                          "date_created.from": dfrom, "date_created.to": dto}
-                r = await _ml_get(client, "https://api.mercadolibre.com/marketplace/orders/search", headers, params)
-                if r.status_code != 200:
-                    raise HTTPException(502, f"orders/search status={r.status_code} {r.text[:200]}")
-                j = r.json(); results = j.get("results", [])
-                if not results:
-                    break
-                for pack in results:
-                    for sub in (pack.get("orders") or [pack]):
-                        oid = sub.get("id")
-                        if oid and oid not in seen:
-                            seen.add(oid); order_ids.append(int(oid))
-                offset += 50
-                if offset >= 1000 or len(results) < 50:
-                    break
-        agg: dict = {}
-        tot = dict(K=0.0, L=0.0, O=0.0, Q=0.0, M=0.0, R=0.0, units=0, orders=0, cancelled=0)
-        new_detail = 0; new_ship = 0; pending_detail = 0; pending_ship = 0
-        for oid in order_ids:
-            cached = await db.cache_get_order(oid)
-            od = cached.get("_payload") if cached else None
+        for cr in cached_orders:
+            od = cr.get("_payload")
             if not od:
-                if new_detail >= max_detail_fetch:
-                    pending_detail += 1; continue
-                rd = await _ml_get(client, f"https://api.mercadolibre.com/marketplace/orders/{oid}", headers)
-                new_detail += 1
-                if rd.status_code != 200:
-                    continue
-                od = rd.json(); await db.cache_put_order(oid, seller_id, od)
+                continue
             tot["orders"] += 1
             if od.get("status") == "cancelled":
                 tot["cancelled"] += 1
@@ -646,7 +618,7 @@ async def cbt_pnl_api(seller_id: int, month: str, parent_user_id: int = 15025208
                 if cs and float(cs.get("sender_cost") or 0) > 0:
                     O_usd = float(cs["sender_cost"])
                 elif new_ship < max_ship_fetch:
-                    sc = await _ship.fetch_shipping_cost(int(ship_id), seller_id, oid, parent_user_id, client)
+                    sc = await _ship.fetch_shipping_cost(int(ship_id), seller_id, int(od.get("id") or 0), parent_user_id, client)
                     new_ship += 1
                     if sc:
                         O_usd = float(sc.get("sender_cost") or 0)
@@ -666,8 +638,8 @@ async def cbt_pnl_api(seller_id: int, month: str, parent_user_id: int = 15025208
         S = tot["K"] - tot["L"] - tot["O"] - tot["Q"] - tot["M"] - tot["R"]
     return {
         "seller_id": seller_id, "month": month, "scope": "官方Orders report口径(全状态, R冲销取消单)",
-        "orders_in_scope": len(order_ids), "orders_processed": tot["orders"], "cancelled": tot["cancelled"],
-        "pending_detail": pending_detail, "pending_ship": pending_ship,
+        "cached_orders": len(cached_orders), "orders_processed": tot["orders"], "cancelled": tot["cancelled"],
+        "pending_ship": pending_ship,
         "new_detail_fetched": new_detail, "new_ship_fetched": new_ship,
         "complete": pending_detail == 0 and pending_ship == 0,
         "totals_usd": {**{k: round(v, 2) for k, v in tot.items()}, "S_net_payback": round(S, 2)},
@@ -817,8 +789,9 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
                 page_size = min(50, recent_n - len(packs))
             params = {"seller": seller_id, "limit": page_size, "offset": offset, "sort": "date_desc"}
             if windowed:
-                params["order.date_created.from"] = date_from
-                params["order.date_created.to"] = date_to
+                # 🚨 marketplace/orders/search 的日期过滤参数无"order."前缀(带前缀被静默忽略→返回全时段)
+                params["date_created.from"] = date_from
+                params["date_created.to"] = date_to
             r = await _ml_get(client, orders_search_url, headers, params)
             if r.status_code == 429:
                 await _asyncio.sleep(30)
