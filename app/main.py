@@ -1392,6 +1392,12 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
     """
     if seller_id not in SHOP_LABEL:
         raise HTTPException(400, f"unknown seller_id {seller_id}; allowed: {list(SHOP_LABEL.keys())}")
+    # 🚨 CBT-FULL(1502236229) 不走主sync(2026-06-17 task3): orders/search 被429墙→缓存仅~85%不全,
+    # 且 Full仓储无CBT API → 主sync CBT毛利结构性不准. CBT 改走官方导出解析(cbt_export_ingest.py,
+    # B口径完整准确) 按SKU update 写飞书. 主sync只写本土店(缓存完整). 防主sync用85%数字覆盖导出行.
+    if seller_id == 1502236229:
+        return {"status": "skipped_cbt", "seller_id": seller_id, "month": month,
+                "note": "CBT-FULL 走官方导出解析(cbt_export_ingest.py), 不走主sync(缓存仅85%不全)."}
     period = period_label or f"month_{month}"
 
     cached_rows = await db.cache_list_orders_for_month(seller_id, month)
