@@ -366,14 +366,14 @@ def attribute_ad_cost_to_skus(campaigns: list[dict], known_skus: set[str]) -> tu
 #      每月 A vs B 对账校准. 实测 13687.45 MXN 收入 → 税 1238.89(9.0512%). env MLM_TAX_RATE 可调.
 #   🚨 MLB 巴西不是 18% ICMS! (旧假设错). 官方"Vendas BR"导出 K列(Tarifa de venda e impostos)=佣金+税合并;
 #      sale_fee 实测=per-unit(order qty=2/unit_price=49.9/sale_fee=6.49=单单位)要×qty(同墨西哥原生,非CBT per-line).
-#      逐SKU A(飞书主sync sale_fee×qty)vs B(导出非取消): A佣金=3489.74 BRL vs B K列=3648.18 → 税=158.44 BRL=营收 0.58%.
-#      巴西 ML 税(impostos)只是佣金上的小额服务税, 非销售 ICMS. 营收H是卖家净产品收入(ICMS已在定价).
-#      税只在导出 K列, A 用此校准率, B 用导出 K列-API佣金 做真值月度对账. env BR_TAX_RATE 可调.
-#      ⚠️残留: 逐SKU营收 A vs B 有~0.17%差(缓存订单归属差异, 总额级小, 非税).
+#      🚨 税率必须**订单级JOIN同一订单集**算, 不能用聚合差(不同订单集的聚合差含订单集错配, 非纯税!Frankie 2026-06-18 纠正).
+#      JOIN venta=pack_id 匹配452单(A营收=B营收=28349.55 完全一致): A佣金(sale_fee×qty)=3597.94 vs B K列=3766.13
+#      → 真税=168.19 BRL=营收 0.593%. **逐单89%税=0, 集中11%订单**(疑特定高客单SKU巴西税); flat 0.593%是其聚合近似.
+#      巴西 ML 税(impostos)非销售 ICMS(营收H是卖家净额). B 用导出 K列-API佣金(订单级匹配)做真值月度对账. env BR_TAX_RATE 可调.
 #   CBT-MX 走 cbt-pnl-api 单算(13.8%), 主sync不重复扣→0.
 VAT_RATE_BY_SITE: dict[str, float] = {
     "MLM": float(os.getenv("MLM_TAX_RATE", "0.0905")),
-    "MLB": float(os.getenv("BR_TAX_RATE", "0.0058")),
+    "MLB": float(os.getenv("BR_TAX_RATE", "0.0059")),
     # CBT-MX 税(IVA 代扣)按 K×13.8% 扣(2026-06-17 收口校验: 官方 Orders report Q税列实测 13.82% ✓).
     # 旧注释"seller's net already excludes it→0"是错的: 导出 Q税列是独立扣项, 从 S净受领中扣减.
     # 与 main.py CBT_TAX_RATE 同 env 同默认, 保持主sync 与 cbt-pnl-api 口径一致.
