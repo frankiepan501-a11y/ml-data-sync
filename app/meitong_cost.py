@@ -349,6 +349,80 @@ def build_unit(months=12):
             for k, v in agg.items() if v["plat"] == "美客多"}
 
 
+# ============ 诊断(只读, 不写报表) ============
+def diag(period="month_2026-05", months=12):
+    """全链路解析诊断: 每个发货台产品名/标签 → key_used → resolve_erp 结果, 平台分布,
+    订单cbm填充, unit dict, 与 ML 期间行 SKU 的交集缺口。"""
+    orders = meitong_orders()
+    cut = _cutoff(months)
+    zsmx = [o for o in orders if str(o.get("orderNo", "")).startswith("ZSMX")]
+    in_win = [o for o in zsmx if ((o.get("warehouseArrivalTime") or o.get("orderTime") or o.get("createTime") or "")[:10] >= (cut or "0"))]
+    cbm_ok = sum(1 for o in zsmx if (o.get("realChargeableNum") or o.get("realVolume")))
+    name2erp, sku_set = load_erp()
+
+    # 重跑 live_resolver 但保留原始字段
+    rows = _sheet(ZL_SHEET_LIVE, "A1:Q3000")
+    hdr = {str(h).strip(): i for i, h in enumerate(rows[0])} if rows else {}
+    cb = hdr.get("送往中转仓箱唛", 1); cs = hdr.get("店铺", 9); cp = hdr.get("产品名", 11)
+    cq = hdr.get("数量", 12); cl = hdr.get("国内所贴产品标签", 15); cw = hdr.get("送往中转仓的货件号", 16)
+    cerp = hdr.get("ERP-SKU", 10)
+    win_wb = set(o.get("orderNo") for o in in_win)
+    resmap = {}
+    for r in rows[1:] if rows else []:
+        g = lambda i: (r[i] if (i is not None and len(r) > i) else None)
+        key = str(g(cw) or g(cb) or "").strip()
+        if not key.startswith("ZSMX"):
+            continue
+        wb = key.split("U")[0]
+        label = str(g(cl) or "").strip(); pname = str(g(cp) or "").strip(); erpcol = str(g(cerp) or "").strip()
+        sku_key = label if label.startswith("X00") else (pname or label)
+        store = str(g(cs) or ""); plat = "美客多" if "美客多" in store else "亚马逊"
+        try:
+            qty = float(str(g(cq)).strip()) if g(cq) not in (None, "") else 0.0
+        except ValueError:
+            qty = 0.0
+        erp, reason = resolve_erp(sku_key, name2erp, sku_set)
+        k = (pname, label, store)
+        d = resmap.setdefault(k, {"pname": pname, "label": label, "erpcol": erpcol, "store": store,
+                                  "plat": plat, "key_used": sku_key, "erp": erp, "reason": reason,
+                                  "qty": 0.0, "wbs": set(), "wbs_in_win": set()})
+        d["qty"] += qty; d["wbs"].add(wb)
+        if wb in win_wb:
+            d["wbs_in_win"].add(wb)
+    res = []
+    for d in resmap.values():
+        d["n_wb"] = len(d["wbs"]); d["n_wb_in_win"] = len(d["wbs_in_win"])
+        del d["wbs"], d["wbs_in_win"]
+        res.append(d)
+    res.sort(key=lambda x: -x["qty"])
+
+    unit = build_unit(months)
+    # ML 期间行
+    recs, pt = [], None
+    while True:
+        url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{ML_APP}/tables/{ML_T}/records/search?page_size=500" + (f"&page_token={pt}" if pt else "")
+        dd = _fs(url, {}, "POST").get("data", {})
+        recs += dd.get("items", []); pt = dd.get("page_token")
+        if not dd.get("has_more") or not pt:
+            break
+    ml = []
+    for r in recs:
+        f = r["fields"]
+        if _txt(f.get("周期")) != period:
+            continue
+        sku = _txt(f.get("SKU"))
+        ml.append({"sku": sku, "qty": _num(f.get("件数")), "in_unit": sku in unit,
+                   "seller": _txt(f.get("店铺"))})
+    return {"period": period, "months": months, "cutoff": cut,
+            "orders_total": len(orders), "zsmx": len(zsmx), "zsmx_in_window": len(in_win),
+            "zsmx_cbm_ok": cbm_ok,
+            "live_resolution": res,
+            "unit": {k: {"head_u": round(v[0], 4), "ovs_u": round(v[1], 4)} for k, v in unit.items()},
+            "ml_rows": ml,
+            "ml_in_unit": [m["sku"] for m in ml if m["in_unit"]],
+            "ml_not_in_unit": [m["sku"] for m in ml if not m["in_unit"]]}
+
+
 # ============ 写 ML 报表 ============
 def run(period, months=12, commit=False):
     """灌 period(如 month_2026-04) 的美通中转 头程/海外仓成本。commit=False 只预览。"""

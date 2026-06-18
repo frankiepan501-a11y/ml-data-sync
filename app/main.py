@@ -1016,6 +1016,16 @@ def sync_meitong_cost(period: str, months: int = 12, commit: bool = False):
         return {"status": "error", "exc": type(e).__name__, "msg": str(e), "traceback": traceback.format_exc()}
 
 
+@app.post("/report/meitong-diag", dependencies=[Depends(require_service_token)])
+def meitong_diag(period: str = "month_2026-05", months: int = 12):
+    import traceback
+    from app import meitong_cost
+    try:
+        return meitong_cost.diag(period, months)
+    except Exception as e:
+        return {"status": "error", "exc": type(e).__name__, "msg": str(e), "traceback": traceback.format_exc()}
+
+
 @app.get("/admin/cache-stats", dependencies=[Depends(require_service_token)])
 async def admin_cache_stats():
     return await db.cache_stats()
