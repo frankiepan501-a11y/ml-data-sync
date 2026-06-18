@@ -244,14 +244,19 @@ def oversea_box_fee():
 
 
 def zhiling_boxcount():
-    """指令明细 sheet → {运单号: SUM(箱数)} = 实际换标箱数。"""
+    """指令明细 sheet → {运单号: SUM(箱数)} = 实际换标箱数。按表头名取列(防插列错位)。"""
     out = defaultdict(float)
-    for r in _sheet(ZL_SHEET_CMD, "A1:M3000")[1:]:
-        wb = str(r[12]).strip() if len(r) > 12 and r[12] else ""   # M列 物流货件号
+    rows = _sheet(ZL_SHEET_CMD, "A1:M3000")
+    if not rows:
+        return dict(out)
+    hdr = {str(h).strip(): i for i, h in enumerate(rows[0])}
+    c_wb = hdr.get("物流货件号", 12); c_box = hdr.get("箱数", 11)
+    for r in rows[1:]:
+        wb = str(r[c_wb]).strip() if (len(r) > c_wb and r[c_wb]) else ""
         if not wb.startswith("ZSMX"):
             continue
         try:
-            box = float(str(r[11]).strip()) if len(r) > 11 and r[11] not in (None, "") else 0  # L列 箱数
+            box = float(str(r[c_box]).strip()) if (len(r) > c_box and r[c_box] not in (None, "")) else 0
         except ValueError:
             box = 0
         out[wb] += box
@@ -260,20 +265,32 @@ def zhiling_boxcount():
 
 # ============ 活表 SKU 解析(运单→SKU/数量/平台) ============
 def live_resolver():
+    # 🚨 按表头名取列, 不硬编索引(2026-06-18 踩坑: 发货台插「ERP-SKU」列致硬编索引全右移1位→
+    #   读错列(把"国内所贴产品标签"当货件号)→ ZSMX过滤命中0 → meitong_skus=0 头程/海外仓静默全0)。
     by_wb = defaultdict(list)
-    for r in _sheet(ZL_SHEET_LIVE, "A1:Q3000")[1:]:
-        g = lambda i: (r[i] if len(r) > i else None)
-        key = str(g(15) or g(1) or "").strip()                 # 货件号(col15) or 箱唛(col1)
+    rows = _sheet(ZL_SHEET_LIVE, "A1:Q3000")
+    if not rows:
+        return by_wb
+    hdr = {str(h).strip(): i for i, h in enumerate(rows[0])}
+    c_box = hdr.get("送往中转仓箱唛", 1)
+    c_store = hdr.get("店铺", 9)
+    c_pname = hdr.get("产品名", 11)
+    c_qty = hdr.get("数量", 12)
+    c_label = hdr.get("国内所贴产品标签", 15)
+    c_wb = hdr.get("送往中转仓的货件号", 16)
+    for r in rows[1:]:
+        g = lambda i: (r[i] if (i is not None and len(r) > i) else None)
+        key = str(g(c_wb) or g(c_box) or "").strip()           # 货件号 or 箱唛
         if not key.startswith("ZSMX"):
             continue
         wb = key.split("U")[0]
-        label = str(g(14) or "").strip(); pname = str(g(10) or "").strip()  # 国内所贴产品标签 / 产品名
+        label = str(g(c_label) or "").strip(); pname = str(g(c_pname) or "").strip()
         sku = label if label.startswith("X00") else (pname or label)
         try:
-            qty = float(str(g(11)).strip()) if g(11) not in (None, "") else 0.0
+            qty = float(str(g(c_qty)).strip()) if g(c_qty) not in (None, "") else 0.0
         except ValueError:
             qty = 0.0
-        store = str(g(9) or "")
+        store = str(g(c_store) or "")
         plat = "美客多" if "美客多" in store else "亚马逊"
         by_wb[wb].append({"sku": sku, "qty": qty, "platform": plat})
     return by_wb
