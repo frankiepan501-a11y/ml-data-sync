@@ -450,7 +450,13 @@ def run(period, months=12, commit=False):
         _ml_alias = lambda s: s
     written, blank, mh, mo, detail = 0, 0, 0.0, 0.0, []
     for r in rows:
-        f = r["fields"]; sku = _ml_alias(_txt(f.get("SKU")))
+        f = r["fields"]
+        # 🚨 美通=墨西哥中转仓, 只服务墨西哥美客多店(CBT+本土); 巴西店(AIRSOFT)走三沐, 绝不套美通成本
+        #   (防 FB07-7/KS35-19 等同 SKU 跨国把墨西哥美通单价误算到巴西销售)
+        store = _txt(f.get("店铺"))
+        if "巴西" in store or "AIRSOFT" in store.upper():
+            blank += 1; continue
+        sku = _ml_alias(_txt(f.get("SKU")))
         if sku not in unit:
             blank += 1; continue
         qty = _num(f.get("件数"))
