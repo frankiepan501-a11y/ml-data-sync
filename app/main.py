@@ -1026,6 +1026,29 @@ def meitong_diag(period: str = "month_2026-05", months: int = 12):
         return {"status": "error", "exc": type(e).__name__, "msg": str(e), "traceback": traceback.format_exc()}
 
 
+@app.post("/report/validate-skus", dependencies=[Depends(require_service_token)])
+def validate_skus(skus: str, period: str = "month_2026-05"):
+    """校验逗号分隔的 ERP SKU 是否存在于领星产品库 + 是否在 period 的 ML 报表行(有销量)。"""
+    import traceback
+    from app import meitong_cost as mc
+    try:
+        name2erp, sku_set = mc.load_erp()
+        recs, pt = [], None
+        while True:
+            url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{mc.ML_APP}/tables/{mc.ML_T}/records/search?page_size=500" + (f"&page_token={pt}" if pt else "")
+            d = mc._fs(url, {}, "POST").get("data", {})
+            recs += d.get("items", []); pt = d.get("page_token")
+            if not d.get("has_more") or not pt:
+                break
+        ml_skus = set(mc._txt(r["fields"].get("SKU")) for r in recs if mc._txt(r["fields"].get("周期")) == period)
+        out = {}
+        for s in [x.strip() for x in skus.split(",") if x.strip()]:
+            out[s] = {"exists_lingxing": s in sku_set, "in_ml_period": s in ml_skus}
+        return {"period": period, "lingxing_total": len(sku_set), "result": out}
+    except Exception as e:
+        return {"status": "error", "exc": type(e).__name__, "msg": str(e), "traceback": traceback.format_exc()}
+
+
 @app.get("/admin/cache-stats", dependencies=[Depends(require_service_token)])
 async def admin_cache_stats():
     return await db.cache_stats()
