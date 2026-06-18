@@ -274,6 +274,7 @@ def live_resolver():
     hdr = {str(h).strip(): i for i, h in enumerate(rows[0])}
     c_box = hdr.get("送往中转仓箱唛", 1)
     c_store = hdr.get("店铺", 9)
+    c_erpcol = hdr.get("ERP-SKU")                              # 物流直填 ERP SKU(最可靠), 见下
     c_pname = hdr.get("产品名", 11)
     c_qty = hdr.get("数量", 12)
     c_label = hdr.get("国内所贴产品标签", 15)
@@ -285,7 +286,9 @@ def live_resolver():
             continue
         wb = key.split("U")[0]
         label = str(g(c_label) or "").strip(); pname = str(g(c_pname) or "").strip()
-        sku = label if label.startswith("X00") else (pname or label)
+        erpcol = str(g(c_erpcol) or "").strip()                # 物流填的 ERP-SKU 列优先
+        # 解析优先级: ① 物流填的 ERP-SKU 列(直读最可靠, 治本) ② X00 FNSKU 标签 ③ 产品名
+        sku = erpcol or (label if label.startswith("X00") else (pname or label))
         try:
             qty = float(str(g(c_qty)).strip()) if g(c_qty) not in (None, "") else 0.0
         except ValueError:
@@ -330,7 +333,10 @@ def build_unit(months=12):
     for wb, nbox in zl.items():
         ovs_by_wb[wb] = nbox * box_fee
 
-    agg = defaultdict(lambda: {"head": 0.0, "ovs": 0.0, "qty": 0.0, "plat": ""})
+    # 🚨 按 (ERP SKU, 平台) 聚合, 不混平台。原 last-write-wins(a["plat"]=s["platform"]) bug:
+    #   同 SKU 发到美客多+亚马逊两店时, 保留与否取决于 set 迭代顺序(非确定) → meitong_skus 15↔35 漂移,
+    #   且美客多单价被亚马逊发货量稀释。改为 per-平台隔离 → 美客多成本只用美客多发货, 确定且准。
+    agg = defaultdict(lambda: {"head": 0.0, "ovs": 0.0, "qty": 0.0})
     for wb in set(head_by_wb) | set(ovs_by_wb):
         skus = by_wb.get(wb, [])
         if not skus:
@@ -341,12 +347,12 @@ def build_unit(months=12):
             erp_sku, _ = resolve_erp(s["sku"], name2erp, sku_set)
             if not erp_sku:
                 continue
-            a = agg[erp_sku]
+            a = agg[(erp_sku, s["platform"])]
             a["head"] += head_by_wb.get(wb, 0) * w
             a["ovs"] += ovs_by_wb.get(wb, 0) * w
-            a["qty"] += s["qty"]; a["plat"] = s["platform"]
-    return {k: (v["head"] / v["qty"] if v["qty"] else 0, v["ovs"] / v["qty"] if v["qty"] else 0)
-            for k, v in agg.items() if v["plat"] == "美客多"}
+            a["qty"] += s["qty"]
+    return {erp: (v["head"] / v["qty"] if v["qty"] else 0, v["ovs"] / v["qty"] if v["qty"] else 0)
+            for (erp, plat), v in agg.items() if plat == "美客多" and v["qty"]}
 
 
 # ============ 诊断(只读, 不写报表) ============
@@ -436,9 +442,15 @@ def run(period, months=12, commit=False):
         if not d.get("has_more") or not pt:
             break
     rows = [r for r in recs if _txt(r["fields"].get("周期")) == period]
+    # ML 后台 seller_sku → 领星 ERP SKU(俊辉确认的 CBT 定制 listing 别名, 如 MXCFFLFFSCP-TOTK→FF01A-04),
+    # 与主 sync 同源, 否则 unit 按 ERP 键、ML 行按 seller_sku 键, 永远匹配不上。
+    try:
+        from app.lingxing import resolve_erp_sku as _ml_alias
+    except Exception:
+        _ml_alias = lambda s: s
     written, blank, mh, mo, detail = 0, 0, 0.0, 0.0, []
     for r in rows:
-        f = r["fields"]; sku = _txt(f.get("SKU"))
+        f = r["fields"]; sku = _ml_alias(_txt(f.get("SKU")))
         if sku not in unit:
             blank += 1; continue
         qty = _num(f.get("件数"))
