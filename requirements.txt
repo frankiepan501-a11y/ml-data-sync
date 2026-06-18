@@ -6,3 +6,4 @@ pydantic==2.9.2
 aiosqlite==0.20.0
 aiolimiter==1.1.0
 cryptography==43.0.1
+openpyxl==3.1.5

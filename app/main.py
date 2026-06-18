@@ -652,6 +652,23 @@ async def cbt_pnl_api(seller_id: int, month: str, parent_user_id: int = 15025208
     }
 
 
+@app.post("/report/cbt-ingest", dependencies=[Depends(require_service_token)])
+async def cbt_ingest(month: str | None = None, commit: bool = False, fx: float = 6.8628,
+                     folder_token: str | None = None):
+    """CBT-FULL 官方导出(B)解析 → 按SKU update 飞书报表(task3云化, 2026-06-18).
+    俊辉每月把3导出(Orders+账单+广告)传飞书云盘文件夹(env CBT_EXPORT_FOLDER_TOKEN), 本端点下载解析.
+    month 缺省=上月. 默认 commit=false dry-run; commit=true 才写飞书(保留美通头程/海外仓列, 全额毛利是公式不写)."""
+    import datetime, traceback
+    from app import cbt_ingest as _ci
+    if not month:
+        last = datetime.date.today().replace(day=1) - datetime.timedelta(days=1)
+        month = last.strftime("%Y-%m")
+    try:
+        return await _ci.run(month, commit=commit, fx=fx, folder_token=folder_token)
+    except Exception as e:
+        return {"status": "error", "exc": type(e).__name__, "msg": str(e), "traceback": traceback.format_exc()[:1500]}
+
+
 import asyncio as _asyncio
 import random as _random
 from aiolimiter import AsyncLimiter
