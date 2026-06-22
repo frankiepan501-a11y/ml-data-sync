@@ -41,6 +41,8 @@ ALIAS_TO_ERP = {
     "Switch2潜水员戴夫收纳包（PU）+2代switch摇杆帽-戴夫+TPU壳*1+硅胶套红蓝色*1+硅胶套黑色*1+钢化膜*2（含清洁包）+PD快充线": "FL-BUNL-NSW-001-DAVE",
     "KS37-黑色": "KS37-4", "KS37-白色": "KS37-05", "KS42-黑色": "KS42-1", "KS42-白色": "KS42-2",
     "KS51-透明黑": "KS51-04T", "KS52-黑色": "KS52-04G", "KS52-粉色": "KS52-03G", "KS52-灰色": "KS52-02G", "KS62-紫色": "KS62-06",
+    # 墨客多发货台产品名→ERP(2026-06-22 转单号 join 账单 + ML标题 + 标签 三重确认)
+    "Switch2钢化膜3pack": "PPPJ01",   # =NS2-屏幕保护膜(账单)/3pcs Cristal Mica(ML)/标签GXGZ49783
 }
 
 
@@ -307,6 +309,66 @@ def _cutoff(months):
     return f"{y:04d}-{m:02d}-{min(t.day,28):02d}"
 
 
+def _serial_date(v):
+    """gGxKHQ 日期列多为 Excel 序列号(如 45839=2025-07-02) → 'YYYY-MM-DD'。"""
+    try:
+        n = int(float(v))
+        if n > 20000:
+            return (datetime.date(1899, 12, 30) + datetime.timedelta(days=n)).strftime("%Y-%m-%d")
+    except (TypeError, ValueError):
+        pass
+    s = str(v or "")[:10].replace("/", "-").replace(".", "-")
+    return s if s.startswith("20") else ""
+
+
+# ============ 墨客多头程(gGxKHQ 运费列, 账单验证一致, 无需 API) ============
+def mokeduo_by_trans(cut=None):
+    """gGxKHQ 物流商=墨客多 行 → {转单号: {fee, date, items:[{sku,qty,platform}]}}。
+    🔑 墨客多「运费」列已是头程真值(2026-06-22 用墨客多对账单 STA00325070500012 逐运单验证一致, 费率2850/CBM);
+       运费仅记在转单号首箱行, 数量是每箱 → 按转单号 Σ每箱数量; 同美通靠转单号 join 拿真 SKU(账单品名是报关名不可用)。"""
+    rows = _sheet(ZL_SHEET_LIVE, "A1:Z3000")
+    out = {}
+    if not rows:
+        return out
+    hdr = {str(h).strip(): i for i, h in enumerate(rows[0])}
+    c_carrier = hdr.get("物流商", 5); c_ship = hdr.get("实际发货时间", 2)
+    c_store = hdr.get("店铺", 9); c_erp = hdr.get("ERP-SKU"); c_pname = hdr.get("产品名", 11)
+    c_qty = hdr.get("数量", 12); c_label = hdr.get("国内所贴产品标签", 15)
+    c_wb = hdr.get("送往中转仓的货件号", 16); c_fee = hdr.get("运费", 22)
+    cur = None
+    for r in rows[1:]:
+        g = lambda i: (r[i] if (i is not None and len(r) > i) else None)
+        carrier = str(g(c_carrier) or "").strip()
+        if carrier:
+            cur = carrier
+        if cur != "墨客多":
+            continue
+        wbfull = str(g(c_wb) or "").strip()
+        if not wbfull:
+            continue
+        trans = wbfull.split("/")[0]
+        d = out.setdefault(trans, {"fee": 0.0, "date": "", "items": []})
+        try:
+            d["fee"] += float(g(c_fee)) if g(c_fee) not in (None, "") else 0.0
+        except (TypeError, ValueError):
+            pass
+        if not d["date"]:
+            d["date"] = _serial_date(g(c_ship))
+        label = str(g(c_label) or "").strip(); pname = str(g(c_pname) or "").strip()
+        erpcol = str(g(c_erp) or "").strip()
+        sku = erpcol or (label if label.startswith("X00") else (pname or label))
+        try:
+            qty = float(g(c_qty)) if g(c_qty) not in (None, "") else 0.0
+        except (TypeError, ValueError):
+            qty = 0.0
+        store = str(g(c_store) or ""); plat = "美客多" if "美客多" in store else "亚马逊"
+        if sku and qty:
+            d["items"].append({"sku": sku, "qty": qty, "platform": plat})
+    if cut:
+        out = {k: v for k, v in out.items() if (not v["date"]) or v["date"] >= cut}
+    return out
+
+
 # ============ 摊分: 每 ERP SKU 的 头程/海外仓 per件单价 ============
 def build_unit(months=12):
     orders = meitong_orders()
@@ -351,6 +413,22 @@ def build_unit(months=12):
             a["head"] += head_by_wb.get(wb, 0) * w
             a["ovs"] += ovs_by_wb.get(wb, 0) * w
             a["qty"] += s["qty"]
+
+    # 🟡 墨客多: gGxKHQ 物流商=墨客多 行(运费列=头程真值), 转单号 Σ每箱数量, 运费按数量份额拆到 SKU,
+    #   混进同一 agg → per件单价自动按 carrier(美通+墨客多) 加权混合, 同 SKU 跨货代不双算。
+    #   墨客多运费列只含运费不含海外仓(报关350/票同美通口径不计) → 不加 ovs。
+    for trans, t in mokeduo_by_trans(cut).items():
+        tq = sum(it["qty"] for it in t["items"])
+        if tq <= 0:
+            continue
+        for it in t["items"]:
+            erp_sku, _ = resolve_erp(it["sku"], name2erp, sku_set)
+            if not erp_sku:
+                continue
+            a = agg[(erp_sku, it["platform"])]
+            a["head"] += t["fee"] * (it["qty"] / tq)
+            a["qty"] += it["qty"]
+
     return {erp: (v["head"] / v["qty"] if v["qty"] else 0, v["ovs"] / v["qty"] if v["qty"] else 0)
             for (erp, plat), v in agg.items() if plat == "美客多" and v["qty"]}
 
