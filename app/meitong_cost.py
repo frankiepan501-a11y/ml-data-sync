@@ -369,6 +369,54 @@ def mokeduo_by_trans(cut=None):
     return out
 
 
+def _plat_of(store, country=""):
+    """平台归属。🚨 区分 美客多-墨西哥(美通/墨客多) vs 美客多-巴西(三沐): 巴西另套三沐成本。"""
+    s = str(store or ""); c = str(country or "")
+    if "巴西" in s or "巴西" in c or "三沐" in s or "AIRSOFT" in s.upper():
+        return "美客多巴西"
+    if "美客多" in s:
+        return "美客多"
+    return "亚马逊"
+
+
+# ============ 通用 Z 列(单个产品头程): 物流手工算好的 per件头程, 直读 ============
+def zcol_rows(cut=None):
+    """gGxKHQ 任何货代行, 若「单个产品头程」(Z列) 已填 → 直接用作 per件头程(俊辉为三沐/万国手工算的,
+    建议 AI 直接抓 Z 列)。head_row = Z × 数量。美通/墨客多 Z 列空(走各自逻辑)→不进此 pass 不双算。"""
+    rows = _sheet(ZL_SHEET_LIVE, "A1:AD3000")
+    out = []
+    if not rows:
+        return out
+    hdr = {str(h).strip(): i for i, h in enumerate(rows[0])}
+    c_z = hdr.get("单个产品头程")
+    if c_z is None:
+        return out
+    c_qty = hdr.get("数量", 12); c_store = hdr.get("店铺", 9); c_country = hdr.get("国家", 7)
+    c_erp = hdr.get("ERP-SKU"); c_pname = hdr.get("产品名", 11); c_label = hdr.get("国内所贴产品标签", 15)
+    c_ship = hdr.get("实际发货时间", 2)
+    for r in rows[1:]:
+        g = lambda i: (r[i] if (i is not None and len(r) > i) else None)
+        try:
+            z = float(g(c_z)) if g(c_z) not in (None, "") else 0.0
+        except (TypeError, ValueError):
+            z = 0.0
+        try:
+            qty = float(g(c_qty)) if g(c_qty) not in (None, "") else 0.0
+        except (TypeError, ValueError):
+            qty = 0.0
+        if z <= 0 or qty <= 0:
+            continue
+        if cut:
+            sd = _serial_date(g(c_ship))
+            if sd and sd < cut:
+                continue
+        label = str(g(c_label) or "").strip(); pname = str(g(c_pname) or "").strip()
+        erpcol = str(g(c_erp) or "").strip()
+        sku = erpcol or (label if label.startswith("X00") else (pname or label))
+        out.append({"sku": sku, "qty": qty, "z": z, "platform": _plat_of(g(c_store), g(c_country))})
+    return out
+
+
 # ============ 摊分: 每 ERP SKU 的 头程/海外仓 per件单价 ============
 def build_unit(months=12):
     orders = meitong_orders()
@@ -429,8 +477,19 @@ def build_unit(months=12):
             a["head"] += t["fee"] * (it["qty"] / tq)
             a["qty"] += it["qty"]
 
-    return {erp: (v["head"] / v["qty"] if v["qty"] else 0, v["ovs"] / v["qty"] if v["qty"] else 0)
-            for (erp, plat), v in agg.items() if plat == "美客多" and v["qty"]}
+    # 🟠 通用 Z 列(单个产品头程): 三沐(巴西)/万国 等物流手工算好的 per件头程, head=Z×数量 混进 agg。
+    #   三沐巴西店→"美客多巴西"平台(run() 把巴西 ML 行路由到此, 不与墨西哥美通/墨客多混)。
+    for it in zcol_rows(cut):
+        erp_sku, _ = resolve_erp(it["sku"], name2erp, sku_set)
+        if not erp_sku:
+            continue
+        a = agg[(erp_sku, it["platform"])]
+        a["head"] += it["z"] * it["qty"]
+        a["qty"] += it["qty"]
+
+    # 返回 (ERP SKU, 平台) → per件(头程, 海外仓); 含 美客多(墨西哥) + 美客多巴西(三沐)
+    return {(erp, plat): (v["head"] / v["qty"] if v["qty"] else 0, v["ovs"] / v["qty"] if v["qty"] else 0)
+            for (erp, plat), v in agg.items() if plat in ("美客多", "美客多巴西") and v["qty"]}
 
 
 # ============ 诊断(只读, 不写报表) ============
@@ -494,14 +553,15 @@ def diag(period="month_2026-05", months=12):
         f = r["fields"]
         if _txt(f.get("周期")) != period:
             continue
-        sku = _txt(f.get("SKU"))
-        ml.append({"sku": sku, "qty": _num(f.get("件数")), "in_unit": sku in unit,
-                   "seller": _txt(f.get("店铺"))})
+        sku = _txt(f.get("SKU")); store = _txt(f.get("店铺"))
+        tp = "美客多巴西" if ("巴西" in store or "AIRSOFT" in store.upper()) else "美客多"
+        ml.append({"sku": sku, "qty": _num(f.get("件数")), "in_unit": (sku, tp) in unit,
+                   "seller": store, "target_plat": tp})
     return {"period": period, "months": months, "cutoff": cut,
             "orders_total": len(orders), "zsmx": len(zsmx), "zsmx_in_window": len(in_win),
             "zsmx_cbm_ok": cbm_ok,
             "live_resolution": res,
-            "unit": {k: {"head_u": round(v[0], 4), "ovs_u": round(v[1], 4)} for k, v in unit.items()},
+            "unit": {f"{e}|{p}": {"head_u": round(v[0], 4), "ovs_u": round(v[1], 4)} for (e, p), v in unit.items()},
             "ml_rows": ml,
             "ml_in_unit": [m["sku"] for m in ml if m["in_unit"]],
             "ml_not_in_unit": [m["sku"] for m in ml if not m["in_unit"]]}
@@ -529,16 +589,16 @@ def run(period, months=12, commit=False):
     written, blank, mh, mo, detail = 0, 0, 0.0, 0.0, []
     for r in rows:
         f = r["fields"]
-        # 🚨 美通=墨西哥中转仓, 只服务墨西哥美客多店(CBT+本土); 巴西店(AIRSOFT)走三沐, 绝不套美通成本
-        #   (防 FB07-7/KS35-19 等同 SKU 跨国把墨西哥美通单价误算到巴西销售)
+        # 🚨 按店铺路由平台: 墨西哥美客多(CBT/本土)→"美客多"(美通+墨客多); 巴西店(AIRSOFT)→"美客多巴西"(三沐)。
+        #   防 FB07-7/KS35-19 等同 SKU 跨国把墨西哥成本误算到巴西(反之亦然)。
         store = _txt(f.get("店铺"))
-        if "巴西" in store or "AIRSOFT" in store.upper():
-            blank += 1; continue
+        target_plat = "美客多巴西" if ("巴西" in store or "AIRSOFT" in store.upper()) else "美客多"
         sku = _ml_alias(_txt(f.get("SKU")))
-        if sku not in unit:
+        key = (sku, target_plat)
+        if key not in unit:
             blank += 1; continue
         qty = _num(f.get("件数"))
-        uh, uo = unit[sku]; hc = round(uh * qty, 2); oc = round(uo * qty, 2)
+        uh, uo = unit[key]; hc = round(uh * qty, 2); oc = round(uo * qty, 2)
         mh += hc; mo += oc
         detail.append({"sku": sku, "qty": qty, "head": hc, "ovs": oc})
         if commit:
