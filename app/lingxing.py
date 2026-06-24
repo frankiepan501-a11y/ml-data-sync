@@ -40,6 +40,11 @@ SKU_ALIAS_TO_ERP: dict[str, str] = {
     "MXCFFLFFSCP-TOTKW01": "FF01B-01",  # YS11pro 手柄-白眼款（霍尔摇杆）
     "MXCFFLFFSCP-TOTK":    "FF01A-04",  # YS11pro 手柄-波纹款（霍尔摇杆）
     "MXCFFLFFSCP-TOTKB02": "FF01A-05",  # YS11pro 手柄-魔法阵款（霍尔摇杆）
+    # CBT 定制 listing → 产品 ERP SKU(2026-06-24 俊辉双数据点推导: 运单→ML SKU + 同运单 gGxKHQ 填的产品SKU)
+    # 俊辉在 gGxKHQ 把 ERP-SKU 标为产品SKU(TZ15/KS37-4/FF05B-01), ML 报表卖的是 listing SKU → 在此映射对齐
+    "FB07-7":   "TZ15",      # 2代钢印包套装 (运单 ZSMX2510023684)
+    "YS37-01":  "KS37-4",    # KS37 joycon手柄-黑色 (运单 ZSMX2511044430)
+    "FF05-1":   "FF05B-01",  # YS11-5 充电底座套装-惊奇款 (运单 ZSMX2512096743)
 }
 
 
