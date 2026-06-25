@@ -417,6 +417,46 @@ def zcol_rows(cut=None):
     return out
 
 
+def sanmu_ovs_rows(cut=None):
+    """指令明细(72g5oE) 巴西三沐行「产品标费用/RMB」(俊辉公式: 换标的按3元/产品贴标费) → 海外仓 ovs。
+    俊辉口径: 巴西三沐海外仓仅扣产品标签贴标费。只取 美客多巴西(美通/墨客多墨西哥海外仓走 zhiling_boxcount 箱费)。"""
+    rows = _sheet(ZL_SHEET_CMD, "A1:AB3000")
+    out = []
+    if not rows:
+        return out
+    hdr = {str(h).strip(): i for i, h in enumerate(rows[0])}
+    c_fee = hdr.get("产品标费用/RMB")
+    if c_fee is None:
+        return out
+    c_qty = hdr.get("数量"); c_pname = hdr.get("产品名字"); c_label = hdr.get("送仓标签")
+    c_store = hdr.get("店铺"); c_country = hdr.get("国家"); c_ship = hdr.get("到仓时间")
+    for r in rows[1:]:
+        g = lambda i: (r[i] if (i is not None and len(r) > i) else None)
+        try:
+            fee = float(g(c_fee)) if g(c_fee) not in (None, "") else 0.0
+        except (TypeError, ValueError):
+            fee = 0.0
+        if fee <= 0:
+            continue
+        plat = _plat_of(g(c_store), g(c_country))
+        if plat != "美客多巴西":            # 只巴西三沐贴标费; 墨西哥海外仓走 zhiling_boxcount
+            continue
+        try:
+            qty = float(g(c_qty)) if g(c_qty) not in (None, "") else 0.0
+        except (TypeError, ValueError):
+            qty = 0.0
+        if qty <= 0:
+            continue
+        if cut:
+            sd = _serial_date(g(c_ship))
+            if sd and sd < cut:
+                continue
+        label = str(g(c_label) or "").strip(); pname = str(g(c_pname) or "").strip()
+        sku = label if label.startswith("X00") else (pname or label)
+        out.append({"sku": sku, "qty": qty, "ovs": fee, "platform": plat})
+    return out
+
+
 # ============ 摊分: 每 ERP SKU 的 头程/海外仓 per件单价 ============
 def build_unit(months=12):
     orders = meitong_orders()
@@ -487,9 +527,28 @@ def build_unit(months=12):
         a["head"] += it["z"] * it["qty"]
         a["qty"] += it["qty"]
 
-    # 返回 (ERP SKU, 平台) → per件(头程, 海外仓); 含 美客多(墨西哥) + 美客多巴西(三沐)
-    return {(erp, plat): (v["head"] / v["qty"] if v["qty"] else 0, v["ovs"] / v["qty"] if v["qty"] else 0)
-            for (erp, plat), v in agg.items() if plat in ("美客多", "美客多巴西") and v["qty"]}
+    # 🟠 巴西三沐 海外仓 = 产品标签贴标费(指令明细 产品标费用/RMB, 俊辉算 3元/产品换标的)。
+    #   单独 agg(自己的 qty), 不混进上面 head 的 qty(否则稀释 head per件)。
+    sovs = defaultdict(lambda: {"ovs": 0.0, "qty": 0.0})
+    for it in sanmu_ovs_rows(cut):
+        erp_sku, _ = resolve_erp(it["sku"], name2erp, sku_set)
+        if not erp_sku:
+            continue
+        s = sovs[(erp_sku, it["platform"])]
+        s["ovs"] += it["ovs"]; s["qty"] += it["qty"]
+
+    # 返回 (ERP SKU, 平台) → per件(头程, 海外仓); 含 美客多(墨西哥) + 美客多巴西(三沐)。
+    #   海外仓 per件 = 美通/墨客多箱费(v.ovs/v.qty, 墨西哥) + 巴西三沐贴标费(sovs, 各按自己 qty), 平台不重叠不双算。
+    out = {}
+    for (erp, plat), v in agg.items():
+        if plat not in ("美客多", "美客多巴西") or not v["qty"]:
+            continue
+        ovs_u = v["ovs"] / v["qty"]
+        so = sovs.get((erp, plat))
+        if so and so["qty"]:
+            ovs_u += so["ovs"] / so["qty"]
+        out[(erp, plat)] = (v["head"] / v["qty"], ovs_u)
+    return out
 
 
 # ============ 诊断(只读, 不写报表) ============
