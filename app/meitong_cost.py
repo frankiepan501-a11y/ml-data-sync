@@ -43,6 +43,8 @@ ALIAS_TO_ERP = {
     "KS51-透明黑": "KS51-04T", "KS52-黑色": "KS52-04G", "KS52-粉色": "KS52-03G", "KS52-灰色": "KS52-02G", "KS62-紫色": "KS62-06",
     # 墨客多发货台产品名→ERP(2026-06-22 转单号 join 账单 + ML标题 + 标签 三重确认)
     "Switch2钢化膜3pack": "PPPJ01",   # =NS2-屏幕保护膜(账单)/3pcs Cristal Mica(ML)/标签GXGZ49783
+    # 指令明细产品名字→ERP(指令明细无ERP-SKU列, 贴标费靠产品名解析; 头程走gGxKHQ的ERP-SKU列不需此)
+    "2代小黑包套装（吊+膜+帽)": "TZ04",   # 巴西三沐(俊辉2026-06-25); ML卖TZ03→lingxing别名TZ03→TZ04
 }
 
 
