@@ -603,13 +603,13 @@ def diag(period="month_2026-05", months=12):
     res.sort(key=lambda x: -x["qty"])
 
     unit = build_unit(months)
-    # ML 期间行
+    # ML 期间行 (LIST API, 同 run: search 会丢行)
     recs, pt = [], None
     while True:
-        url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{ML_APP}/tables/{ML_T}/records/search?page_size=500" + (f"&page_token={pt}" if pt else "")
-        dd = _fs(url, {}, "POST").get("data", {})
+        url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{ML_APP}/tables/{ML_T}/records?page_size=500" + (f"&page_token={pt}" if pt else "")
+        dd = _fs(url, None, "GET").get("data", {})
         recs += dd.get("items", []); pt = dd.get("page_token")
-        if not dd.get("has_more") or not pt:
+        if not dd.get("has_more"):
             break
     ml = []
     for r in recs:
@@ -634,13 +634,14 @@ def diag(period="month_2026-05", months=12):
 def run(period, months=12, commit=False):
     """灌 period(如 month_2026-04) 的美通中转 头程/海外仓成本。commit=False 只预览。"""
     unit = build_unit(months)
+    # 🚨 用 LIST API 不用 search: search 无排序分页会丢行/封顶(铁律, 实测漏 TZ03 巴西行致未灌成本)。
     recs, pt = [], None
     while True:
-        url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{ML_APP}/tables/{ML_T}/records/search?page_size=500" + (f"&page_token={pt}" if pt else "")
-        d = _fs(url, {}, "POST").get("data", {})
+        url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{ML_APP}/tables/{ML_T}/records?page_size=500" + (f"&page_token={pt}" if pt else "")
+        d = _fs(url, None, "GET").get("data", {})
         recs += d.get("items", [])
         pt = d.get("page_token")
-        if not d.get("has_more") or not pt:
+        if not d.get("has_more"):
             break
     rows = [r for r in recs if _txt(r["fields"].get("周期")) == period]
     # ML 后台 seller_sku → 领星 ERP SKU(俊辉确认的 CBT 定制 listing 别名, 如 MXCFFLFFSCP-TOTK→FF01A-04),
