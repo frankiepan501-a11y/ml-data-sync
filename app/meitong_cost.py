@@ -519,7 +519,9 @@ def build_unit(months=12):
 
     # 🟠 通用 Z 列(单个产品头程): 三沐(巴西)/万国 等物流手工算好的 per件头程, head=Z×数量 混进 agg。
     #   三沐巴西店→"美客多巴西"平台(run() 把巴西 ML 行路由到此, 不与墨西哥美通/墨客多混)。
-    for it in zcol_rows(cut):
+    #   🚨 不套 12mo cutoff: Z 是物流算好的 per件值(与时间无关, 非滚动均价); 且三沐巴西发货稀疏周转慢
+    #   (2025/4 发的货 2026/5 才卖), 套窗口会把老批次排除→TZ02/TZ03 等漏覆盖。
+    for it in zcol_rows(None):
         erp_sku, _ = resolve_erp(it["sku"], name2erp, sku_set)
         if not erp_sku:
             continue
@@ -530,7 +532,7 @@ def build_unit(months=12):
     # 🟠 巴西三沐 海外仓 = 产品标签贴标费(指令明细 产品标费用/RMB, 俊辉算 3元/产品换标的)。
     #   单独 agg(自己的 qty), 不混进上面 head 的 qty(否则稀释 head per件)。
     sovs = defaultdict(lambda: {"ovs": 0.0, "qty": 0.0})
-    for it in sanmu_ovs_rows(cut):
+    for it in sanmu_ovs_rows(None):   # 同 Z-pass: 贴标费 per件与时间无关, 不套 cutoff
         erp_sku, _ = resolve_erp(it["sku"], name2erp, sku_set)
         if not erp_sku:
             continue
