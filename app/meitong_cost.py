@@ -577,6 +577,21 @@ def build_unit(months=12):
     return out
 
 
+def _lookup_unit_with_fallback(unit, key, months, cache):
+    """Use the rolling window first; if a selling SKU has no recent shipment, fall back to older shipped stock."""
+    if key in unit:
+        return unit[key], months
+    fb_months = int(os.getenv("MEITONG_COST_FALLBACK_MONTHS", "24"))
+    if months >= fb_months:
+        return None, None
+    if "unit" not in cache:
+        cache["months"] = fb_months
+        cache["unit"] = build_unit(fb_months)
+    if key in cache["unit"]:
+        return cache["unit"][key], cache["months"]
+    return None, None
+
+
 # ============ 诊断(只读, 不写报表) ============
 def diag(period="month_2026-05", months=12):
     """全链路解析诊断: 每个发货台产品名/标签 → key_used → resolve_erp 结果, 平台分布,
@@ -640,20 +655,26 @@ def diag(period="month_2026-05", months=12):
         from app.lingxing import resolve_erp_sku as _ml_alias
     except Exception:
         _ml_alias = lambda s: s
-    ml = []
+    ml, fb_cache = [], {}
     for r in recs:
         f = r["fields"]
         if _txt(f.get("周期")) != period:
             continue
         raw_sku = _txt(f.get("SKU")); sku = _ml_alias(raw_sku); store = _txt(f.get("店铺"))
         tp = "美客多巴西" if ("巴西" in store or "AIRSOFT" in store.upper()) else "美客多"
-        ml.append({"sku": raw_sku, "erp_sku": sku, "qty": _num(f.get("件数")), "in_unit": (sku, tp) in unit,
+        u, used_months = _lookup_unit_with_fallback(unit, (sku, tp), months, fb_cache)
+        ml.append({"sku": raw_sku, "erp_sku": sku, "qty": _num(f.get("件数")), "in_unit": bool(u),
+                   "cost_window_months": used_months,
                    "seller": store, "target_plat": tp})
+    unit_keys = set(unit.keys()) | set((fb_cache.get("unit") or {}).keys())
     return {"period": period, "months": months, "cutoff": cut,
             "orders_total": len(orders), "zsmx": len(zsmx), "zsmx_in_window": len(in_win),
             "zsmx_cbm_ok": cbm_ok,
             "live_resolution": res,
-            "unit": {f"{e}|{p}": {"head_u": round(v[0], 4), "ovs_u": round(v[1], 4)} for (e, p), v in unit.items()},
+            "unit": {f"{e}|{p}": {"head_u": round((unit.get((e, p)) or fb_cache.get("unit", {}).get((e, p)))[0], 4),
+                                  "ovs_u": round((unit.get((e, p)) or fb_cache.get("unit", {}).get((e, p)))[1], 4)}
+                     for (e, p) in unit_keys},
+            "fallback_months": fb_cache.get("months"),
             "ml_rows": ml,
             "ml_in_unit": [m["sku"] for m in ml if m["in_unit"]],
             "ml_not_in_unit": [m["sku"] for m in ml if not m["in_unit"]]}
@@ -679,7 +700,7 @@ def run(period, months=12, commit=False):
         from app.lingxing import resolve_erp_sku as _ml_alias
     except Exception:
         _ml_alias = lambda s: s
-    written, blank, mh, mo, detail = 0, 0, 0.0, 0.0, []
+    written, blank, mh, mo, detail, fb_cache, fb_written = 0, 0, 0.0, 0.0, [], {}, 0
     for r in rows:
         f = r["fields"]
         # 🚨 按店铺路由平台: 墨西哥美客多(CBT/本土)→"美客多"(美通+墨客多); 巴西店(AIRSOFT)→"美客多巴西"(三沐)。
@@ -688,16 +709,21 @@ def run(period, months=12, commit=False):
         target_plat = "美客多巴西" if ("巴西" in store or "AIRSOFT" in store.upper()) else "美客多"
         sku = _ml_alias(_txt(f.get("SKU")))
         key = (sku, target_plat)
-        if key not in unit:
+        u, used_months = _lookup_unit_with_fallback(unit, key, months, fb_cache)
+        if not u:
             blank += 1; continue
         qty = _num(f.get("件数"))
-        uh, uo = unit[key]; hc = round(uh * qty, 2); oc = round(uo * qty, 2)
+        uh, uo = u; hc = round(uh * qty, 2); oc = round(uo * qty, 2)
         mh += hc; mo += oc
-        detail.append({"sku": sku, "qty": qty, "head": hc, "ovs": oc})
+        if used_months != months:
+            fb_written += 1
+        detail.append({"sku": sku, "qty": qty, "head": hc, "ovs": oc, "cost_window_months": used_months})
         if commit:
             _fs(f"https://open.feishu.cn/open-apis/bitable/v1/apps/{ML_APP}/tables/{ML_T}/records/{r['record_id']}",
                 {"fields": {F_HEAD: hc, F_OVS: oc}}, "PUT")
         written += 1
+    unit_keys = set(unit.keys()) | set((fb_cache.get("unit") or {}).keys())
     return {"period": period, "months": months, "committed": commit, "rows_in_period": len(rows),
-            "meitong_skus": len(unit), "written": written, "blank_non_meitong": blank,
+            "meitong_skus": len(unit_keys), "fallback_months": fb_cache.get("months"), "fallback_written": fb_written,
+            "written": written, "blank_non_meitong": blank,
             "head_total": round(mh, 2), "ovs_total": round(mo, 2), "detail": detail}
