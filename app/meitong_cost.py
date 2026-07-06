@@ -636,14 +636,18 @@ def diag(period="month_2026-05", months=12):
         recs += dd.get("items", []); pt = dd.get("page_token")
         if not dd.get("has_more"):
             break
+    try:
+        from app.lingxing import resolve_erp_sku as _ml_alias
+    except Exception:
+        _ml_alias = lambda s: s
     ml = []
     for r in recs:
         f = r["fields"]
         if _txt(f.get("周期")) != period:
             continue
-        sku = _txt(f.get("SKU")); store = _txt(f.get("店铺"))
+        raw_sku = _txt(f.get("SKU")); sku = _ml_alias(raw_sku); store = _txt(f.get("店铺"))
         tp = "美客多巴西" if ("巴西" in store or "AIRSOFT" in store.upper()) else "美客多"
-        ml.append({"sku": sku, "qty": _num(f.get("件数")), "in_unit": (sku, tp) in unit,
+        ml.append({"sku": raw_sku, "erp_sku": sku, "qty": _num(f.get("件数")), "in_unit": (sku, tp) in unit,
                    "seller": store, "target_plat": tp})
     return {"period": period, "months": months, "cutoff": cut,
             "orders_total": len(orders), "zsmx": len(zsmx), "zsmx_in_window": len(in_win),
