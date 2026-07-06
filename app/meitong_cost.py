@@ -211,6 +211,27 @@ def resolve_erp(key, name2erp, sku_set):
     return None, "unmapped"
 
 
+def _direct_erp(key):
+    """ERP-SKU column is logistics-maintained ground truth; do not reject it by Lingxing productList membership."""
+    key = (key or "").strip()
+    if not key:
+        return None
+    try:
+        from app.lingxing import resolve_erp_sku as _ml_alias
+        key = _ml_alias(key)
+    except Exception:
+        pass
+    return key
+
+
+def resolve_ship_item(item, name2erp, sku_set):
+    """Resolve one shipping-table item to the SKU key used by the ML report cost rows."""
+    if item.get("erp_direct"):
+        erp = _direct_erp(item.get("sku"))
+        return erp, ("erp_col" if erp else "empty")
+    return resolve_erp(item.get("sku"), name2erp, sku_set)
+
+
 # ============ 费率快照 / 海外仓操作费快照 / 指令明细箱数 ============
 def load_rate_versions():
     items = _fs(f"https://open.feishu.cn/open-apis/bitable/v1/apps/{SHIP_APP}/tables/{RATE_T}/records/search?page_size=500", {}, "POST").get("data", {}).get("items", [])
@@ -278,6 +299,7 @@ def live_resolver():
     hdr = {str(h).strip(): i for i, h in enumerate(rows[0])}
     c_box = hdr.get("送往中转仓箱唛", 1)
     c_store = hdr.get("店铺", 9)
+    c_country = hdr.get("国家", 7)
     c_erpcol = hdr.get("ERP-SKU")                              # 物流直填 ERP SKU(最可靠), 见下
     c_pname = hdr.get("产品名", 11)
     c_qty = hdr.get("数量", 12)
@@ -298,8 +320,8 @@ def live_resolver():
         except ValueError:
             qty = 0.0
         store = str(g(c_store) or "")
-        plat = "美客多" if "美客多" in store else "亚马逊"
-        by_wb[wb].append({"sku": sku, "qty": qty, "platform": plat})
+        plat = _plat_of(store, str(g(c_country) or ""))
+        by_wb[wb].append({"sku": sku, "qty": qty, "platform": plat, "erp_direct": bool(erpcol)})
     return by_wb
 
 
@@ -334,7 +356,7 @@ def mokeduo_by_trans(cut=None):
         return out
     hdr = {str(h).strip(): i for i, h in enumerate(rows[0])}
     c_carrier = hdr.get("物流商", 5); c_ship = hdr.get("实际发货时间", 2)
-    c_store = hdr.get("店铺", 9); c_erp = hdr.get("ERP-SKU"); c_pname = hdr.get("产品名", 11)
+    c_store = hdr.get("店铺", 9); c_country = hdr.get("国家", 7); c_erp = hdr.get("ERP-SKU"); c_pname = hdr.get("产品名", 11)
     c_qty = hdr.get("数量", 12); c_label = hdr.get("国内所贴产品标签", 15)
     c_wb = hdr.get("送往中转仓的货件号", 16); c_fee = hdr.get("运费", 22)
     cur = None
@@ -363,9 +385,9 @@ def mokeduo_by_trans(cut=None):
             qty = float(g(c_qty)) if g(c_qty) not in (None, "") else 0.0
         except (TypeError, ValueError):
             qty = 0.0
-        store = str(g(c_store) or ""); plat = "美客多" if "美客多" in store else "亚马逊"
+        store = str(g(c_store) or ""); plat = _plat_of(store, str(g(c_country) or ""))
         if sku and qty:
-            d["items"].append({"sku": sku, "qty": qty, "platform": plat})
+            d["items"].append({"sku": sku, "qty": qty, "platform": plat, "erp_direct": bool(erpcol)})
     if cut:
         out = {k: v for k, v in out.items() if (not v["date"]) or v["date"] >= cut}
     return out
@@ -415,7 +437,7 @@ def zcol_rows(cut=None):
         label = str(g(c_label) or "").strip(); pname = str(g(c_pname) or "").strip()
         erpcol = str(g(c_erp) or "").strip()
         sku = erpcol or (label if label.startswith("X00") else (pname or label))
-        out.append({"sku": sku, "qty": qty, "z": z, "platform": _plat_of(g(c_store), g(c_country))})
+        out.append({"sku": sku, "qty": qty, "z": z, "platform": _plat_of(g(c_store), g(c_country)), "erp_direct": bool(erpcol)})
     return out
 
 
@@ -496,7 +518,7 @@ def build_unit(months=12):
         tq = sum(s["qty"] for s in skus) or len(skus)
         for s in skus:
             w = (s["qty"] / tq) if tq else (1.0 / len(skus))
-            erp_sku, _ = resolve_erp(s["sku"], name2erp, sku_set)
+            erp_sku, _ = resolve_ship_item(s, name2erp, sku_set)
             if not erp_sku:
                 continue
             a = agg[(erp_sku, s["platform"])]
@@ -512,7 +534,7 @@ def build_unit(months=12):
         if tq <= 0:
             continue
         for it in t["items"]:
-            erp_sku, _ = resolve_erp(it["sku"], name2erp, sku_set)
+            erp_sku, _ = resolve_ship_item(it, name2erp, sku_set)
             if not erp_sku:
                 continue
             a = agg[(erp_sku, it["platform"])]
@@ -524,7 +546,7 @@ def build_unit(months=12):
     #   🚨 不套 12mo cutoff: Z 是物流算好的 per件值(与时间无关, 非滚动均价); 且三沐巴西发货稀疏周转慢
     #   (2025/4 发的货 2026/5 才卖), 套窗口会把老批次排除→TZ02/TZ03 等漏覆盖。
     for it in zcol_rows(None):
-        erp_sku, _ = resolve_erp(it["sku"], name2erp, sku_set)
+        erp_sku, _ = resolve_ship_item(it, name2erp, sku_set)
         if not erp_sku:
             continue
         a = agg[(erp_sku, it["platform"])]
@@ -569,7 +591,7 @@ def diag(period="month_2026-05", months=12):
     # 重跑 live_resolver 但保留原始字段
     rows = _sheet(ZL_SHEET_LIVE, "A1:Q3000")
     hdr = {str(h).strip(): i for i, h in enumerate(rows[0])} if rows else {}
-    cb = hdr.get("送往中转仓箱唛", 1); cs = hdr.get("店铺", 9); cp = hdr.get("产品名", 11)
+    cb = hdr.get("送往中转仓箱唛", 1); cs = hdr.get("店铺", 9); cc = hdr.get("国家", 7); cp = hdr.get("产品名", 11)
     cq = hdr.get("数量", 12); cl = hdr.get("国内所贴产品标签", 15); cw = hdr.get("送往中转仓的货件号", 16)
     cerp = hdr.get("ERP-SKU", 10)
     win_wb = set(o.get("orderNo") for o in in_win)
@@ -581,13 +603,16 @@ def diag(period="month_2026-05", months=12):
             continue
         wb = key.split("U")[0]
         label = str(g(cl) or "").strip(); pname = str(g(cp) or "").strip(); erpcol = str(g(cerp) or "").strip()
-        sku_key = label if label.startswith("X00") else (pname or label)
-        store = str(g(cs) or ""); plat = "美客多" if "美客多" in store else "亚马逊"
+        sku_key = erpcol or (label if label.startswith("X00") else (pname or label))
+        store = str(g(cs) or ""); plat = _plat_of(store, str(g(cc) or ""))
         try:
             qty = float(str(g(cq)).strip()) if g(cq) not in (None, "") else 0.0
         except ValueError:
             qty = 0.0
-        erp, reason = resolve_erp(sku_key, name2erp, sku_set)
+        if erpcol:
+            erp, reason = _direct_erp(erpcol), "erp_col"
+        else:
+            erp, reason = resolve_erp(sku_key, name2erp, sku_set)
         k = (pname, label, store)
         d = resmap.setdefault(k, {"pname": pname, "label": label, "erpcol": erpcol, "store": store,
                                   "plat": plat, "key_used": sku_key, "erp": erp, "reason": reason,
