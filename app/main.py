@@ -8,6 +8,7 @@ import json
 import secrets
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Depends, Header, BackgroundTasks
+from fastapi.concurrency import run_in_threadpool
 from dotenv import load_dotenv
 
 from app import db
@@ -664,7 +665,14 @@ async def cbt_ingest(month: str | None = None, commit: bool = False, fx: float =
         last = datetime.date.today().replace(day=1) - datetime.timedelta(days=1)
         month = last.strftime("%Y-%m")
     try:
-        return await _ci.run(month, commit=commit, fx=fx, folder_token=folder_token)
+        result = await _ci.run(month, commit=commit, fx=fx, folder_token=folder_token)
+        if commit and result.get("status") == "ok":
+            from app import meitong_cost, ml_close
+            period = f"month_{month}"
+            cost = await run_in_threadpool(meitong_cost.run, period, 12, True)
+            close = await ml_close.audit(period=period, commit=True, run_cost_preview=False, cost_summary=cost)
+            result["post_ingest"] = {"sync_meitong_cost": cost, "ml_close_audit": close}
+        return result
     except Exception as e:
         return {"status": "error", "exc": type(e).__name__, "msg": str(e), "traceback": traceback.format_exc()[:1500]}
 
@@ -1014,6 +1022,85 @@ def sync_meitong_cost(period: str, months: int = 12, commit: bool = False):
         return meitong_cost.run(period, months, commit)
     except Exception as e:
         return {"status": "error", "exc": type(e).__name__, "msg": str(e), "traceback": traceback.format_exc()}
+
+
+@app.post("/report/ml-close/audit", dependencies=[Depends(require_service_token)])
+async def ml_close_audit(month: str | None = None, period: str | None = None,
+                         commit: bool = False, run_cost_preview: bool = True):
+    """Audit ML monthly close state and optionally upsert the close status table."""
+    import traceback
+    from app import ml_close
+    try:
+        return await ml_close.audit(month=month, period=period, commit=commit, run_cost_preview=run_cost_preview)
+    except Exception as e:
+        return {"status": "error", "exc": type(e).__name__, "msg": str(e), "traceback": traceback.format_exc()[:3000]}
+
+
+@app.post("/report/ml-close/recalc-cost", dependencies=[Depends(require_service_token)])
+async def ml_close_recalc_cost(month: str | None = None, period: str | None = None, commit: bool = True):
+    """Recalculate Meitong/Mokeduo/Sanmu cost, then run close audit."""
+    import traceback
+    from app import ml_close
+    try:
+        return await ml_close.recalc_cost(month=month, period=period, commit=commit)
+    except Exception as e:
+        return {"status": "error", "exc": type(e).__name__, "msg": str(e), "traceback": traceback.format_exc()[:3000]}
+
+
+@app.api_route("/report/ml-close/card", methods=["GET", "POST"], dependencies=[Depends(require_service_token)])
+async def ml_close_card(kind: str | None = None, month: str | None = None, period: str | None = None,
+                        send: bool = False, receive_id: str | None = None,
+                        receive_id_type: str = "chat_id"):
+    """Build, and optionally send, the next ML monthly close interactive card."""
+    import traceback
+    from app import ml_close
+    try:
+        return await ml_close.card_endpoint(kind=kind, month=month, period=period, send=send,
+                                            receive_id=receive_id, receive_id_type=receive_id_type)
+    except Exception as e:
+        return {"status": "error", "exc": type(e).__name__, "msg": str(e), "traceback": traceback.format_exc()[:3000]}
+
+
+@app.api_route("/report/ml-close/status", methods=["GET", "POST"], dependencies=[Depends(require_service_token)])
+async def ml_close_status(month: str | None = None, period: str | None = None):
+    """Read ML monthly close status for downstream gates."""
+    import traceback
+    from app import ml_close
+    try:
+        return await ml_close.status_endpoint(month=month, period=period)
+    except Exception as e:
+        return {"status": "error", "exc": type(e).__name__, "msg": str(e), "traceback": traceback.format_exc()[:3000]}
+
+
+@app.post("/report/ml-close/confirm", dependencies=[Depends(require_service_token)])
+async def ml_close_confirm(req: Request, action: str | None = None, month: str | None = None,
+                           period: str | None = None, operator_id: str | None = None,
+                           operator_name: str | None = None, message_id: str | None = None,
+                           patch_message: bool = False):
+    """Handle Feishu interactive-card callbacks for the ML monthly close loop."""
+    import traceback
+    from app import ml_close
+    body = {}
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    payload = dict(body or {})
+    for k, v in {
+        "action": action,
+        "month": month,
+        "period": period,
+        "operator_id": operator_id,
+        "operator_name": operator_name,
+        "message_id": message_id,
+        "patch_message": patch_message,
+    }.items():
+        if v not in (None, False):
+            payload[k] = v
+    try:
+        return await ml_close.confirm_action(payload)
+    except Exception as e:
+        return {"status": "error", "exc": type(e).__name__, "msg": str(e), "traceback": traceback.format_exc()[:3000]}
 
 
 @app.post("/report/meitong-diag", dependencies=[Depends(require_service_token)])

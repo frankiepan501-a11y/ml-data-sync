@@ -76,6 +76,18 @@ cp .env.example .env  # 填 ML_APP_ID / ML_APP_SECRET 等
 uvicorn app.main:app --reload --port 8000
 ```
 
+## 美客多毛利月结闭环
+
+2026-07 起，月结不再只靠普通通知。服务端新增一组闭环端点：
+
+- `POST /report/ml-close/audit`：审计指定月份报表行，输出店铺覆盖、缺口 SKU、采购成本缺口、头程/海外仓缺口，并可写入「美客多毛利月结状态台」。
+- `POST /report/ml-close/recalc-cost`：重跑美通/墨客多/三沐成本同步后再审计。
+- `GET|POST /report/ml-close/card`：生成或发送飞书交互卡，卡片类型包括操作指引、成本缺口、运营终稿确认、财务终稿确认。
+- `GET|POST /report/ml-close/status`：给全渠道汇总器做 gate，只有 `运营已确认` 或 `财务已确认终稿` 才允许放行财务终稿。
+- `POST /report/ml-close/confirm`：处理飞书按钮回调，并把原卡 PATCH 成结果态。
+
+CBT-FULL 仍以官方导出 3 文件为准；本土店和巴西店走 ML API/cache，不要求运营上传。`/report/cbt-ingest?commit=true` 成功后会自动触发 `sync-meitong-cost(commit=true)` 和月结审计，避免 CBT 入表后成本状态停在旧版本。
+
 ## 部署
 
 Zeabur 项目 `frankiepan501` 下 service `ml-sync`，详见 [zeabur-deploy-workflow](../../.claude/projects/C--Users-Administrator/memory/zeabur-deploy-workflow.md)。

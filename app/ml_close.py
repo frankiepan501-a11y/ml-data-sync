@@ -1,0 +1,711 @@
+# -*- coding: utf-8 -*-
+"""Mercado Libre profit monthly close loop.
+
+This module keeps the close-state logic in one place:
+audit report rows, upsert the close status table, build interactive cards, and
+handle button actions from Feishu event-hub.
+"""
+from __future__ import annotations
+
+import datetime as _dt
+import json
+import os
+import time
+from collections import defaultdict
+from typing import Any
+
+import anyio
+import httpx
+
+from app import meitong_cost
+
+FEISHU = "https://open.feishu.cn/open-apis"
+APP_TOKEN = os.getenv("FEISHU_BASE_APP_TOKEN", "WM3LbBr76aRqMys2of8c1dGInEb")
+REPORT_TABLE_ID = os.getenv("FEISHU_BASE_TABLE_ID", "tbl09sRPkX35PDfU")
+BASE_URL = f"https://u1wpma3xuhr.feishu.cn/base/{APP_TOKEN}"
+STATUS_TABLE_NAME = os.getenv("ML_CLOSE_STATUS_TABLE_NAME", "美客多毛利月结状态台")
+STATUS_TABLE_ID_ENV = os.getenv("ML_CLOSE_STATUS_TABLE_ID", "")
+
+ML_GROUP_ID = os.getenv("ML_CLOSE_GROUP_ID", "oc_cd007a8f1dbb4a78943625e5432a4cd7")
+FINANCE_GROUP_ID = os.getenv("ML_CLOSE_FINANCE_GROUP_ID", "oc_6b2da626d80eb6284bbe9dcf895030b9")
+CARD_APP_ID = os.getenv("FEISHU_CARD_APP_ID", "cli_a9457898bd78dccc")
+CARD_APP_SECRET = os.getenv("FEISHU_CARD_APP_SECRET", "")
+
+STATUSES = [
+    "待数据同步",
+    "待CBT上传",
+    "待CBT解析",
+    "待成本核算",
+    "成本缺失待补",
+    "待运营确认",
+    "运营已确认",
+    "财务已确认终稿",
+    "退回重算",
+    "异常",
+]
+
+STATUS_FIELDS: list[dict[str, Any]] = [
+    {"field_name": "月份", "type": 1},
+    {"field_name": "状态", "type": 3, "property": {"options": [{"name": s} for s in STATUSES]}},
+    {"field_name": "报表行数", "type": 2},
+    {"field_name": "店铺覆盖数", "type": 2},
+    {"field_name": "CBT解析状态", "type": 1},
+    {"field_name": "成本缺口数", "type": 2},
+    {"field_name": "采购缺口数", "type": 2},
+    {"field_name": "头程/海外仓缺口数", "type": 2},
+    {"field_name": "最近重算时间", "type": 5},
+    {"field_name": "运营确认人", "type": 1},
+    {"field_name": "运营确认时间", "type": 5},
+    {"field_name": "财务确认人", "type": 1},
+    {"field_name": "财务确认时间", "type": 5},
+    {"field_name": "报表链接", "type": 1},
+    {"field_name": "缺口视图链接", "type": 1},
+    {"field_name": "最后卡片 message_id", "type": 1},
+    {"field_name": "最后按钮动作Key", "type": 1},
+    {"field_name": "最后按钮动作时间", "type": 5},
+    {"field_name": "重算次数", "type": 2},
+    {"field_name": "最后错误", "type": 1},
+    {"field_name": "最后结果JSON", "type": 1},
+]
+
+
+def normalize_period(month: str | None = None, period: str | None = None) -> tuple[str, str]:
+    if period:
+        p = period.strip()
+        if p.startswith("month_"):
+            return p, p.removeprefix("month_")
+        return f"month_{p}", p
+    if month:
+        m = month.strip().removeprefix("month_")
+        return f"month_{m}", m
+    last = _dt.date.today().replace(day=1) - _dt.timedelta(days=1)
+    m = last.strftime("%Y-%m")
+    return f"month_{m}", m
+
+
+async def _tenant_token(app_id: str | None = None, secret: str | None = None) -> str:
+    app_id = app_id or os.getenv("FEISHU_APP_ID", "cli_a9f6ae86fce8dbd8")
+    secret = secret if secret is not None else os.getenv("FEISHU_APP_SECRET", "")
+    if not secret:
+        raise RuntimeError(f"Feishu secret missing for app {app_id}")
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.post(
+            f"{FEISHU}/auth/v3/tenant_access_token/internal",
+            json={"app_id": app_id, "app_secret": secret},
+        )
+    j = r.json()
+    tok = j.get("tenant_access_token")
+    if not tok:
+        raise RuntimeError(f"tenant token failed: {j}")
+    return tok
+
+
+async def _fs_json(
+    method: str,
+    url: str,
+    tok: str,
+    payload: dict[str, Any] | None = None,
+    timeout: int = 60,
+) -> dict[str, Any]:
+    headers = {"Authorization": f"Bearer {tok}", "Content-Type": "application/json; charset=utf-8"}
+    async with httpx.AsyncClient(timeout=timeout) as c:
+        r = await c.request(method, url, headers=headers, json=payload)
+    try:
+        j = r.json()
+    except Exception:
+        raise RuntimeError(f"Feishu non-json response {r.status_code}: {r.text[:500]}")
+    if r.status_code >= 400 or j.get("code") not in (0, None):
+        raise RuntimeError(f"Feishu API failed {method} {url}: {j}")
+    return j
+
+
+def _text(v: Any) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, list):
+        return "".join(_text(x) for x in v)
+    if isinstance(v, dict):
+        return str(v.get("text") or v.get("name") or v.get("value") or "")
+    return str(v)
+
+
+def _num(v: Any) -> float:
+    try:
+        if isinstance(v, list) and v:
+            v = v[0]
+        if isinstance(v, dict):
+            v = v.get("text") or v.get("value")
+        if v in ("", None):
+            return 0.0
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _blank_cost(v: Any) -> bool:
+    if v in (None, ""):
+        return True
+    if isinstance(v, list) and not v:
+        return True
+    return abs(_num(v)) < 0.0001
+
+
+def _money(v: float) -> str:
+    return f"¥{v:,.2f}"
+
+
+def _record_url(rid: str) -> str:
+    return f"{BASE_URL}?table={REPORT_TABLE_ID}&record={rid}"
+
+
+def _report_url() -> str:
+    return f"{BASE_URL}?table={REPORT_TABLE_ID}"
+
+
+async def _list_records(tok: str, table_id: str, field_names: list[str] | None = None) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    page_token = ""
+    params = "page_size=500"
+    if field_names:
+        params += "".join(f"&field_names={name}" for name in field_names)
+    while True:
+        url = f"{FEISHU}/bitable/v1/apps/{APP_TOKEN}/tables/{table_id}/records?{params}"
+        if page_token:
+            url += f"&page_token={page_token}"
+        d = (await _fs_json("GET", url, tok)).get("data", {})
+        out.extend(d.get("items", []))
+        page_token = d.get("page_token") or ""
+        if not d.get("has_more"):
+            break
+    return out
+
+
+async def _status_table(tok: str) -> str:
+    if STATUS_TABLE_ID_ENV:
+        return STATUS_TABLE_ID_ENV
+    page_token = ""
+    while True:
+        url = f"{FEISHU}/bitable/v1/apps/{APP_TOKEN}/tables?page_size=100"
+        if page_token:
+            url += f"&page_token={page_token}"
+        d = (await _fs_json("GET", url, tok)).get("data", {})
+        for table in d.get("items", []):
+            if table.get("name") == STATUS_TABLE_NAME:
+                return table["table_id"]
+        page_token = d.get("page_token") or ""
+        if not d.get("has_more"):
+            break
+    created = await _fs_json(
+        "POST",
+        f"{FEISHU}/bitable/v1/apps/{APP_TOKEN}/tables",
+        tok,
+        {"table": {"name": STATUS_TABLE_NAME}},
+    )
+    return created.get("data", {}).get("table_id") or created.get("data", {}).get("table", {}).get("table_id")
+
+
+async def ensure_status_table(tok: str | None = None) -> dict[str, Any]:
+    tok = tok or await _tenant_token()
+    table_id = await _status_table(tok)
+    fields_resp = await _fs_json(
+        "GET",
+        f"{FEISHU}/bitable/v1/apps/{APP_TOKEN}/tables/{table_id}/fields?page_size=200",
+        tok,
+    )
+    fields = fields_resp.get("data", {}).get("items", [])
+    existing = {f.get("field_name"): f for f in fields}
+
+    # New Feishu tables start with one default text field. Rename it to 周期 if needed.
+    if "周期" not in existing and fields:
+        first = fields[0]
+        await _fs_json(
+            "PUT",
+            f"{FEISHU}/bitable/v1/apps/{APP_TOKEN}/tables/{table_id}/fields/{first['field_id']}",
+            tok,
+            {"field_name": "周期", "type": first.get("type", 1)},
+        )
+
+    fields_resp = await _fs_json(
+        "GET",
+        f"{FEISHU}/bitable/v1/apps/{APP_TOKEN}/tables/{table_id}/fields?page_size=200",
+        tok,
+    )
+    existing_names = {f.get("field_name") for f in fields_resp.get("data", {}).get("items", [])}
+    for spec in STATUS_FIELDS:
+        if spec["field_name"] in existing_names:
+            continue
+        await _fs_json(
+            "POST",
+            f"{FEISHU}/bitable/v1/apps/{APP_TOKEN}/tables/{table_id}/fields",
+            tok,
+            spec,
+        )
+    return {"table_id": table_id, "url": f"{BASE_URL}?table={table_id}"}
+
+
+async def _upsert_status(period: str, fields: dict[str, Any], tok: str | None = None) -> dict[str, Any]:
+    tok = tok or await _tenant_token()
+    table = await ensure_status_table(tok)
+    table_id = table["table_id"]
+    rows = await _list_records(tok, table_id)
+    rid = None
+    for r in rows:
+        if _text(r.get("fields", {}).get("周期")) == period:
+            rid = r["record_id"]
+            break
+    fields = {"周期": period, **fields}
+    if rid:
+        await _fs_json(
+            "PUT",
+            f"{FEISHU}/bitable/v1/apps/{APP_TOKEN}/tables/{table_id}/records/{rid}",
+            tok,
+            {"fields": fields},
+        )
+        return {"record_id": rid, "table_id": table_id, "updated": True, "url": f"{BASE_URL}?table={table_id}&record={rid}"}
+    created = await _fs_json(
+        "POST",
+        f"{FEISHU}/bitable/v1/apps/{APP_TOKEN}/tables/{table_id}/records",
+        tok,
+        {"fields": fields},
+    )
+    rid = created.get("data", {}).get("record", {}).get("record_id") or created.get("data", {}).get("record_id")
+    return {"record_id": rid, "table_id": table_id, "created": True, "url": f"{BASE_URL}?table={table_id}&record={rid}"}
+
+
+async def _get_status(period: str, tok: str | None = None) -> dict[str, Any] | None:
+    tok = tok or await _tenant_token()
+    table = await ensure_status_table(tok)
+    for r in await _list_records(tok, table["table_id"]):
+        if _text(r.get("fields", {}).get("周期")) == period:
+            return {"record_id": r["record_id"], "fields": r.get("fields", {}), "table_id": table["table_id"]}
+    return None
+
+
+async def audit(
+    month: str | None = None,
+    period: str | None = None,
+    commit: bool = False,
+    run_cost_preview: bool = True,
+    cost_summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    period, month = normalize_period(month, period)
+    tok = await _tenant_token()
+    records = await _list_records(tok, REPORT_TABLE_ID)
+    rows = [r for r in records if _text(r.get("fields", {}).get("周期")) == period]
+
+    cost_error = ""
+    if cost_summary is None and run_cost_preview:
+        try:
+            cost_summary = await anyio.to_thread.run_sync(meitong_cost.run, period, 12, False)
+        except Exception as e:
+            cost_error = f"{type(e).__name__}: {e}"
+            cost_summary = {"status": "error", "msg": cost_error}
+
+    stores: set[str] = set()
+    revenue = 0.0
+    profit = 0.0
+    head_total = 0.0
+    ovs_total = 0.0
+    order_count = 0
+    unit_count = 0.0
+    purchase_gaps: list[dict[str, Any]] = []
+    freight_gaps: list[dict[str, Any]] = []
+    gap_map: dict[str, dict[str, Any]] = {}
+
+    for r in rows:
+        f = r.get("fields", {})
+        store = _text(f.get("店铺")) or "未识别店铺"
+        sku = _text(f.get("SKU")) or "(空SKU)"
+        rev = _num(f.get("营收(RMB)"))
+        units = _num(f.get("件数"))
+        orders = int(_num(f.get("订单数")))
+        cg = _num(f.get("采购成本(RMB)"))
+        head = _num(f.get("头程成本(RMB)"))
+        ovs = _num(f.get("海外仓成本(RMB)"))
+        stores.add(store)
+        revenue += rev
+        profit += _num(f.get("全额毛利(RMB)"))
+        head_total += head
+        ovs_total += ovs
+        order_count += orders
+        unit_count += units
+        active_row = rev > 0.0001 or units > 0.0001 or orders > 0
+        if active_row and units > 0 and (cg <= 0.0001 or _blank_cost(f.get("采购成本(RMB)"))):
+            purchase_gaps.append({"record_id": r["record_id"], "store": store, "sku": sku, "orders": orders, "units": units, "revenue": rev})
+            gap_map.setdefault(r["record_id"], {"record_id": r["record_id"], "store": store, "sku": sku, "orders": orders, "units": units, "revenue": rev, "gap_types": []})["gap_types"].append("采购成本")
+        if active_row and units > 0 and _blank_cost(f.get("头程成本(RMB)")) and _blank_cost(f.get("海外仓成本(RMB)")):
+            freight_gaps.append({"record_id": r["record_id"], "store": store, "sku": sku, "orders": orders, "units": units, "revenue": rev})
+            gap_map.setdefault(r["record_id"], {"record_id": r["record_id"], "store": store, "sku": sku, "orders": orders, "units": units, "revenue": rev, "gap_types": []})["gap_types"].append("头程/海外仓")
+
+    gap_rows = list(gap_map.values())
+    cbt_rows = [r for r in rows if "CBT" in _text(r.get("fields", {}).get("店铺"))]
+    cbt_state = "已解析" if cbt_rows else "未发现CBT行"
+
+    last_error = cost_error
+    if cost_summary and cost_summary.get("status") == "error":
+        last_error = _text(cost_summary.get("msg")) or json.dumps(cost_summary, ensure_ascii=False)[:500]
+
+    if last_error:
+        state = "异常"
+        next_card = "error"
+    elif not rows:
+        state = "待数据同步"
+        next_card = "instruction"
+    elif purchase_gaps or freight_gaps:
+        state = "成本缺失待补"
+        next_card = "cost_gap"
+    else:
+        state = "待运营确认"
+        next_card = "ops_final"
+
+    result = {
+        "status": "ok" if not last_error else "error",
+        "period": period,
+        "month": month,
+        "commit": commit,
+        "state": state,
+        "next_card": next_card,
+        "report_rows": len(rows),
+        "store_count": len(stores),
+        "stores": sorted(stores),
+        "order_count": order_count,
+        "unit_count": unit_count,
+        "revenue_rmb": round(revenue, 2),
+        "gross_profit_rmb": round(profit, 2),
+        "purchase_gap_count": len(purchase_gaps),
+        "freight_gap_count": len(freight_gaps),
+        "gap_row_count": len(gap_rows),
+        "head_total_rmb": round(head_total, 2),
+        "ovs_total_rmb": round(ovs_total, 2),
+        "cbt_state": cbt_state,
+        "report_url": _report_url(),
+        "gap_view_url": _report_url(),
+        "gap_rows": gap_rows,
+        "cost_summary": cost_summary or {},
+        "last_error": last_error,
+    }
+
+    if commit:
+        fields = {
+            "月份": month,
+            "状态": state,
+            "报表行数": len(rows),
+            "店铺覆盖数": len(stores),
+            "CBT解析状态": cbt_state,
+            "成本缺口数": len(gap_rows),
+            "采购缺口数": len(purchase_gaps),
+            "头程/海外仓缺口数": len(freight_gaps),
+            "最近重算时间": int(time.time() * 1000),
+            "报表链接": _report_url(),
+            "缺口视图链接": _report_url(),
+            "最后错误": last_error[:1800],
+            "最后结果JSON": json.dumps({k: v for k, v in result.items() if k != "gap_rows"}, ensure_ascii=False)[:1800],
+        }
+        prior = await _get_status(period, tok)
+        if prior:
+            fields["重算次数"] = int(_num(prior["fields"].get("重算次数"))) + 1
+        else:
+            fields["重算次数"] = 1
+        result["status_record"] = await _upsert_status(period, fields, tok)
+    return result
+
+
+def _md(content: str) -> dict[str, str]:
+    return {"tag": "lark_md", "content": content}
+
+
+def _plain(content: str) -> dict[str, str]:
+    return {"tag": "plain_text", "content": content}
+
+
+def _field(label: str, value: str) -> dict[str, Any]:
+    return {"is_short": True, "text": _md(f"**{label}**\n{value}")}
+
+
+def _button(label: str, action: str | None = None, period: str | None = None, url: str | None = None,
+            btn_type: str = "default", extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    b: dict[str, Any] = {"tag": "button", "text": _plain(label), "type": btn_type}
+    if url:
+        b["url"] = url
+    if action:
+        value = {"action": action, "period": period}
+        if extra:
+            value.update(extra)
+        b["value"] = value
+    return b
+
+
+def _title_for(kind: str, month: str) -> tuple[str, str]:
+    if kind == "instruction":
+        return "yellow", f"🟡 [FIN·P2] 美客多毛利本月操作指引 · {month}"
+    if kind == "cost_gap":
+        return "orange", f"🟠 [FIN·P1] 美客多成本缺口待处理 · {month}"
+    if kind == "ops_final":
+        return "green", f"🟢 [FIN·P2] 美客多毛利待运营确认 · {month}"
+    if kind == "finance_final":
+        return "blue", f"🟡 [FIN·P2] 美客多毛利待财务确认 · {month}"
+    if kind == "processed":
+        return "grey", f"✅ [FIN·P2] 美客多毛利卡片已处理 · {month}"
+    return "red", f"🔴 [FIN·P0] 美客多毛利月结异常 · {month}"
+
+
+def build_card(kind: str, summary: dict[str, Any], status_fields: dict[str, Any] | None = None) -> dict[str, Any]:
+    period = summary.get("period") or normalize_period(summary.get("month"))[0]
+    month = summary.get("month") or period.removeprefix("month_")
+    status_fields = status_fields or {}
+    template, title = _title_for(kind, month)
+    report_url = summary.get("report_url") or _report_url()
+    gap_url = summary.get("gap_view_url") or report_url
+
+    card: dict[str, Any] = {
+        "config": {"wide_screen_mode": True},
+        "header": {"template": template, "title": _plain(title)},
+        "elements": [],
+    }
+    els = card["elements"]
+
+    if kind == "instruction":
+        folder_url = os.getenv("CBT_EXPORT_FOLDER_URL", "https://u1wpma3xuhr.feishu.cn/drive/folder/NBPifXvXVl5khXdUSJxcCTvhnWg")
+        els.append({"tag": "div", "fields": [
+            _field("周期", month),
+            _field("截止动作", "7-11号系统自动解析CBT导出"),
+            _field("CBT需上传", "Orders / Billing / Ads 三个官方导出文件"),
+            _field("本土店", "无需上传，系统通过 ML API / webhook / cache 入表"),
+        ]})
+        els.append({"tag": "hr"})
+        els.append({"tag": "div", "text": _md(
+            "本土店覆盖包含 **DISTRIBUIDOR VALMIGOZ**。运营只需要完成 CBT-FULL 三个导出文件上传，后续系统会自动重算成本、审计缺口，并发送下一张处理卡片。"
+        )})
+        els.append({"tag": "action", "actions": [
+            _button("打开上传文件夹", url=folder_url, btn_type="primary"),
+            _button("打开毛利报表", url=report_url),
+        ]})
+        return card
+
+    if kind == "cost_gap":
+        els.append({"tag": "div", "fields": [
+            _field("报表行数", str(summary.get("report_rows", 0))),
+            _field("缺口行数", str(summary.get("gap_row_count", 0))),
+            _field("采购缺口", str(summary.get("purchase_gap_count", 0))),
+            _field("头程/海外仓缺口", str(summary.get("freight_gap_count", 0))),
+            _field("头程合计", _money(float(summary.get("head_total_rmb") or 0))),
+            _field("海外仓合计", _money(float(summary.get("ovs_total_rmb") or 0))),
+        ]})
+        grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in summary.get("gap_rows", [])[:12]:
+            grouped[row.get("store") or "未识别店铺"].append(row)
+        lines: list[str] = []
+        for store, items in grouped.items():
+            lines.append(f"**{store}**")
+            for row in items:
+                gaps = "、".join(row.get("gap_types") or [])
+                lines.append(
+                    f"- `{row.get('sku')}`：订单 {row.get('orders', 0)}，件数 {row.get('units', 0):g}，营收 {_money(float(row.get('revenue') or 0))}，缺口 {gaps}"
+                )
+        rest = max(0, int(summary.get("gap_row_count") or 0) - 12)
+        if rest:
+            lines.append(f"- 其余 {rest} 行请通过下方缺口视图查看")
+        els.append({"tag": "hr"})
+        els.append({"tag": "div", "text": _md("\n".join(lines) if lines else "未发现可展示的缺口明细。")})
+        els.append({"tag": "action", "actions": [
+            _button("已补映射，重新核算", action="ml_profit_recalc_cost", period=period, btn_type="primary"),
+            _button("本月缺口确认不影响终稿", action="ml_profit_ops_waive_gap", period=period),
+            _button("打开缺口视图", url=gap_url),
+            _button("打开毛利报表", url=report_url),
+        ]})
+        return card
+
+    if kind == "ops_final":
+        els.append({"tag": "div", "fields": [
+            _field("店铺覆盖", str(summary.get("store_count", 0))),
+            _field("订单行数", str(summary.get("report_rows", 0))),
+            _field("营收", _money(float(summary.get("revenue_rmb") or 0))),
+            _field("全额毛利", _money(float(summary.get("gross_profit_rmb") or 0))),
+            _field("采购缺口", str(summary.get("purchase_gap_count", 0))),
+            _field("成本缺口", str(summary.get("gap_row_count", 0))),
+            _field("CBT解析状态", str(summary.get("cbt_state") or "-")),
+            _field("最近重算", _dt.datetime.now().strftime("%Y-%m-%d %H:%M")),
+        ]})
+        els.append({"tag": "hr"})
+        els.append({"tag": "div", "text": _md("系统审计未发现采购成本或头程/海外仓成本缺口。请运营打开报表抽检后确认终稿，确认后才会推送财务终稿确认。")})
+        els.append({"tag": "action", "actions": [
+            _button("确认运营终稿", action="ml_profit_ops_confirm", period=period, btn_type="primary"),
+            _button("发现问题，退回重算", action="ml_profit_ops_reject", period=period, btn_type="danger"),
+            _button("打开毛利报表", url=report_url),
+        ]})
+        return card
+
+    if kind == "finance_final":
+        ops_name = _text(status_fields.get("运营确认人")) or "-"
+        ops_time = _text(status_fields.get("运营确认时间")) or "-"
+        els.append({"tag": "div", "fields": [
+            _field("运营确认人", ops_name),
+            _field("运营确认时间", ops_time),
+            _field("终稿版本", month),
+            _field("报表行数", str(summary.get("report_rows", 0))),
+            _field("营收", _money(float(summary.get("revenue_rmb") or 0))),
+            _field("全额毛利", _money(float(summary.get("gross_profit_rmb") or 0))),
+        ]})
+        els.append({"tag": "hr"})
+        els.append({"tag": "div", "text": _md("此版本已经运营确认。财务确认后，月结状态会进入 **财务已确认终稿**。")})
+        els.append({"tag": "action", "actions": [
+            _button("财务确认终稿", action="ml_profit_finance_confirm", period=period, btn_type="primary"),
+            _button("退回运营复核", action="ml_profit_finance_reject", period=period, btn_type="danger"),
+            _button("打开报表", url=report_url),
+        ]})
+        return card
+
+    els.append({"tag": "div", "text": _md(str(summary.get("last_error") or "月结流程异常，请查看 ml-sync 日志。"))})
+    els.append({"tag": "action", "actions": [_button("打开毛利报表", url=report_url)]})
+    return card
+
+
+def build_processed_card(month: str, result: str, actor: str = "", detail: str = "", ok: bool = True) -> dict[str, Any]:
+    template = "green" if ok else "red"
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {"template": template, "title": _plain(f"✅ [FIN·P2] 美客多毛利卡片已处理 · {month}")},
+        "elements": [
+            {"tag": "div", "fields": [
+                _field("处理结果", result),
+                _field("处理人", actor or "-"),
+                _field("处理时间", _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                _field("说明", detail or "-"),
+            ]},
+        ],
+    }
+
+
+async def send_card(card: dict[str, Any], receive_id: str, receive_id_type: str = "chat_id") -> dict[str, Any]:
+    tok = await _tenant_token(CARD_APP_ID, CARD_APP_SECRET)
+    return await _fs_json(
+        "POST",
+        f"{FEISHU}/im/v1/messages?receive_id_type={receive_id_type}",
+        tok,
+        {"receive_id": receive_id, "msg_type": "interactive", "content": json.dumps(card, ensure_ascii=False)},
+    )
+
+
+async def patch_card(message_id: str, card: dict[str, Any]) -> dict[str, Any]:
+    tok = await _tenant_token(CARD_APP_ID, CARD_APP_SECRET)
+    return await _fs_json(
+        "PATCH",
+        f"{FEISHU}/im/v1/messages/{message_id}",
+        tok,
+        {"content": json.dumps(card, ensure_ascii=False)},
+    )
+
+
+async def card_endpoint(
+    kind: str | None = None,
+    month: str | None = None,
+    period: str | None = None,
+    send: bool = False,
+    receive_id: str | None = None,
+    receive_id_type: str = "chat_id",
+) -> dict[str, Any]:
+    summary = await audit(month=month, period=period, commit=False, run_cost_preview=(kind != "instruction"))
+    kind = kind or summary.get("next_card") or "instruction"
+    status = await _get_status(summary["period"]) or {}
+    card = build_card(kind, summary, status.get("fields") if status else {})
+    out = {"status": "ok", "kind": kind, "period": summary["period"], "summary": summary, "card": card}
+    if send:
+        target = receive_id or (FINANCE_GROUP_ID if kind == "finance_final" else ML_GROUP_ID)
+        sent = await send_card(card, target, receive_id_type)
+        msg_id = (
+            sent.get("data", {}).get("message_id")
+            or sent.get("data", {}).get("message", {}).get("message_id")
+        )
+        out["send_result"] = sent
+        if msg_id:
+            tok = await _tenant_token()
+            await _upsert_status(summary["period"], {"最后卡片 message_id": msg_id}, tok)
+    return out
+
+
+async def status_endpoint(month: str | None = None, period: str | None = None) -> dict[str, Any]:
+    period, month = normalize_period(month, period)
+    status = await _get_status(period)
+    fields = status.get("fields", {}) if status else {}
+    state = _text(fields.get("状态")) if fields else "待数据同步"
+    return {
+        "status": "ok",
+        "period": period,
+        "month": month,
+        "state": state,
+        "ready_for_finance": state in ("运营已确认", "财务已确认终稿"),
+        "record": status,
+    }
+
+
+async def recalc_cost(month: str | None = None, period: str | None = None, commit: bool = True) -> dict[str, Any]:
+    period, month = normalize_period(month, period)
+    cost = await anyio.to_thread.run_sync(meitong_cost.run, period, 12, commit)
+    summary = await audit(period=period, commit=True, run_cost_preview=False, cost_summary=cost)
+    return {"status": "ok", "period": period, "month": month, "cost_summary": cost, "audit": summary}
+
+
+async def confirm_action(payload: dict[str, Any]) -> dict[str, Any]:
+    action = payload.get("action") or payload.get("value", {}).get("action")
+    period, month = normalize_period(payload.get("month"), payload.get("period") or payload.get("value", {}).get("period"))
+    actor = _text(payload.get("operator_name") or payload.get("operator_id") or payload.get("open_id") or payload.get("user_id"))
+    message_id = payload.get("message_id") or payload.get("card_open_message_id")
+    patch = bool(payload.get("patch_message"))
+    now_ms = int(time.time() * 1000)
+    tok = await _tenant_token()
+    current = await _get_status(period, tok) or {}
+    current_fields = current.get("fields") or {}
+    action_key = f"{message_id or period}:{action}"
+    if action and _text(current_fields.get("最后按钮动作Key")) == action_key:
+        processed = build_processed_card(month, "已处理", actor, "重复点击已拦截，未重复执行")
+        if patch and message_id:
+            await patch_card(message_id, processed)
+        return {"status": "ok", "action": action, "period": period, "deduped": True, "processed_card": processed}
+    if action:
+        await _upsert_status(period, {"最后按钮动作Key": action_key, "最后按钮动作时间": now_ms}, tok)
+
+    if action == "ml_profit_recalc_cost":
+        recalc = await recalc_cost(period=period, commit=True)
+        kind = recalc["audit"].get("next_card")
+        next_card = build_card(kind, recalc["audit"])
+        processed = build_processed_card(month, "已重新核算成本", actor, f"下一步卡片：{kind}")
+        if patch and message_id:
+            await patch_card(message_id, processed)
+        return {"status": "ok", "action": action, "period": period, "recalc": recalc, "processed_card": processed, "next_card": next_card, "next_kind": kind}
+
+    summary = await audit(period=period, commit=False, run_cost_preview=False)
+
+    if action in ("ml_profit_ops_confirm", "ml_profit_ops_waive_gap"):
+        state = "运营已确认"
+        detail = "运营确认终稿" if action == "ml_profit_ops_confirm" else "运营确认本月缺口不影响终稿"
+        status_update = {"状态": state, "运营确认人": actor, "运营确认时间": now_ms}
+        await _upsert_status(period, status_update, tok)
+        status = await _get_status(period, tok) or {}
+        finance_card = build_card("finance_final", summary, status.get("fields") or {})
+        processed = build_processed_card(month, state, actor, detail)
+        if patch and message_id:
+            await patch_card(message_id, processed)
+        return {"status": "ok", "action": action, "period": period, "state": state, "processed_card": processed, "next_card": finance_card, "next_kind": "finance_final"}
+
+    if action == "ml_profit_ops_reject":
+        await _upsert_status(period, {"状态": "退回重算", "最后错误": "运营退回重算"}, tok)
+        processed = build_processed_card(month, "退回重算", actor, "运营发现问题，需补数后重新核算", ok=False)
+        if patch and message_id:
+            await patch_card(message_id, processed)
+        return {"status": "ok", "action": action, "period": period, "state": "退回重算", "processed_card": processed}
+
+    if action == "ml_profit_finance_confirm":
+        await _upsert_status(period, {"状态": "财务已确认终稿", "财务确认人": actor, "财务确认时间": now_ms}, tok)
+        processed = build_processed_card(month, "财务已确认终稿", actor, "月结终稿完成")
+        if patch and message_id:
+            await patch_card(message_id, processed)
+        return {"status": "ok", "action": action, "period": period, "state": "财务已确认终稿", "processed_card": processed}
+
+    if action == "ml_profit_finance_reject":
+        await _upsert_status(period, {"状态": "退回重算", "最后错误": "财务退回运营复核"}, tok)
+        processed = build_processed_card(month, "退回运营复核", actor, "财务退回，需运营复核后再确认", ok=False)
+        if patch and message_id:
+            await patch_card(message_id, processed)
+        return {"status": "ok", "action": action, "period": period, "state": "退回重算", "processed_card": processed}
+
+    return {"status": "ignored", "action": action, "period": period, "msg": "unknown ml close action"}

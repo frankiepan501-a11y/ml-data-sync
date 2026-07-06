@@ -126,15 +126,18 @@ def _parse_storage(data: bytes) -> float:
 
 async def _bitable_all(tok: str) -> list[dict]:
     out = []
-    body = {"page_size": 500}
+    page_token = None
     async with httpx.AsyncClient(timeout=60) as c:
         while True:
-            d = (await c.post(f"{FEISHU}/bitable/v1/apps/{APP_TOKEN}/tables/{TABLE_ID}/records/search",
-                              json=body, headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"})).json().get("data", {})
+            # Use LIST API for full-table reads. records/search pagination is not
+            # stable without sort and has previously dropped ML cost rows.
+            url = f"{FEISHU}/bitable/v1/apps/{APP_TOKEN}/tables/{TABLE_ID}/records?page_size=500"
+            if page_token:
+                url += f"&page_token={page_token}"
+            d = (await c.get(url, headers={"Authorization": f"Bearer {tok}"})).json().get("data", {})
             out += d.get("items", [])
-            if d.get("has_more") and d.get("page_token"):
-                body["page_token"] = d["page_token"]
-            else:
+            page_token = d.get("page_token")
+            if not d.get("has_more"):
                 break
     return out
 
