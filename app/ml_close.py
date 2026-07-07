@@ -182,6 +182,18 @@ def _report_url() -> str:
     return f"{BASE_URL}?table={REPORT_TABLE_ID}"
 
 
+def _status_url() -> str:
+    return f"{BASE_URL}?table={STATUS_TABLE_ID_ENV}" if STATUS_TABLE_ID_ENV else BASE_URL
+
+
+def _top_link_actions(report_url: str, gap_url: str | None = None) -> dict[str, Any]:
+    actions = [_button("打开飞书毛利报表", url=report_url)]
+    if gap_url and gap_url != report_url:
+        actions.append(_button("打开缺口视图", url=gap_url))
+    actions.append(_button("打开月结状态台", url=_status_url()))
+    return {"tag": "action", "actions": actions}
+
+
 async def _list_records(tok: str, table_id: str, field_names: list[str] | None = None) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     page_token = ""
@@ -533,6 +545,8 @@ def build_card(kind: str, summary: dict[str, Any], status_fields: dict[str, Any]
             _field("头程合计", _money(float(summary.get("head_total_rmb") or 0))),
             _field("海外仓合计", _money(float(summary.get("ovs_total_rmb") or 0))),
         ]})
+        els.append(_top_link_actions(report_url, gap_url))
+        els.append({"tag": "hr"})
         grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for row in summary.get("gap_rows", [])[:12]:
             grouped[row.get("store") or "未识别店铺"].append(row)
@@ -572,6 +586,7 @@ def build_card(kind: str, summary: dict[str, Any], status_fields: dict[str, Any]
             _field("CBT解析状态", str(summary.get("cbt_state") or "-")),
             _field("最近重算", _dt.datetime.now().strftime("%Y-%m-%d %H:%M")),
         ]})
+        els.append(_top_link_actions(report_url))
         els.append({"tag": "hr"})
         store_section = _store_details_section(summary)
         if store_section:
@@ -581,7 +596,6 @@ def build_card(kind: str, summary: dict[str, Any], status_fields: dict[str, Any]
         els.append({"tag": "action", "actions": [
             _button("确认运营终稿", action="ml_profit_ops_confirm", period=period, btn_type="primary"),
             _button("发现问题，退回重算", action="ml_profit_ops_reject", period=period, btn_type="danger"),
-            _button("打开毛利报表", url=report_url),
         ]})
         return card
 
@@ -596,6 +610,7 @@ def build_card(kind: str, summary: dict[str, Any], status_fields: dict[str, Any]
             _field("营收", _money(float(summary.get("revenue_rmb") or 0))),
             _field("全额毛利", _money(float(summary.get("gross_profit_rmb") or 0))),
         ]})
+        els.append(_top_link_actions(report_url))
         els.append({"tag": "hr"})
         store_section = _store_details_section(summary)
         if store_section:
@@ -605,7 +620,6 @@ def build_card(kind: str, summary: dict[str, Any], status_fields: dict[str, Any]
         els.append({"tag": "action", "actions": [
             _button("财务确认终稿", action="ml_profit_finance_confirm", period=period, btn_type="primary"),
             _button("退回运营复核", action="ml_profit_finance_reject", period=period, btn_type="danger"),
-            _button("打开报表", url=report_url),
         ]})
         return card
 
