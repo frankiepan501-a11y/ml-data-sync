@@ -154,6 +154,26 @@ def _money(v: float) -> str:
     return f"¥{v:,.2f}"
 
 
+def _store_details_section(summary: dict[str, Any]) -> dict[str, Any] | None:
+    details = summary.get("store_details") or []
+    if not details:
+        stores = summary.get("stores") or []
+        if not stores:
+            return None
+        text = "**覆盖店铺**\n" + "\n".join(f"- {s}" for s in stores)
+        return {"tag": "div", "text": _md(text)}
+
+    lines = ["**覆盖店铺明细**"]
+    for row in details:
+        store = row.get("store") or "未识别店铺"
+        rows = int(row.get("rows") or 0)
+        orders = int(row.get("orders") or 0)
+        revenue = _money(float(row.get("revenue_rmb") or 0))
+        ad_fee = _money(float(row.get("ad_fee_rmb") or 0))
+        lines.append(f"- **{store}**：{rows} 行 / {orders} 单 / 营收 {revenue} / 广告费 {ad_fee}")
+    return {"tag": "div", "text": _md("\n".join(lines))}
+
+
 def _record_url(rid: str) -> str:
     return f"{BASE_URL}?table={REPORT_TABLE_ID}&record={rid}"
 
@@ -308,6 +328,8 @@ async def audit(
     ovs_total = 0.0
     order_count = 0
     unit_count = 0.0
+    ad_total_rmb = 0.0
+    store_details: dict[str, dict[str, Any]] = {}
     purchase_gaps: list[dict[str, Any]] = []
     freight_gaps: list[dict[str, Any]] = []
     gap_map: dict[str, dict[str, Any]] = {}
@@ -319,16 +341,24 @@ async def audit(
         rev = _num(f.get("营收(RMB)"))
         units = _num(f.get("件数"))
         orders = int(_num(f.get("订单数")))
+        ad_fee = _num(f.get("广告费(RMB)"))
         cg = _num(f.get("采购成本(RMB)"))
         head = _num(f.get("头程成本(RMB)"))
         ovs = _num(f.get("海外仓成本(RMB)"))
         stores.add(store)
+        sd = store_details.setdefault(store, {"store": store, "rows": 0, "orders": 0, "units": 0.0, "revenue_rmb": 0.0, "ad_fee_rmb": 0.0})
+        sd["rows"] += 1
+        sd["orders"] += orders
+        sd["units"] += units
+        sd["revenue_rmb"] += rev
+        sd["ad_fee_rmb"] += ad_fee
         revenue += rev
         profit += _num(f.get("全额毛利(RMB)"))
         head_total += head
         ovs_total += ovs
         order_count += orders
         unit_count += units
+        ad_total_rmb += ad_fee
         active_row = rev > 0.0001 or units > 0.0001 or orders > 0
         if active_row and units > 0 and (cg <= 0.0001 or _blank_cost(f.get("采购成本(RMB)"))):
             purchase_gaps.append({"record_id": r["record_id"], "store": store, "sku": sku, "orders": orders, "units": units, "revenue": rev})
@@ -372,6 +402,18 @@ async def audit(
         "unit_count": unit_count,
         "revenue_rmb": round(revenue, 2),
         "gross_profit_rmb": round(profit, 2),
+        "ad_total_rmb": round(ad_total_rmb, 2),
+        "store_details": [
+            {
+                "store": v["store"],
+                "rows": int(v["rows"]),
+                "orders": int(v["orders"]),
+                "units": round(float(v["units"]), 2),
+                "revenue_rmb": round(float(v["revenue_rmb"]), 2),
+                "ad_fee_rmb": round(float(v["ad_fee_rmb"]), 2),
+            }
+            for v in sorted(store_details.values(), key=lambda x: x["store"])
+        ],
         "purchase_gap_count": len(purchase_gaps),
         "freight_gap_count": len(freight_gaps),
         "gap_row_count": len(gap_rows),
@@ -506,6 +548,10 @@ def build_card(kind: str, summary: dict[str, Any], status_fields: dict[str, Any]
         if rest:
             lines.append(f"- 其余 {rest} 行请通过下方缺口视图查看")
         els.append({"tag": "hr"})
+        store_section = _store_details_section(summary)
+        if store_section:
+            els.append(store_section)
+            els.append({"tag": "hr"})
         els.append({"tag": "div", "text": _md("\n".join(lines) if lines else "未发现可展示的缺口明细。")})
         els.append({"tag": "action", "actions": [
             _button("已补映射，重新核算", action="ml_profit_recalc_cost", period=period, btn_type="primary"),
@@ -527,6 +573,10 @@ def build_card(kind: str, summary: dict[str, Any], status_fields: dict[str, Any]
             _field("最近重算", _dt.datetime.now().strftime("%Y-%m-%d %H:%M")),
         ]})
         els.append({"tag": "hr"})
+        store_section = _store_details_section(summary)
+        if store_section:
+            els.append(store_section)
+            els.append({"tag": "hr"})
         els.append({"tag": "div", "text": _md("系统审计未发现采购成本或头程/海外仓成本缺口。请运营打开报表抽检后确认终稿，确认后才会推送财务终稿确认。")})
         els.append({"tag": "action", "actions": [
             _button("确认运营终稿", action="ml_profit_ops_confirm", period=period, btn_type="primary"),
@@ -547,6 +597,10 @@ def build_card(kind: str, summary: dict[str, Any], status_fields: dict[str, Any]
             _field("全额毛利", _money(float(summary.get("gross_profit_rmb") or 0))),
         ]})
         els.append({"tag": "hr"})
+        store_section = _store_details_section(summary)
+        if store_section:
+            els.append(store_section)
+            els.append({"tag": "hr"})
         els.append({"tag": "div", "text": _md("此版本已经运营确认。财务确认后，月结状态会进入 **财务已确认终稿**。")})
         els.append({"tag": "action", "actions": [
             _button("财务确认终稿", action="ml_profit_finance_confirm", period=period, btn_type="primary"),

@@ -32,8 +32,8 @@ ADVERTISER_BY_SELLER: dict[int, int | None] = {
     1502236229: 501915,  # CBT-FULL — CNFUNLABMXF advertiser, site MLM
     1407362838: 38602,   # 本土 1 MX FUNLABDIRECTMX
     1436420028: 380587,  # 本土 2 MX FUNLAB_MX
-    2378517428: 683851,  # 巴西 AIRSOFT (MLB)
-    3383185411: None,    # 本土 3 MX DISTRIBUIDOR VALMIGOZ — 新店 advertiser_id 待俊辉确认
+    2378517428: 683851,   # 巴西 AIRSOFT (MLB)
+    3383185411: 2909534,  # 本土 3 MX DISTRIBUIDOR VALMIGOZ
 }
 
 # Auth-via: which user_id's token to use when calling /advertising for this seller.
@@ -106,6 +106,7 @@ AD_SITE_BY_ADVERTISER: dict[int, str] = {
     38602: "MLM",
     380587: "MLM",
     683851: "MLB",
+    2909534: "MLM",
 }
 
 # Currency advertiser bills in.
@@ -114,6 +115,7 @@ AD_CURRENCY_BY_ADVERTISER: dict[int, str] = {
     38602: "MXN",
     380587: "MXN",
     683851: "BRL",
+    2909534: "MXN",
 }
 
 _campaign_cache: dict[tuple[int, str], dict] = {}  # (advertiser_id, month) → {results, cached_at}
@@ -180,7 +182,7 @@ async def fetch_campaigns_for_month(advertiser_id: int, month: str, token_user_i
     return all_results
 
 
-async def fetch_ad_items_for_month(advertiser_id: int, month: str, token_user_id: int) -> list[dict]:
+async def fetch_ad_items_for_month(advertiser_id: int, month: str, token_user_id: int, *, strict: bool = False) -> list[dict]:
     """Return ad items list with metrics for the given month. 1-hour cached.
 
     Endpoint (Marketplace Advertising API v2):
@@ -202,10 +204,14 @@ async def fetch_ad_items_for_month(advertiser_id: int, month: str, token_user_id
 
     site = AD_SITE_BY_ADVERTISER.get(advertiser_id)
     if not site:
+        if strict:
+            raise RuntimeError(f"advertising site is not configured for advertiser_id={advertiser_id}")
         return []
 
     row = await db.get_token(token_user_id)
     if not row:
+        if strict:
+            raise RuntimeError(f"advertising token not found for token_user_id={token_user_id}")
         return []
     headers = {
         "Authorization": f"Bearer {row['access_token']}",
@@ -231,6 +237,8 @@ async def fetch_ad_items_for_month(advertiser_id: int, month: str, token_user_id
             r = await client.get(url, headers=headers, params=params)
             if r.status_code != 200:
                 had_error = True
+                if strict:
+                    raise RuntimeError(f"ML ads API failed advertiser_id={advertiser_id} status={r.status_code}: {r.text[:300]}")
                 break
             data = r.json()
             results = data.get("results") or []

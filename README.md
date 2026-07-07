@@ -88,6 +88,13 @@ uvicorn app.main:app --reload --port 8000
 
 CBT-FULL 仍以官方导出 3 文件为准；本土店和巴西店走 ML API/cache，不要求运营上传。`/report/cbt-ingest?commit=true` 成功后会自动触发 `sync-meitong-cost(commit=true)` 和月结审计，避免 CBT 入表后成本状态停在旧版本。
 
+### 2026-07-07 广告费修复记录
+
+- 问题：2026-06 报表里本土 3 店 `DISTRIBUIDOR VALMIGOZ` 和巴西店广告费显示为 0，运营审核时无法判断是否真实无广告费。
+- 根因：本土 3 店未配置 ML Ads advertiser 映射；同时广告 API 拉取异常此前会被静默吞掉，失败结果容易被误写成 0。
+- 修复：补充本土 3 店 advertiser `2909534 / MLM / MXN`；报表同步返回 `ad_error`、`ad_items_count`、`ad_total_local`；月结审计卡片展示每个覆盖店铺的行数、订单数、营收和广告费。
+- 验证：ML Ads API 已确认 2026-06 本土 3 店和巴西店均有 cost；重新同步对应店铺后，运营确认卡应直接列出 `ML CBT-FULL`、`ML 巴西本土店 AIRSOFT COMERCIAL`、`ML 本土3店 DISTRIBUIDOR VALMIGOZ`。
+
 ## 部署
 
 Zeabur 项目 `frankiepan501` 下 service `ml-sync`，详见 [zeabur-deploy-workflow](../../.claude/projects/C--Users-Administrator/memory/zeabur-deploy-workflow.md)。

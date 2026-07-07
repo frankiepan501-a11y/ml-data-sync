@@ -1658,17 +1658,20 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
     ad_unallocated_metrics: dict[str, float] = {}
     ad_advertised_unsold: list[str] = []
     ad_currency = "?"
+    ad_error = None
+    ad_items_count = 0
     ad_advertiser_id = advertising.ADVERTISER_BY_SELLER.get(seller_id)
     ad_token_user = advertising.TOKEN_USER_FOR_ADVERTISING.get(seller_id, seller_id)
     if ad_advertiser_id:
         try:
-            ad_items = await advertising.fetch_ad_items_for_month(ad_advertiser_id, month, ad_token_user)
+            ad_items = await advertising.fetch_ad_items_for_month(ad_advertiser_id, month, ad_token_user, strict=True)
+            ad_items_count = len(ad_items)
             ad_sku_metrics, ad_unallocated_metrics, ad_advertised_unsold = await advertising.attribute_ad_metrics_by_item_id(
                 ad_items, item_id_to_sku, token_user_id=ad_token_user
             )
             ad_currency = advertising.AD_CURRENCY_BY_ADVERTISER.get(ad_advertiser_id, "?")
-        except Exception:
-            pass
+        except Exception as e:
+            ad_error = f"{type(e).__name__}: {e}"[:500]
     ad_sku_cost: dict[str, float] = {k: v.get("cost", 0.0) for k, v in ad_sku_metrics.items()}
     ad_unallocated_cost = ad_unallocated_metrics.get("cost", 0.0)
 
@@ -1945,7 +1948,10 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
             "skus_missing_cost": skus_missing_cost,
             "advertiser_id": ad_advertiser_id,
             "ad_currency": ad_currency,
+            "ad_error": ad_error,
+            "ad_items_count": ad_items_count,
             "ad_attributed_skus": len(ad_sku_metrics),
+            "ad_total_local": round(sum(v.get("cost", 0.0) for v in ad_sku_metrics.values()) + ad_unallocated_cost, 2),
             "ad_unallocated_local": round(ad_unallocated_cost, 2),
             "vat_rate": vat_rate,
             "site_id_inferred": site_id_for_vat,
