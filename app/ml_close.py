@@ -586,6 +586,14 @@ async def send_card(card: dict[str, Any], receive_id: str, receive_id_type: str 
     )
 
 
+def _message_id(resp: dict[str, Any]) -> str:
+    return (
+        resp.get("data", {}).get("message_id")
+        or resp.get("data", {}).get("message", {}).get("message_id")
+        or ""
+    )
+
+
 async def patch_card(message_id: str, card: dict[str, Any]) -> dict[str, Any]:
     tok = await _tenant_token(CARD_APP_ID, CARD_APP_SECRET)
     return await _fs_json(
@@ -671,7 +679,11 @@ async def confirm_action(payload: dict[str, Any]) -> dict[str, Any]:
         processed = build_processed_card(month, "已重新核算成本", actor, f"下一步卡片：{kind}")
         if patch and message_id:
             await patch_card(message_id, processed)
-        return {"status": "ok", "action": action, "period": period, "recalc": recalc, "processed_card": processed, "next_card": next_card, "next_kind": kind}
+        sent = await send_card(next_card, ML_GROUP_ID)
+        sent_id = _message_id(sent)
+        if sent_id:
+            await _upsert_status(period, {"最后卡片 message_id": sent_id}, tok)
+        return {"status": "ok", "action": action, "period": period, "recalc": recalc, "processed_card": processed, "next_card": next_card, "next_kind": kind, "send_result": sent}
 
     summary = await audit(period=period, commit=False, run_cost_preview=False)
 
@@ -685,7 +697,11 @@ async def confirm_action(payload: dict[str, Any]) -> dict[str, Any]:
         processed = build_processed_card(month, state, actor, detail)
         if patch and message_id:
             await patch_card(message_id, processed)
-        return {"status": "ok", "action": action, "period": period, "state": state, "processed_card": processed, "next_card": finance_card, "next_kind": "finance_final"}
+        sent = await send_card(finance_card, FINANCE_GROUP_ID)
+        sent_id = _message_id(sent)
+        if sent_id:
+            await _upsert_status(period, {"最后卡片 message_id": sent_id}, tok)
+        return {"status": "ok", "action": action, "period": period, "state": state, "processed_card": processed, "next_card": finance_card, "next_kind": "finance_final", "send_result": sent}
 
     if action == "ml_profit_ops_reject":
         await _upsert_status(period, {"状态": "退回重算", "最后错误": "运营退回重算"}, tok)
