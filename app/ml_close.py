@@ -173,7 +173,7 @@ async def _list_records(tok: str, table_id: str, field_names: list[str] | None =
         if page_token:
             url += f"&page_token={page_token}"
         d = (await _fs_json("GET", url, tok)).get("data", {})
-        out.extend(d.get("items", []))
+        out.extend(d.get("items") or [])
         page_token = d.get("page_token") or ""
         if not d.get("has_more"):
             break
