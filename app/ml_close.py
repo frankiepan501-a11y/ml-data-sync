@@ -64,6 +64,8 @@ STATUS_FIELDS: list[dict[str, Any]] = [
     {"field_name": "最后按钮动作Key", "type": 1},
     {"field_name": "最后按钮动作时间", "type": 5},
     {"field_name": "重算次数", "type": 2},
+    {"field_name": "上次全额毛利", "type": 2},
+    {"field_name": "全额毛利差异", "type": 2},
     {"field_name": "最后错误", "type": 1},
     {"field_name": "最后结果JSON", "type": 1},
 ]
@@ -152,6 +154,29 @@ def _blank_cost(v: Any) -> bool:
 
 def _money(v: float) -> str:
     return f"¥{v:,.2f}"
+
+
+def _signed_money(v: float) -> str:
+    sign = "+" if v > 0.0001 else ""
+    return f"{sign}{_money(v)}"
+
+
+def _fmt_ms(v: Any) -> str:
+    ms = int(_num(v))
+    if ms <= 0:
+        return "-"
+    return _dt.datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d %H:%M")
+
+
+def _last_result(fields: dict[str, Any]) -> dict[str, Any]:
+    raw = _text(fields.get("最后结果JSON"))
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 
 def _store_details_section(summary: dict[str, Any]) -> dict[str, Any] | None:
@@ -322,6 +347,10 @@ async def audit(
 ) -> dict[str, Any]:
     period, month = normalize_period(month, period)
     tok = await _tenant_token()
+    prior = await _get_status(period, tok) if commit else None
+    prior_fields = prior.get("fields", {}) if prior else {}
+    prior_state = _text(prior_fields.get("状态"))
+    prior_result = _last_result(prior_fields)
     records = await _list_records(tok, REPORT_TABLE_ID)
     rows = [r for r in records if _text(r.get("fields", {}).get("周期")) == period]
 
@@ -387,6 +416,7 @@ async def audit(
     if cost_summary and cost_summary.get("status") == "error":
         last_error = _text(cost_summary.get("msg")) or json.dumps(cost_summary, ensure_ascii=False)[:500]
 
+    confirmed_state = prior_state in ("运营已确认", "财务已确认终稿")
     if last_error:
         state = "异常"
         next_card = "error"
@@ -396,6 +426,9 @@ async def audit(
     elif purchase_gaps or freight_gaps:
         state = "成本缺失待补"
         next_card = "cost_gap"
+    elif confirmed_state:
+        state = prior_state
+        next_card = "none"
     else:
         state = "待运营确认"
         next_card = "ops_final"
@@ -440,6 +473,8 @@ async def audit(
     }
 
     if commit:
+        previous_gross = round(float(_num(prior_result.get("gross_profit_rmb"))), 2)
+        gross_delta = round(float(profit) - previous_gross, 2) if previous_gross else 0.0
         fields = {
             "月份": month,
             "状态": state,
@@ -452,10 +487,11 @@ async def audit(
             "最近重算时间": int(time.time() * 1000),
             "报表链接": _report_url(),
             "缺口视图链接": _report_url(),
+            "上次全额毛利": previous_gross,
+            "全额毛利差异": gross_delta,
             "最后错误": last_error[:1800],
             "最后结果JSON": json.dumps({k: v for k, v in result.items() if k != "gap_rows"}, ensure_ascii=False)[:1800],
         }
-        prior = await _get_status(period, tok)
         if prior:
             fields["重算次数"] = int(_num(prior["fields"].get("重算次数"))) + 1
         else:
@@ -576,6 +612,10 @@ def build_card(kind: str, summary: dict[str, Any], status_fields: dict[str, Any]
         return card
 
     if kind == "ops_final":
+        last_recalc = _fmt_ms(status_fields.get("最近重算时间")) or "-"
+        delta = _num(status_fields.get("全额毛利差异"))
+        data_state = _text(status_fields.get("状态")) or "待运营确认"
+        delta_text = _signed_money(delta) if abs(delta) > 0.0001 else "无变化"
         els.append({"tag": "div", "fields": [
             _field("店铺覆盖", str(summary.get("store_count", 0))),
             _field("订单行数", str(summary.get("report_rows", 0))),
@@ -584,7 +624,9 @@ def build_card(kind: str, summary: dict[str, Any], status_fields: dict[str, Any]
             _field("采购缺口", str(summary.get("purchase_gap_count", 0))),
             _field("成本缺口", str(summary.get("gap_row_count", 0))),
             _field("CBT解析状态", str(summary.get("cbt_state") or "-")),
-            _field("最近重算", _dt.datetime.now().strftime("%Y-%m-%d %H:%M")),
+            _field("最近重算", last_recalc),
+            _field("数据状态", data_state),
+            _field("较上次重算", delta_text),
         ]})
         els.append(_top_link_actions(report_url))
         els.append({"tag": "hr"})
@@ -592,7 +634,9 @@ def build_card(kind: str, summary: dict[str, Any], status_fields: dict[str, Any]
         if store_section:
             els.append(store_section)
             els.append({"tag": "hr"})
-        els.append({"tag": "div", "text": _md("系统审计未发现采购成本或头程/海外仓成本缺口。请运营打开报表抽检后确认终稿，确认后才会推送财务终稿确认。")})
+        els.append({"tag": "div", "text": _md(
+            "系统审计未发现采购成本或头程/海外仓成本缺口。上方金额是**本次实时重算快照**；运营确认前，如果广告费、采购成本、头程/海外仓成本或报表公式回填，毛利可能变化。确认后系统会锁定月结状态，不再重复发待确认卡。"
+        )})
         els.append({"tag": "action", "actions": [
             _button("确认运营终稿", action="ml_profit_ops_confirm", period=period, btn_type="primary"),
             _button("发现问题，退回重算", action="ml_profit_ops_reject", period=period, btn_type="danger"),
@@ -601,7 +645,7 @@ def build_card(kind: str, summary: dict[str, Any], status_fields: dict[str, Any]
 
     if kind == "finance_final":
         ops_name = _text(status_fields.get("运营确认人")) or "-"
-        ops_time = _text(status_fields.get("运营确认时间")) or "-"
+        ops_time = _fmt_ms(status_fields.get("运营确认时间"))
         els.append({"tag": "div", "fields": [
             _field("运营确认人", ops_name),
             _field("运营确认时间", ops_time),
@@ -629,16 +673,23 @@ def build_card(kind: str, summary: dict[str, Any], status_fields: dict[str, Any]
 
 
 def build_processed_card(month: str, result: str, actor: str = "", detail: str = "", ok: bool = True) -> dict[str, Any]:
-    template = "green" if ok else "red"
+    template = "grey" if ok else "red"
+    report_url = _report_url()
     return {
         "config": {"wide_screen_mode": True},
-        "header": {"template": template, "title": _plain(f"✅ [FIN·P2] 美客多毛利卡片已处理 · {month}")},
+        "header": {"template": template, "title": _plain(f"✅ [FIN·P2] 美客多毛利已处理 · {month}")},
         "elements": [
             {"tag": "div", "fields": [
                 _field("处理结果", result),
                 _field("处理人", actor or "-"),
                 _field("处理时间", _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-                _field("说明", detail or "-"),
+                _field("业务状态", result),
+            ]},
+            {"tag": "hr"},
+            {"tag": "div", "text": _md((detail or "操作已写入月结状态台。") + "\n\n_此卡片已处理，无需重复点击。_")},
+            {"tag": "action", "actions": [
+                _button("打开飞书毛利报表", url=report_url),
+                _button("打开月结状态台", url=_status_url()),
             ]},
         ],
     }
@@ -672,6 +723,25 @@ async def patch_card(message_id: str, card: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+async def patch_or_fallback(message_id: str, card: dict[str, Any], chat_id: str = "") -> dict[str, Any]:
+    result: dict[str, Any] = {"patched": False, "fallback_sent": False}
+    if message_id:
+        try:
+            result["patch_result"] = await patch_card(message_id, card)
+            result["patched"] = True
+            return result
+        except Exception as e:
+            result["patch_error"] = f"{type(e).__name__}: {e}"
+    if chat_id:
+        try:
+            sent = await send_card(card, chat_id)
+            result["fallback_sent"] = True
+            result["fallback_message_id"] = _message_id(sent)
+        except Exception as e:
+            result["fallback_error"] = f"{type(e).__name__}: {e}"
+    return result
+
+
 async def card_endpoint(
     kind: str | None = None,
     month: str | None = None,
@@ -680,10 +750,30 @@ async def card_endpoint(
     receive_id: str | None = None,
     receive_id_type: str = "chat_id",
 ) -> dict[str, Any]:
+    if kind in ("none", "skip"):
+        p, _ = normalize_period(month, period)
+        return {"status": "skipped", "reason": "no_next_card", "kind": kind, "period": p}
+    p, _ = normalize_period(month, period)
+    early_status = await _get_status(p)
+    early_fields = early_status.get("fields", {}) if early_status else {}
+    early_state = _text(early_fields.get("状态")) if early_fields else ""
+    if kind is None and early_state in ("运营已确认", "财务已确认终稿"):
+        return {"status": "skipped", "reason": "already_confirmed", "state": early_state, "period": p}
     summary = await audit(month=month, period=period, commit=False, run_cost_preview=(kind != "instruction"))
+    requested_kind = kind
     kind = kind or summary.get("next_card") or "instruction"
     status = await _get_status(summary["period"]) or {}
-    card = build_card(kind, summary, status.get("fields") if status else {})
+    status_fields = status.get("fields") if status else {}
+    current_state = _text(status_fields.get("状态")) if status_fields else ""
+    if requested_kind is None and current_state in ("运营已确认", "财务已确认终稿"):
+        return {
+            "status": "skipped",
+            "reason": "already_confirmed",
+            "state": current_state,
+            "period": summary["period"],
+            "summary": summary,
+        }
+    card = build_card(kind, summary, status_fields)
     out = {"status": "ok", "kind": kind, "period": summary["period"], "summary": summary, "card": card}
     if send:
         target = receive_id or (FINANCE_GROUP_ID if kind == "finance_final" else ML_GROUP_ID)
@@ -725,8 +815,17 @@ async def confirm_action(payload: dict[str, Any]) -> dict[str, Any]:
     action = payload.get("action") or payload.get("value", {}).get("action")
     period, month = normalize_period(payload.get("month"), payload.get("period") or payload.get("value", {}).get("period"))
     actor = _text(payload.get("operator_name") or payload.get("operator_id") or payload.get("open_id") or payload.get("user_id"))
-    message_id = payload.get("message_id") or payload.get("card_open_message_id")
-    patch = bool(payload.get("patch_message"))
+    context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+    message_id = (
+        payload.get("message_id")
+        or payload.get("open_message_id")
+        or payload.get("card_open_message_id")
+        or context.get("open_message_id")
+        or context.get("message_id")
+        or ""
+    )
+    chat_id = payload.get("open_chat_id") or payload.get("chat_id") or context.get("open_chat_id") or context.get("chat_id") or ""
+    patch = payload.get("patch_message", True) is not False
     now_ms = int(time.time() * 1000)
     tok = await _tenant_token()
     current = await _get_status(period, tok) or {}
@@ -734,9 +833,8 @@ async def confirm_action(payload: dict[str, Any]) -> dict[str, Any]:
     action_key = f"{message_id or period}:{action}"
     if action and _text(current_fields.get("最后按钮动作Key")) == action_key:
         processed = build_processed_card(month, "已处理", actor, "重复点击已拦截，未重复执行")
-        if patch and message_id:
-            await patch_card(message_id, processed)
-        return {"status": "ok", "action": action, "period": period, "deduped": True, "processed_card": processed}
+        feedback = await patch_or_fallback(message_id, processed, chat_id) if patch else {}
+        return {"status": "ok", "action": action, "period": period, "deduped": True, "processed_card": processed, "feedback": feedback}
     if action:
         await _upsert_status(period, {"最后按钮动作Key": action_key, "最后按钮动作时间": now_ms}, tok)
 
@@ -745,13 +843,12 @@ async def confirm_action(payload: dict[str, Any]) -> dict[str, Any]:
         kind = recalc["audit"].get("next_card")
         next_card = build_card(kind, recalc["audit"])
         processed = build_processed_card(month, "已重新核算成本", actor, f"下一步卡片：{kind}")
-        if patch and message_id:
-            await patch_card(message_id, processed)
+        feedback = await patch_or_fallback(message_id, processed, chat_id) if patch else {}
         sent = await send_card(next_card, ML_GROUP_ID)
         sent_id = _message_id(sent)
         if sent_id:
             await _upsert_status(period, {"最后卡片 message_id": sent_id}, tok)
-        return {"status": "ok", "action": action, "period": period, "recalc": recalc, "processed_card": processed, "next_card": next_card, "next_kind": kind, "send_result": sent}
+        return {"status": "ok", "action": action, "period": period, "recalc": recalc, "processed_card": processed, "feedback": feedback, "next_card": next_card, "next_kind": kind, "send_result": sent}
 
     summary = await audit(period=period, commit=False, run_cost_preview=False)
 
@@ -763,33 +860,29 @@ async def confirm_action(payload: dict[str, Any]) -> dict[str, Any]:
         status = await _get_status(period, tok) or {}
         finance_card = build_card("finance_final", summary, status.get("fields") or {})
         processed = build_processed_card(month, state, actor, detail)
-        if patch and message_id:
-            await patch_card(message_id, processed)
+        feedback = await patch_or_fallback(message_id, processed, chat_id) if patch else {}
         sent = await send_card(finance_card, FINANCE_GROUP_ID)
         sent_id = _message_id(sent)
         if sent_id:
             await _upsert_status(period, {"最后卡片 message_id": sent_id}, tok)
-        return {"status": "ok", "action": action, "period": period, "state": state, "processed_card": processed, "next_card": finance_card, "next_kind": "finance_final", "send_result": sent}
+        return {"status": "ok", "action": action, "period": period, "state": state, "processed_card": processed, "feedback": feedback, "next_card": finance_card, "next_kind": "finance_final", "send_result": sent}
 
     if action == "ml_profit_ops_reject":
         await _upsert_status(period, {"状态": "退回重算", "最后错误": "运营退回重算"}, tok)
         processed = build_processed_card(month, "退回重算", actor, "运营发现问题，需补数后重新核算", ok=False)
-        if patch and message_id:
-            await patch_card(message_id, processed)
-        return {"status": "ok", "action": action, "period": period, "state": "退回重算", "processed_card": processed}
+        feedback = await patch_or_fallback(message_id, processed, chat_id) if patch else {}
+        return {"status": "ok", "action": action, "period": period, "state": "退回重算", "processed_card": processed, "feedback": feedback}
 
     if action == "ml_profit_finance_confirm":
         await _upsert_status(period, {"状态": "财务已确认终稿", "财务确认人": actor, "财务确认时间": now_ms}, tok)
         processed = build_processed_card(month, "财务已确认终稿", actor, "月结终稿完成")
-        if patch and message_id:
-            await patch_card(message_id, processed)
-        return {"status": "ok", "action": action, "period": period, "state": "财务已确认终稿", "processed_card": processed}
+        feedback = await patch_or_fallback(message_id, processed, chat_id) if patch else {}
+        return {"status": "ok", "action": action, "period": period, "state": "财务已确认终稿", "processed_card": processed, "feedback": feedback}
 
     if action == "ml_profit_finance_reject":
         await _upsert_status(period, {"状态": "退回重算", "最后错误": "财务退回运营复核"}, tok)
         processed = build_processed_card(month, "退回运营复核", actor, "财务退回，需运营复核后再确认", ok=False)
-        if patch and message_id:
-            await patch_card(message_id, processed)
-        return {"status": "ok", "action": action, "period": period, "state": "退回重算", "processed_card": processed}
+        feedback = await patch_or_fallback(message_id, processed, chat_id) if patch else {}
+        return {"status": "ok", "action": action, "period": period, "state": "退回重算", "processed_card": processed, "feedback": feedback}
 
     return {"status": "ignored", "action": action, "period": period, "msg": "unknown ml close action"}

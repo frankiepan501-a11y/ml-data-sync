@@ -95,6 +95,13 @@ CBT-FULL 仍以官方导出 3 文件为准；本土店和巴西店走 ML API/cac
 - 修复：补充本土 3 店 advertiser `2909534 / MLM / MXN`；报表同步返回 `ad_error`、`ad_items_count`、`ad_total_local`；月结审计卡片展示每个覆盖店铺的行数、订单数、营收和广告费。
 - 验证：ML Ads API 已确认 2026-06 本土 3 店和巴西店均有 cost；重新同步对应店铺后，运营确认卡应直接列出 `ML CBT-FULL`、`ML 巴西本土店 AIRSOFT COMERCIAL`、`ML 本土3店 DISTRIBUIDOR VALMIGOZ`。
 
+### 2026-07-09 运营确认与卡片反馈修复记录
+
+- 问题：运营 2026-07-08 已点击「确认运营终稿」，但 2026-07-09 定时卡又显示「待运营确认」；同时原卡没有稳定变成“已处理”结果态，运营难判断点击是否生效。
+- 根因：`audit(commit=true)` 每次无缺口重算都会写回 `状态=待运营确认`，覆盖了已确认状态；美客多 event-hub payload 只传 `message_id`，未传 `chat_id/open_chat_id` fallback 上下文，PATCH 原卡失败时没有可见回执。
+- 修复：无缺口重算遇到 `运营已确认/财务已确认终稿` 时保留终态并返回 `next_card=none`；`/report/ml-close/card?kind=none` 直接跳过发送；确认回调改为 PATCH 原卡，失败则向源群发送灰色“已处理”结果卡；运营确认卡增加“实时重算快照、较上次重算、确认后不再重复发卡”的说明。
+- 验证：`python -m py_compile app/ml_close.py` 通过；n8n event-hub `ML Profit Payload` 已补传 `open_message_id/chat_id/open_chat_id` 并保持 active。
+
 ## 部署
 
 Zeabur 项目 `frankiepan501` 下 service `ml-sync`，详见 [zeabur-deploy-workflow](../../.claude/projects/C--Users-Administrator/memory/zeabur-deploy-workflow.md)。
