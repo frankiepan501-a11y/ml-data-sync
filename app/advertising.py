@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import re
 import time
+import math
 from typing import Any
 
 import httpx
@@ -121,6 +122,52 @@ AD_CURRENCY_BY_ADVERTISER: dict[int, str] = {
 _campaign_cache: dict[tuple[int, str], dict] = {}  # (advertiser_id, month) → {results, cached_at}
 _items_cache: dict[tuple[int, str], dict] = {}     # (advertiser_id, month) → {results, cached_at}
 
+AD_METRIC_KEYS = (
+    "cost", "clicks", "prints", "direct_amount", "indirect_amount", "total_amount",
+    "direct_items_quantity", "indirect_items_quantity",
+)
+
+
+def _ad_identity(item: dict) -> tuple[Any, ...]:
+    """Logical identity for one Product Ads row.
+
+    Mercado Libre can repeat the same ad row in the response. Non-metric fields may
+    differ between copies, so whole-object equality is not sufficient.
+    """
+    return (item.get("item_id"), item.get("campaign_id"), item.get("ad_group_id"))
+
+
+def _dedupe_ad_items(items: list[dict]) -> list[dict]:
+    seen: set[tuple[Any, ...]] = set()
+    unique: list[dict] = []
+    for item in items:
+        identity = _ad_identity(item)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        unique.append(item)
+    return unique
+
+
+def _validate_metrics_summary(items: list[dict], summary: dict[str, Any], advertiser_id: int) -> None:
+    """Fail if deduplicated item metrics do not reconcile to ML's official summary."""
+    missing = [key for key in AD_METRIC_KEYS if key not in summary]
+    if missing:
+        raise RuntimeError(
+            f"ML ads metrics summary incomplete advertiser_id={advertiser_id}: "
+            + ", ".join(missing)
+        )
+    mismatches: list[str] = []
+    for key in AD_METRIC_KEYS:
+        actual = sum(float((item.get("metrics") or {}).get(key) or 0) for item in items)
+        expected = float(summary.get(key) or 0)
+        if not math.isclose(actual, expected, rel_tol=1e-6, abs_tol=0.05):
+            mismatches.append(f"{key}: items={actual:.2f}, summary={expected:.2f}")
+    if mismatches:
+        raise RuntimeError(
+            f"ML ads metrics summary mismatch advertiser_id={advertiser_id}: " + "; ".join(mismatches)
+        )
+
 
 def _month_range(month: str) -> tuple[str, str]:
     """YYYY-MM → (YYYY-MM-01, YYYY-MM-DD-last), capped at today.
@@ -199,7 +246,11 @@ async def fetch_ad_items_for_month(advertiser_id: int, month: str, token_user_id
     """
     key = (advertiser_id, month)
     cached = _items_cache.get(key)
-    if cached and cached.get("_expires_at", 0) > time.time():
+    if (
+        cached
+        and cached.get("_expires_at", 0) > time.time()
+        and (not strict or cached.get("validated") is True)
+    ):
         return cached["results"]
 
     site = AD_SITE_BY_ADVERTISER.get(advertiser_id)
@@ -231,6 +282,7 @@ async def fetch_ad_items_for_month(advertiser_id: int, month: str, token_user_id
         "offset": 0,
     }
     all_results: list[dict] = []
+    metrics_summary: dict[str, Any] | None = None
     had_error = False
     async with httpx.AsyncClient(timeout=30) as client:
         while True:
@@ -238,22 +290,42 @@ async def fetch_ad_items_for_month(advertiser_id: int, month: str, token_user_id
             if r.status_code != 200:
                 had_error = True
                 if strict:
-                    raise RuntimeError(f"ML ads API failed advertiser_id={advertiser_id} status={r.status_code}: {r.text[:300]}")
+                    request_id = r.headers.get("x-request-id") or "unknown"
+                    retry_after = r.headers.get("retry-after") or "unknown"
+                    raise RuntimeError(
+                        f"ML ads API failed advertiser_id={advertiser_id} status={r.status_code} "
+                        f"request_id={request_id} retry_after={retry_after}"
+                    )
                 break
             data = r.json()
             results = data.get("results") or []
             all_results.extend(results)
+            if metrics_summary is None and isinstance(data.get("metrics_summary"), dict):
+                metrics_summary = data["metrics_summary"]
             paging = data.get("paging") or {}
             total = int(paging.get("total") or 0)
             if params["offset"] + len(results) >= total or not results:
                 break
             params["offset"] += params["limit"]
 
-    # Only cache successful non-empty results. If ML rate-limited / 5xx,
-    # next call should retry rather than serve stale empty data.
-    if not had_error and all_results:
-        _items_cache[key] = {"results": all_results, "_expires_at": time.time() + 3600}
-    return all_results
+    if strict and any(not item.get("item_id") for item in all_results):
+        raise RuntimeError(f"ML ads item_id missing advertiser_id={advertiser_id}")
+
+    unique_results = _dedupe_ad_items(all_results)
+    if metrics_summary is None and strict:
+        raise RuntimeError(f"ML ads metrics summary missing advertiser_id={advertiser_id}")
+    if metrics_summary is not None:
+        _validate_metrics_summary(unique_results, metrics_summary, advertiser_id)
+
+    # Cache only results reconciled to ML's official summary. A non-strict caller
+    # must never seed data that lets a later strict monthly sync bypass validation.
+    if not had_error and unique_results and metrics_summary is not None:
+        _items_cache[key] = {
+            "results": unique_results,
+            "validated": True,
+            "_expires_at": time.time() + 3600,
+        }
+    return unique_results
 
 
 async def attribute_ad_metrics_by_item_id(
@@ -284,9 +356,7 @@ async def attribute_ad_metrics_by_item_id(
             fetch_token = trow["access_token"]
 
     def _add(target: dict[str, float], m: dict):
-        for k in ("cost", "clicks", "prints",
-                 "direct_amount", "indirect_amount", "total_amount",
-                 "direct_items_quantity", "indirect_items_quantity"):
+        for k in AD_METRIC_KEYS:
             target[k] = target.get(k, 0.0) + float(m.get(k) or 0)
 
     async with httpx.AsyncClient(timeout=15) as client:

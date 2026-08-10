@@ -45,7 +45,11 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {
+        "ok": True,
+        "ad_sync_fail_closed": True,
+        "ad_sync_preview": True,
+    }
 
 
 from fastapi.responses import RedirectResponse, HTMLResponse
@@ -1502,7 +1506,8 @@ async def report_sync_feishu(
 
 @app.post("/report/sync-feishu-monthly", dependencies=[Depends(require_service_token)])
 async def report_sync_feishu_monthly(seller_id: int, month: str, background_tasks: BackgroundTasks,
-                                     period_label: str = "", nowait: bool = False):
+                                     period_label: str = "", nowait: bool = False,
+                                     commit: bool = True):
     """Dispatcher. nowait=true → schedule aggregation in background, return 202 immediately
     (avoids Zeabur gateway ~150s connection reset on heavy sellers like CBT-FULL 1502236229,
     which made the monthly cron 9ZvARULB0wIp19yp false-alarm even though data lands fine).
@@ -1510,13 +1515,15 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, background_task
     if seller_id not in SHOP_LABEL:
         raise HTTPException(400, f"unknown seller_id {seller_id}; allowed: {list(SHOP_LABEL.keys())}")
     if nowait:
-        background_tasks.add_task(_sync_feishu_monthly_impl, seller_id, month, period_label)
+        background_tasks.add_task(_sync_feishu_monthly_impl, seller_id, month, period_label, commit)
         return {"status": "accepted", "mode": "background", "seller_id": seller_id, "month": month,
+                "commit": commit,
                 "note": "Aggregation runs in background; verify via Feishu 数据拉取时间 in ~3-5min."}
-    return await _sync_feishu_monthly_impl(seller_id, month, period_label)
+    return await _sync_feishu_monthly_impl(seller_id, month, period_label, commit)
 
 
-async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: str = ""):
+async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: str = "",
+                                    commit: bool = True):
     """Aggregate seller_id's `month` orders FROM SQLite CACHE + Lingxing cost/FX → Feishu.
 
     Reads ml_order_cache, enriches with Lingxing cg_price (RMB cost) and monthly FX rate
@@ -1672,6 +1679,13 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
             ad_currency = advertising.AD_CURRENCY_BY_ADVERTISER.get(ad_advertiser_id, "?")
         except Exception as e:
             ad_error = f"{type(e).__name__}: {e}"[:500]
+            raise HTTPException(
+                502,
+                detail=(
+                    f"advertising data unavailable for seller_id={seller_id}, month={month}; "
+                    "Feishu rows were not changed. " + ad_error
+                ),
+            ) from e
     ad_sku_cost: dict[str, float] = {k: v.get("cost", 0.0) for k, v in ad_sku_metrics.items()}
     ad_unallocated_cost = ad_unallocated_metrics.get("cost", 0.0)
 
@@ -1741,7 +1755,6 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
         break
     vat_rate = advertising.vat_for_site(site_id_for_vat)
 
-    feishu_token = await _feishu_tenant_token()
     import time as _t
     pulled_at_ms = int(_t.time() * 1000)
     records: list[dict] = []
@@ -1904,44 +1917,176 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
             "数据拉取时间": pulled_at_ms,
         }})
 
-    # Idempotency: delete existing rows for (店铺, 周期) before inserting new.
-    # Use Bitable search API to find current shop+period records, then batch_delete.
-    shop_label = SHOP_LABEL[seller_id]
-    async with httpx.AsyncClient(timeout=30) as client:
-        # Search existing records for this shop + period
-        existing_ids: list[str] = []
-        sr_url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{FEISHU_BASE_APP_TOKEN}/tables/{FEISHU_BASE_TABLE_ID}/records/search?page_size=500"
-        sr = await client.post(
-            sr_url,
-            headers={"Authorization": f"Bearer {feishu_token}", "Content-Type": "application/json"},
-            json={"filter": {"conjunction": "and", "conditions": [
-                {"field_name": "店铺", "operator": "is", "value": [shop_label]},
-                {"field_name": "周期", "operator": "is", "value": [period]},
-            ]}},
-        )
-        if sr.status_code == 200 and sr.json().get("code") == 0:
-            existing_ids = [it["record_id"] for it in (sr.json().get("data", {}).get("items") or [])]
-        if existing_ids:
-            dr = await client.post(
-                f"https://open.feishu.cn/open-apis/bitable/v1/apps/{FEISHU_BASE_APP_TOKEN}/tables/{FEISHU_BASE_TABLE_ID}/records/batch_delete",
-                headers={"Authorization": f"Bearer {feishu_token}", "Content-Type": "application/json"},
-                json={"records": existing_ids},
-            )
-            # Soft-fail on delete: if it errors we still insert and accept duplicate risk this run
-            _ = dr.status_code  # noqa: F841
+    ad_total_local_value = round(
+        sum(v.get("cost", 0.0) for v in ad_sku_metrics.values()) + ad_unallocated_cost,
+        2,
+    )
+    ad_total_rmb_value = round(
+        sum(float((record.get("fields") or {}).get("广告费(RMB)") or 0) for record in records),
+        2,
+    )
+    if not commit:
+        return {
+            "status": "preview",
+            "commit": False,
+            "seller_id": seller_id,
+            "shop": SHOP_LABEL[seller_id],
+            "month": month,
+            "period": period,
+            "rows_previewed": len(records),
+            "cached_orders_total": len(cached_rows),
+            "unique_skus": len(rows),
+            "advertiser_id": ad_advertiser_id,
+            "ad_currency": ad_currency,
+            "ad_items_count": ad_items_count,
+            "ad_attributed_skus": len(ad_sku_metrics),
+            "ad_total_local": ad_total_local_value,
+            "ad_total_rmb": ad_total_rmb_value,
+            "ad_unallocated_local": round(ad_unallocated_cost, 2),
+            "ad_rows": [
+                {
+                    "sku": fields.get("SKU"),
+                    "ad_local": fields.get("广告费(原币)", 0),
+                    "ad_rmb": fields.get("广告费(RMB)", 0),
+                }
+                for fields in (record.get("fields") or {} for record in records)
+                if fields.get("广告费(原币)")
+            ],
+        }
 
-        # Insert fresh rows
-        r = await client.post(
-            f"https://open.feishu.cn/open-apis/bitable/v1/apps/{FEISHU_BASE_APP_TOKEN}/tables/{FEISHU_BASE_TABLE_ID}/records/batch_create",
-            headers={"Authorization": f"Bearer {feishu_token}", "Content-Type": "application/json"},
+    # Safe replace: create the fresh seller/month set first, then delete the old set.
+    # If old-row deletion fails, remove the newly created rows to preserve the old snapshot.
+    shop_label = SHOP_LABEL[seller_id]
+    feishu_token = await _feishu_tenant_token()
+    async with httpx.AsyncClient(timeout=30) as client:
+        sr_url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{FEISHU_BASE_APP_TOKEN}/tables/{FEISHU_BASE_TABLE_ID}/records/search"
+        create_url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{FEISHU_BASE_APP_TOKEN}/tables/{FEISHU_BASE_TABLE_ID}/records/batch_create"
+        delete_url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{FEISHU_BASE_APP_TOKEN}/tables/{FEISHU_BASE_TABLE_ID}/records/batch_delete"
+        fs_headers = {
+            "Authorization": f"Bearer {feishu_token}",
+            "Content-Type": "application/json",
+        }
+        sr_body = {"filter": {"conjunction": "and", "conditions": [
+            {"field_name": "店铺", "operator": "is", "value": [shop_label]},
+            {"field_name": "周期", "operator": "is", "value": [period]},
+        ]}}
+
+        async def _search_scope(phase: str) -> list[dict]:
+            items: list[dict] = []
+            page_token: str | None = None
+            while True:
+                sr_params = {"page_size": 500}
+                if page_token:
+                    sr_params["page_token"] = page_token
+                sr = await client.post(
+                    sr_url,
+                    params=sr_params,
+                    headers=fs_headers,
+                    json=sr_body,
+                )
+                sr_payload = sr.json()
+                if sr.status_code != 200 or sr_payload.get("code") != 0:
+                    raise HTTPException(
+                        502,
+                        f"feishu {phase} lookup failed: status={sr.status_code} code={sr_payload.get('code')}",
+                    )
+                sr_data = sr_payload.get("data", {})
+                items.extend(sr_data.get("items") or [])
+                if not sr_data.get("has_more"):
+                    return items
+                page_token = sr_data.get("page_token")
+                if not page_token:
+                    raise HTTPException(502, f"feishu {phase} lookup failed: pagination token missing")
+
+        existing_items = await _search_scope("pre-write")
+        existing_ids = [it["record_id"] for it in existing_items if it.get("record_id")]
+        if len(existing_ids) > 500 or len(records) > 500:
+            raise HTTPException(502, "feishu safe replace limit exceeded; no rows were changed")
+
+        cr = await client.post(
+            create_url,
+            headers=fs_headers,
             json={"records": records},
         )
-    if r.status_code != 200 or r.json().get("code") != 0:
-        raise HTTPException(502, f"feishu write failed: {r.status_code} {r.text[:500]}")
+        cr_payload = cr.json()
+        if cr.status_code != 200 or cr_payload.get("code") != 0:
+            raise HTTPException(
+                502,
+                f"feishu create failed; old rows preserved: status={cr.status_code} code={cr_payload.get('code')}",
+            )
+        created_ids = [
+            it["record_id"]
+            for it in (cr_payload.get("data", {}).get("records") or [])
+            if it.get("record_id")
+        ]
+        if len(created_ids) != len(records):
+            rollback_ok = False
+            if created_ids:
+                rb = await client.post(delete_url, headers=fs_headers, json={"records": created_ids})
+                rb_payload = rb.json()
+                rollback_ok = rb.status_code == 200 and rb_payload.get("code") == 0
+            raise HTTPException(
+                502,
+                "feishu create response incomplete; "
+                f"known-new-row rollback={'ok' if rollback_ok else 'failed'}",
+            )
+
+        def _verify_scope(items: list[dict], phase: str) -> None:
+            if len(items) != len(records):
+                raise HTTPException(
+                    502,
+                    f"feishu {phase} mismatch: expected_rows={len(records)} actual_rows={len(items)}",
+                )
+            for metric_key, expected in (
+                ("广告费(原币)", ad_total_local_value),
+                ("广告费(RMB)", ad_total_rmb_value),
+            ):
+                actual = round(
+                    sum(float((it.get("fields") or {}).get(metric_key) or 0) for it in items),
+                    2,
+                )
+                if abs(actual - expected) > 0.05:
+                    raise HTTPException(
+                        502,
+                        f"feishu {phase} mismatch: field={metric_key} expected={expected} actual={actual}",
+                    )
+
+        # Verify the fresh set while the old rows still exist. Any failure here can
+        # safely roll back only the new rows and leave the old seller/month snapshot intact.
+        try:
+            after_create_items = await _search_scope("pre-delete")
+            created_id_set = set(created_ids)
+            created_items = [it for it in after_create_items if it.get("record_id") in created_id_set]
+            _verify_scope(created_items, "pre-delete")
+        except HTTPException as verify_error:
+            rb = await client.post(delete_url, headers=fs_headers, json={"records": created_ids})
+            rb_payload = rb.json()
+            rollback_ok = rb.status_code == 200 and rb_payload.get("code") == 0
+            raise HTTPException(
+                502,
+                f"{verify_error.detail}; new-row rollback={'ok' if rollback_ok else 'failed'}",
+            ) from verify_error
+
+        if existing_ids:
+            dr = await client.post(delete_url, headers=fs_headers, json={"records": existing_ids})
+            dr_payload = dr.json()
+            if dr.status_code != 200 or dr_payload.get("code") != 0:
+                rb = await client.post(delete_url, headers=fs_headers, json={"records": created_ids})
+                rb_payload = rb.json()
+                rollback_ok = rb.status_code == 200 and rb_payload.get("code") == 0
+                raise HTTPException(
+                    502,
+                    f"feishu replace delete failed: status={dr.status_code} code={dr_payload.get('code')}; "
+                    f"new-row rollback={'ok' if rollback_ok else 'failed'}",
+                )
+
+        verified_items = await _search_scope("read-back")
+        _verify_scope(verified_items, "read-back")
 
     return {"status": "synced", "seller_id": seller_id, "shop": SHOP_LABEL[seller_id],
             "month": month, "period": period, "rows_written": len(records),
             "rows_replaced": len(existing_ids),
+            "rows_verified": len(verified_items),
             "cached_orders_total": len(cached_rows), "unique_skus": len(rows),
             "lingxing_products_loaded": len(products),
             "lingxing_error": lingxing_error,
@@ -1951,7 +2096,8 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
             "ad_error": ad_error,
             "ad_items_count": ad_items_count,
             "ad_attributed_skus": len(ad_sku_metrics),
-            "ad_total_local": round(sum(v.get("cost", 0.0) for v in ad_sku_metrics.values()) + ad_unallocated_cost, 2),
+            "ad_total_local": ad_total_local_value,
+            "ad_total_rmb": ad_total_rmb_value,
             "ad_unallocated_local": round(ad_unallocated_cost, 2),
             "vat_rate": vat_rate,
             "site_id_inferred": site_id_for_vat,

@@ -102,6 +102,16 @@ CBT-FULL 仍以官方导出 3 文件为准；本土店和巴西店走 ML API/cac
 - 修复：无缺口重算遇到 `运营已确认/财务已确认终稿` 时保留终态并返回 `next_card=none`；`/report/ml-close/card?kind=none` 直接跳过发送；确认回调改为 PATCH 原卡，失败则向源群发送灰色“已处理”结果卡；运营确认卡增加“实时重算快照、较上次重算、确认后不再重复发卡”的说明。
 - 验证：`python -m py_compile app/ml_close.py` 通过；n8n event-hub `ML Profit Payload` 已补传 `open_message_id/chat_id/open_chat_id` 并保持 active。
 
+### 2026-08-10 本土3店广告费漏抓与重复行修复
+
+- 问题：2026-07 本土3店有官方广告花费，但月度飞书报表写成 0，导致整月毛利被高估。
+- 根因一：广告 API 异常虽然写入 `ad_error`，调用方仍继续替换飞书记录，把未知值降级成 0。
+- 根因二：Product Ads 搜索接口会重复返回相同逻辑广告行；直接逐行相加会高于官方 `metrics_summary`。
+- 修复：广告失败立即以 502 阻止飞书写入；按 `item_id + campaign_id + ad_group_id` 去重；去重后逐指标对齐官方汇总；未经汇总校验的缓存不能被严格月度同步复用；新增 `commit=false` 只读预览。
+- 飞书安全替换：先创建新行，再删除旧行；删除失败会删除本次新行并保留旧快照；成功后自动回读本店本月的行数和广告费合计。
+- 回归测试：`python -m unittest discover -s tests -v` 共 12 个场景，覆盖重复行、汇总不一致、缺字段、空明细异常、未校验缓存、广告接口失败、只读预览，以及飞书查询/创建/删除失败、回滚和完整翻页。
+- 生产补数边界：先对单个 `seller_id + month` 预览并保存旧行快照，再提交替换、回读飞书金额，最后重跑月结审计；不做跨店或跨月批量覆盖。
+
 ## 部署
 
 Zeabur 项目 `frankiepan501` 下 service `ml-sync`，详见 [zeabur-deploy-workflow](../../.claude/projects/C--Users-Administrator/memory/zeabur-deploy-workflow.md)。
