@@ -7,17 +7,19 @@ handle button actions from Feishu event-hub.
 """
 from __future__ import annotations
 
+import asyncio
 import datetime as _dt
 import json
 import os
 import time
+import weakref
 from collections import defaultdict
 from typing import Any
 
 import anyio
 import httpx
 
-from app import meitong_cost
+from app import db, meitong_cost
 
 FEISHU = "https://open.feishu.cn/open-apis"
 APP_TOKEN = os.getenv("FEISHU_BASE_APP_TOKEN", "WM3LbBr76aRqMys2of8c1dGInEb")
@@ -30,6 +32,11 @@ ML_GROUP_ID = os.getenv("ML_CLOSE_GROUP_ID", "oc_cd007a8f1dbb4a78943625e5432a4cd
 FINANCE_GROUP_ID = os.getenv("ML_CLOSE_FINANCE_GROUP_ID", "oc_6b2da626d80eb6284bbe9dcf895030b9")
 CARD_APP_ID = os.getenv("FEISHU_CARD_APP_ID", "cli_a9457898bd78dccc")
 CARD_APP_SECRET = os.getenv("FEISHU_CARD_APP_SECRET", "")
+
+_STATUS_LOCKS_BY_LOOP: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[str, asyncio.Lock]
+] = weakref.WeakKeyDictionary()
+_EMERGENCY_AD_FAILURES: dict[str, dict[str, int]] = {}
 
 STATUSES = [
     "待数据同步",
@@ -177,6 +184,60 @@ def _last_result(fields: dict[str, Any]) -> dict[str, Any]:
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+def _failed_ad_shops(fields: dict[str, Any]) -> list[str]:
+    result = _last_result(fields)
+    shops = result.get("failed_ad_shops") or []
+    if not isinstance(shops, list):
+        return []
+    return sorted({_text(shop).strip() for shop in shops if _text(shop).strip()})
+
+
+def _ad_failure_message(shops: list[str]) -> str:
+    names = "、".join(shops) if shops else "未识别店铺"
+    return f"广告费抓取失败：{names}。本次月结已拦截，禁止把抓取失败自动记为 0。"
+
+
+def _status_mutation_lock(period: str) -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    locks = _STATUS_LOCKS_BY_LOOP.setdefault(loop, {})
+    return locks.setdefault(period, asyncio.Lock())
+
+
+def _with_ad_failure(base_error: str, failed_shops: list[str]) -> str:
+    if not failed_shops:
+        return base_error
+    ad_failure = _ad_failure_message(failed_shops)
+    return f"{ad_failure}；{base_error}" if base_error else ad_failure
+
+
+def _close_state(
+    has_rows: bool,
+    has_cost_gaps: bool,
+    prior_state: str,
+    last_error: str,
+) -> tuple[str, str]:
+    if last_error:
+        return "异常", "error"
+    if not has_rows:
+        return "待数据同步", "instruction"
+    if has_cost_gaps:
+        return "成本缺失待补", "cost_gap"
+    if prior_state in ("运营已确认", "财务已确认终稿"):
+        return prior_state, "none"
+    return "待运营确认", "ops_final"
+
+
+async def _open_ad_failures(period: str, status_fields: dict[str, Any] | None = None) -> list[str]:
+    shops = set(_failed_ad_shops(status_fields or {}))
+    shops.update(_EMERGENCY_AD_FAILURES.get(period, {}))
+    for loader in (db.list_ad_sync_failures, db.list_ad_sync_failure_fallbacks):
+        for row in await loader(period):
+            shop = _text(row.get("shop")).strip()
+            if shop:
+                shops.add(shop)
+    return sorted(shops)
 
 
 def _store_details_section(summary: dict[str, Any]) -> dict[str, Any] | None:
@@ -347,10 +408,16 @@ async def audit(
 ) -> dict[str, Any]:
     period, month = normalize_period(month, period)
     tok = await _tenant_token()
-    prior = await _get_status(period, tok) if commit else None
+    prior = await _get_status(period, tok)
     prior_fields = prior.get("fields", {}) if prior else {}
     prior_state = _text(prior_fields.get("状态"))
     prior_result = _last_result(prior_fields)
+    marker_error = ""
+    try:
+        prior_failed_ad_shops = await _open_ad_failures(period, prior_fields)
+    except Exception as e:
+        prior_failed_ad_shops = _failed_ad_shops(prior_fields)
+        marker_error = f"广告失败状态读取失败：{type(e).__name__}"
     records = await _list_records(tok, REPORT_TABLE_ID)
     rows = [r for r in records if _text(r.get("fields", {}).get("周期")) == period]
 
@@ -412,26 +479,12 @@ async def audit(
     cbt_rows = [r for r in rows if "CBT" in _text(r.get("fields", {}).get("店铺"))]
     cbt_state = "已解析" if cbt_rows else "未发现CBT行"
 
-    last_error = cost_error
+    base_error = marker_error or cost_error
     if cost_summary and cost_summary.get("status") == "error":
-        last_error = _text(cost_summary.get("msg")) or json.dumps(cost_summary, ensure_ascii=False)[:500]
-
-    confirmed_state = prior_state in ("运营已确认", "财务已确认终稿")
-    if last_error:
-        state = "异常"
-        next_card = "error"
-    elif not rows:
-        state = "待数据同步"
-        next_card = "instruction"
-    elif purchase_gaps or freight_gaps:
-        state = "成本缺失待补"
-        next_card = "cost_gap"
-    elif confirmed_state:
-        state = prior_state
-        next_card = "none"
-    else:
-        state = "待运营确认"
-        next_card = "ops_final"
+        cost_failure = _text(cost_summary.get("msg")) or json.dumps(cost_summary, ensure_ascii=False)[:500]
+        base_error = f"{base_error}；{cost_failure}" if base_error else cost_failure
+    last_error = _with_ad_failure(base_error, prior_failed_ad_shops)
+    state, next_card = _close_state(bool(rows), bool(purchase_gaps or freight_gaps), prior_state, last_error)
 
     result = {
         "status": "ok" if not last_error else "error",
@@ -470,33 +523,86 @@ async def audit(
         "gap_rows": gap_rows,
         "cost_summary": cost_summary or {},
         "last_error": last_error,
+        "failed_ad_shops": prior_failed_ad_shops,
     }
 
     if commit:
-        previous_gross = round(float(_num(prior_result.get("gross_profit_rmb"))), 2)
-        gross_delta = round(float(profit) - previous_gross, 2) if previous_gross else 0.0
-        fields = {
-            "月份": month,
-            "状态": state,
-            "报表行数": len(rows),
-            "店铺覆盖数": len(stores),
-            "CBT解析状态": cbt_state,
-            "成本缺口数": len(gap_rows),
-            "采购缺口数": len(purchase_gaps),
-            "头程/海外仓缺口数": len(freight_gaps),
-            "最近重算时间": int(time.time() * 1000),
-            "报表链接": _report_url(),
-            "缺口视图链接": _report_url(),
-            "上次全额毛利": previous_gross,
-            "全额毛利差异": gross_delta,
-            "最后错误": last_error[:1800],
-            "最后结果JSON": json.dumps({k: v for k, v in result.items() if k != "gap_rows"}, ensure_ascii=False)[:1800],
-        }
-        if prior:
-            fields["重算次数"] = int(_num(prior["fields"].get("重算次数"))) + 1
-        else:
-            fields["重算次数"] = 1
-        result["status_record"] = await _upsert_status(period, fields, tok)
+        async with _status_mutation_lock(period):
+            latest = await _get_status(period, tok)
+            latest_fields = latest.get("fields", {}) if latest else {}
+            latest_state = _text(latest_fields.get("状态"))
+            latest_result = _last_result(latest_fields)
+            latest_marker_error = ""
+            try:
+                latest_failed_ad_shops = await _open_ad_failures(period, latest_fields)
+            except Exception as e:
+                latest_failed_ad_shops = _failed_ad_shops(latest_fields)
+                latest_marker_error = f"广告失败状态读取失败：{type(e).__name__}"
+            latest_base_error = (
+                f"{base_error}；{latest_marker_error}"
+                if base_error and latest_marker_error
+                else (base_error or latest_marker_error)
+            )
+            last_error = _with_ad_failure(latest_base_error, latest_failed_ad_shops)
+            state, next_card = _close_state(
+                bool(rows),
+                bool(purchase_gaps or freight_gaps),
+                latest_state,
+                last_error,
+            )
+            result.update(
+                {
+                    "status": "ok" if not last_error else "error",
+                    "state": state,
+                    "next_card": next_card,
+                    "last_error": last_error,
+                    "failed_ad_shops": latest_failed_ad_shops,
+                }
+            )
+            previous_gross = round(float(_num(latest_result.get("gross_profit_rmb"))), 2)
+            gross_delta = round(float(profit) - previous_gross, 2) if previous_gross else 0.0
+            status_result = {
+                "failure_type": "advertising_fetch" if latest_failed_ad_shops else "",
+                "failed_ad_shops": latest_failed_ad_shops,
+                "status": result["status"],
+                "period": period,
+                "month": month,
+                "state": state,
+                "next_card": next_card,
+                "report_rows": len(rows),
+                "store_count": len(stores),
+                "order_count": order_count,
+                "unit_count": unit_count,
+                "revenue_rmb": result["revenue_rmb"],
+                "gross_profit_rmb": result["gross_profit_rmb"],
+                "ad_total_rmb": result["ad_total_rmb"],
+                "purchase_gap_count": len(purchase_gaps),
+                "freight_gap_count": len(freight_gaps),
+                "gap_row_count": len(gap_rows),
+                "head_total_rmb": result["head_total_rmb"],
+                "ovs_total_rmb": result["ovs_total_rmb"],
+                "cbt_state": cbt_state,
+                "last_error": last_error[:500],
+            }
+            fields = {
+                "月份": month,
+                "状态": state,
+                "报表行数": len(rows),
+                "店铺覆盖数": len(stores),
+                "CBT解析状态": cbt_state,
+                "成本缺口数": len(gap_rows),
+                "采购缺口数": len(purchase_gaps),
+                "头程/海外仓缺口数": len(freight_gaps),
+                "最近重算时间": int(time.time() * 1000),
+                "报表链接": _report_url(),
+                "缺口视图链接": _report_url(),
+                "上次全额毛利": previous_gross,
+                "全额毛利差异": gross_delta,
+                "最后错误": last_error[:1800],
+                "最后结果JSON": json.dumps(status_result, ensure_ascii=False),
+                "重算次数": int(_num(latest_fields.get("重算次数"))) + 1,
+            }
+            result["status_record"] = await _upsert_status(period, fields, tok)
     return result
 
 
@@ -705,6 +811,205 @@ async def send_card(card: dict[str, Any], receive_id: str, receive_id_type: str 
     )
 
 
+async def record_advertising_failure(
+    period: str,
+    shop: str,
+    message: str,
+    send: bool = True,
+) -> dict[str, Any]:
+    """Publish a visible fail-closed result without touching report rows."""
+    period, month = normalize_period(period=period)
+    failure_version = time.time_ns()
+    sqlite_marker_error = ""
+    fallback_marker_error = ""
+    tok: str | None = None
+    failed_shops_list = [shop]
+    display_message = _ad_failure_message(failed_shops_list)
+    status_fields: dict[str, Any] = {}
+    status_record: dict[str, Any] | None = None
+    status_write_error = ""
+    async with _status_mutation_lock(period):
+        _EMERGENCY_AD_FAILURES.setdefault(period, {})[shop] = failure_version
+        try:
+            await db.set_ad_sync_failure(period, shop, message, failed_at=failure_version)
+        except Exception as e:
+            sqlite_marker_error = f"{type(e).__name__}: {e}"[:500]
+        try:
+            await db.set_ad_sync_failure_fallback(period, shop, message, failure_version)
+        except Exception as e:
+            fallback_marker_error = f"{type(e).__name__}: {e}"[:500]
+        try:
+            tok = await _tenant_token()
+            prior = await _get_status(period, tok)
+            failed_shops = set(_failed_ad_shops((prior or {}).get("fields", {})))
+            failed_shops.update(_EMERGENCY_AD_FAILURES.get(period, {}))
+            failed_shops.add(shop)
+            failed_shops_list = sorted(failed_shops)
+            display_message = _ad_failure_message(failed_shops_list)
+            now_ms = int(time.time() * 1000)
+            status_fields = {
+                "状态": "异常",
+                "最近重算时间": now_ms,
+                "最后错误": display_message[:1800],
+                "最后结果JSON": json.dumps(
+                    {
+                        "status": "error",
+                        "period": period,
+                        "month": month,
+                        "failure_type": "advertising_fetch",
+                        "failed_ad_shops": failed_shops_list,
+                        "latest_failed_shop": shop,
+                        "advertising": "抓取失败",
+                        "report_rows_changed": False,
+                        "detail": message[:500],
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+            status_record = await _upsert_status(period, status_fields, tok)
+        except Exception as e:
+            status_write_error = f"{type(e).__name__}: {e}"[:500]
+        summary = {
+            "status": "error",
+            "period": period,
+            "month": month,
+            "last_error": display_message,
+            "report_url": _report_url(),
+        }
+        card = build_card("error", summary, status_fields)
+        result: dict[str, Any] = {
+            "status": "error_recorded",
+            "period": period,
+            "shop": shop,
+            "message": display_message,
+            "card": card,
+            "visible_channels": [],
+            "gate_channels": ["emergency_memory"],
+        }
+        if not sqlite_marker_error:
+            result["gate_channels"].append("sqlite")
+        else:
+            result["sqlite_marker_error"] = sqlite_marker_error
+        if not fallback_marker_error:
+            result["gate_channels"].append("persistent_fallback")
+        else:
+            result["fallback_marker_error"] = fallback_marker_error
+        if status_record:
+            result["status_record"] = status_record
+            result["visible_channels"].append("status_ledger")
+            result["gate_channels"].append("status_ledger")
+        if status_write_error:
+            result["status_write_error"] = status_write_error
+
+        card_send_error = ""
+        if send:
+            try:
+                sent = await send_card(card, ML_GROUP_ID)
+                result["send_result"] = sent
+                result["visible_channels"].append("error_card")
+                msg_id = _message_id(sent)
+                if msg_id:
+                    result["message_id"] = msg_id
+                    if tok:
+                        try:
+                            await _upsert_status(period, {"最后卡片 message_id": msg_id}, tok)
+                        except Exception as e:
+                            result["message_id_write_error"] = f"{type(e).__name__}: {e}"[:500]
+            except Exception as e:
+                card_send_error = f"{type(e).__name__}: {e}"[:500]
+                result["card_send_error"] = card_send_error
+
+        if not result["visible_channels"]:
+            raise RuntimeError(
+                "advertising failure could not be published: "
+                f"status={status_write_error or 'not requested'} card={card_send_error or 'not requested'}"
+            )
+        persistent_gates = {"sqlite", "persistent_fallback", "status_ledger"}
+        if not persistent_gates.intersection(result["gate_channels"]):
+            raise RuntimeError("advertising failure has no persistent confirmation gate")
+        return result
+
+
+async def clear_advertising_failure(
+    period: str,
+    shop: str,
+    success_started_at: int | None = None,
+) -> dict[str, Any]:
+    """Resolve one shop's failure only after its report rows were verified."""
+    period, month = normalize_period(period=period)
+    tok = await _tenant_token()
+    async with _status_mutation_lock(period):
+        marker_versions: dict[str, int] = {}
+        for row in (
+            await db.list_ad_sync_failures(period)
+            + await db.list_ad_sync_failure_fallbacks(period)
+        ):
+            marker_shop = _text(row.get("shop")).strip()
+            if marker_shop:
+                marker_versions[marker_shop] = max(
+                    marker_versions.get(marker_shop, 0),
+                    int(row.get("failed_at") or 0),
+                )
+        for marker_shop, failed_at in _EMERGENCY_AD_FAILURES.get(period, {}).items():
+            marker_versions[marker_shop] = max(marker_versions.get(marker_shop, 0), failed_at)
+
+        prior = await _get_status(period, tok)
+        failed_shops = set(_failed_ad_shops((prior or {}).get("fields", {})))
+        failed_shops.update(marker_versions)
+        latest_failure = marker_versions.get(shop, 0)
+        if success_started_at is not None and latest_failure > success_started_at:
+            return {
+                "status": "superseded_by_newer_failure",
+                "period": period,
+                "shop": shop,
+                "failed_ad_shops": sorted(failed_shops),
+            }
+        if shop not in failed_shops:
+            return {"status": "unchanged", "period": period, "shop": shop, "failed_ad_shops": sorted(failed_shops)}
+
+        failed_shops.remove(shop)
+        remaining = sorted(failed_shops)
+        state = "异常" if remaining else "退回重算"
+        last_error = _ad_failure_message(remaining) if remaining else ""
+        fields = {
+            "状态": state,
+            "最后错误": last_error,
+            "最后结果JSON": json.dumps(
+                {
+                    "status": "resolved" if not remaining else "error",
+                    "period": period,
+                    "month": month,
+                    "failure_type": "advertising_fetch" if remaining else "",
+                    "failed_ad_shops": remaining,
+                    "latest_resolved_shop": shop,
+                },
+                ensure_ascii=False,
+            ),
+        }
+        status_record = await _upsert_status(period, fields, tok)
+
+        if success_started_at is None:
+            await db.clear_ad_sync_failure_fallback(period, shop)
+            await db.clear_ad_sync_failure(period, shop)
+        else:
+            await db.clear_ad_sync_failure_fallback(period, shop, not_after=success_started_at)
+            await db.clear_ad_sync_failure(period, shop, not_after=success_started_at)
+        emergency_version = _EMERGENCY_AD_FAILURES.get(period, {}).get(shop)
+        if emergency_version is not None and (
+            success_started_at is None or emergency_version <= success_started_at
+        ):
+            _EMERGENCY_AD_FAILURES.get(period, {}).pop(shop, None)
+            if not _EMERGENCY_AD_FAILURES.get(period):
+                _EMERGENCY_AD_FAILURES.pop(period, None)
+    return {
+        "status": "cleared" if not remaining else "partially_cleared",
+        "period": period,
+        "shop": shop,
+        "failed_ad_shops": remaining,
+        "status_record": status_record,
+    }
+
+
 def _message_id(resp: dict[str, Any]) -> str:
     return (
         resp.get("data", {}).get("message_id")
@@ -750,42 +1055,86 @@ async def card_endpoint(
     receive_id: str | None = None,
     receive_id_type: str = "chat_id",
 ) -> dict[str, Any]:
-    if kind in ("none", "skip"):
-        p, _ = normalize_period(month, period)
-        return {"status": "skipped", "reason": "no_next_card", "kind": kind, "period": p}
-    p, _ = normalize_period(month, period)
-    early_status = await _get_status(p)
-    early_fields = early_status.get("fields", {}) if early_status else {}
-    early_state = _text(early_fields.get("状态")) if early_fields else ""
-    if kind is None and early_state in ("运营已确认", "财务已确认终稿"):
-        return {"status": "skipped", "reason": "already_confirmed", "state": early_state, "period": p}
-    summary = await audit(month=month, period=period, commit=False, run_cost_preview=(kind != "instruction"))
+    p, normalized_month = normalize_period(month, period)
+    summary: dict[str, Any] | None = None
+    async with _status_mutation_lock(p):
+        early_status = await _get_status(p)
+        early_fields = early_status.get("fields", {}) if early_status else {}
+        early_state = _text(early_fields.get("状态")) if early_fields else ""
+        initial_marker_error = ""
+        try:
+            initial_failed_shops = await _open_ad_failures(p, early_fields)
+        except Exception as e:
+            initial_failed_shops = _failed_ad_shops(early_fields)
+            initial_marker_error = f"广告失败状态读取失败：{type(e).__name__}"
+
+        if initial_failed_shops or initial_marker_error:
+            initial_reason = _with_ad_failure(initial_marker_error, initial_failed_shops)
+            summary = {
+                "status": "error",
+                "period": p,
+                "month": normalized_month,
+                "state": "异常",
+                "next_card": "error",
+                "last_error": initial_reason,
+                "failed_ad_shops": initial_failed_shops,
+                "report_url": _report_url(),
+            }
+        elif kind in ("none", "skip"):
+            return {"status": "skipped", "reason": "no_next_card", "kind": kind, "period": p}
+        elif kind is None and early_state in ("运营已确认", "财务已确认终稿"):
+            return {"status": "skipped", "reason": "already_confirmed", "state": early_state, "period": p}
+
+    if summary is None:
+        summary = await audit(month=month, period=period, commit=False, run_cost_preview=(kind != "instruction"))
+
     requested_kind = kind
-    kind = kind or summary.get("next_card") or "instruction"
-    status = await _get_status(summary["period"]) or {}
-    status_fields = status.get("fields") if status else {}
-    current_state = _text(status_fields.get("状态")) if status_fields else ""
-    if requested_kind is None and current_state in ("运营已确认", "财务已确认终稿"):
-        return {
-            "status": "skipped",
-            "reason": "already_confirmed",
-            "state": current_state,
-            "period": summary["period"],
-            "summary": summary,
-        }
-    card = build_card(kind, summary, status_fields)
-    out = {"status": "ok", "kind": kind, "period": summary["period"], "summary": summary, "card": card}
-    if send:
-        target = receive_id or (FINANCE_GROUP_ID if kind == "finance_final" else ML_GROUP_ID)
-        sent = await send_card(card, target, receive_id_type)
-        msg_id = (
-            sent.get("data", {}).get("message_id")
-            or sent.get("data", {}).get("message", {}).get("message_id")
-        )
-        out["send_result"] = sent
-        if msg_id:
-            tok = await _tenant_token()
-            await _upsert_status(summary["period"], {"最后卡片 message_id": msg_id}, tok)
+    kind = "error" if summary.get("next_card") == "error" else (kind or summary.get("next_card") or "instruction")
+    async with _status_mutation_lock(summary["period"]):
+        status = await _get_status(summary["period"]) or {}
+        status_fields = status.get("fields") if status else {}
+        final_marker_error = ""
+        try:
+            final_failed_shops = await _open_ad_failures(summary["period"], status_fields)
+        except Exception as e:
+            final_failed_shops = _failed_ad_shops(status_fields)
+            final_marker_error = f"广告失败状态读取失败：{type(e).__name__}"
+        if final_failed_shops or final_marker_error:
+            final_reason = _with_ad_failure(final_marker_error, final_failed_shops)
+            summary.update({
+                "status": "error",
+                "state": "异常",
+                "next_card": "error",
+                "last_error": final_reason,
+                "failed_ad_shops": final_failed_shops,
+            })
+            kind = "error"
+        current_state = _text(status_fields.get("状态")) if status_fields else ""
+        if (
+            requested_kind is None
+            and summary.get("next_card") != "error"
+            and current_state in ("运营已确认", "财务已确认终稿")
+        ):
+            return {
+                "status": "skipped",
+                "reason": "already_confirmed",
+                "state": current_state,
+                "period": summary["period"],
+                "summary": summary,
+            }
+        card = build_card(kind, summary, status_fields)
+        out = {"status": "ok", "kind": kind, "period": summary["period"], "summary": summary, "card": card}
+        if send:
+            target = receive_id or (FINANCE_GROUP_ID if kind == "finance_final" else ML_GROUP_ID)
+            sent = await send_card(card, target, receive_id_type)
+            msg_id = (
+                sent.get("data", {}).get("message_id")
+                or sent.get("data", {}).get("message", {}).get("message_id")
+            )
+            out["send_result"] = sent
+            if msg_id:
+                tok = await _tenant_token()
+                await _upsert_status(summary["period"], {"最后卡片 message_id": msg_id}, tok)
     return out
 
 
@@ -793,13 +1142,21 @@ async def status_endpoint(month: str | None = None, period: str | None = None) -
     period, month = normalize_period(month, period)
     status = await _get_status(period)
     fields = status.get("fields", {}) if status else {}
-    state = _text(fields.get("状态")) if fields else "待数据同步"
+    marker_error = ""
+    try:
+        failed_ad_shops = await _open_ad_failures(period, fields)
+    except Exception as e:
+        failed_ad_shops = _failed_ad_shops(fields)
+        marker_error = f"广告失败状态读取失败：{type(e).__name__}"
+    state = "异常" if failed_ad_shops or marker_error else (_text(fields.get("状态")) if fields else "待数据同步")
     return {
         "status": "ok",
         "period": period,
         "month": month,
         "state": state,
         "ready_for_finance": state in ("运营已确认", "财务已确认终稿"),
+        "failed_ad_shops": failed_ad_shops,
+        "marker_error": marker_error,
         "record": status,
     }
 
@@ -827,16 +1184,51 @@ async def confirm_action(payload: dict[str, Any]) -> dict[str, Any]:
     chat_id = payload.get("open_chat_id") or payload.get("chat_id") or context.get("open_chat_id") or context.get("chat_id") or ""
     patch = payload.get("patch_message", True) is not False
     now_ms = int(time.time() * 1000)
+
+    async def _blocked_confirmation(reason: str) -> dict[str, Any]:
+        processed = build_processed_card(month, "确认已拦截", actor, reason, ok=False)
+        feedback = await patch_or_fallback(message_id, processed, chat_id) if patch else {}
+        return {
+            "status": "blocked",
+            "action": action,
+            "period": period,
+            "state": "异常",
+            "reason": reason,
+            "processed_card": processed,
+            "feedback": feedback,
+        }
+
+    confirmation_actions = {
+        "ml_profit_ops_confirm",
+        "ml_profit_ops_waive_gap",
+        "ml_profit_finance_confirm",
+    }
     tok = await _tenant_token()
-    current = await _get_status(period, tok) or {}
-    current_fields = current.get("fields") or {}
     action_key = f"{message_id or period}:{action}"
-    if action and _text(current_fields.get("最后按钮动作Key")) == action_key:
+    block_reason = ""
+    deduped = False
+    async with _status_mutation_lock(period):
+        current = await _get_status(period, tok) or {}
+        current_fields = current.get("fields") or {}
+        if action in confirmation_actions:
+            try:
+                current_failed = await _open_ad_failures(period, current_fields)
+            except Exception as e:
+                current_failed = []
+                block_reason = f"广告失败状态读取失败：{type(e).__name__}"
+            if current_failed:
+                block_reason = _ad_failure_message(current_failed)
+        if not block_reason and action and _text(current_fields.get("最后按钮动作Key")) == action_key:
+            deduped = True
+        elif not block_reason and action:
+            await _upsert_status(period, {"最后按钮动作Key": action_key, "最后按钮动作时间": now_ms}, tok)
+
+    if block_reason:
+        return await _blocked_confirmation(block_reason)
+    if deduped:
         processed = build_processed_card(month, "已处理", actor, "重复点击已拦截，未重复执行")
         feedback = await patch_or_fallback(message_id, processed, chat_id) if patch else {}
         return {"status": "ok", "action": action, "period": period, "deduped": True, "processed_card": processed, "feedback": feedback}
-    if action:
-        await _upsert_status(period, {"最后按钮动作Key": action_key, "最后按钮动作时间": now_ms}, tok)
 
     if action == "ml_profit_recalc_cost":
         recalc = await recalc_cost(period=period, commit=True)
@@ -852,19 +1244,39 @@ async def confirm_action(payload: dict[str, Any]) -> dict[str, Any]:
 
     summary = await audit(period=period, commit=False, run_cost_preview=False)
 
+    if action in confirmation_actions and summary.get("next_card") == "error":
+        reason = _text(summary.get("last_error")) or "月结存在未解决异常，确认已拦截。"
+        return await _blocked_confirmation(reason)
+
     if action in ("ml_profit_ops_confirm", "ml_profit_ops_waive_gap"):
         state = "运营已确认"
         detail = "运营确认终稿" if action == "ml_profit_ops_confirm" else "运营确认本月缺口不影响终稿"
         status_update = {"状态": state, "运营确认人": actor, "运营确认时间": now_ms}
-        await _upsert_status(period, status_update, tok)
-        status = await _get_status(period, tok) or {}
-        finance_card = build_card("finance_final", summary, status.get("fields") or {})
+        block_reason = ""
+        finance_card: dict[str, Any] = {}
+        sent: dict[str, Any] = {}
+        async with _status_mutation_lock(period):
+            latest = await _get_status(period, tok) or {}
+            latest_fields = latest.get("fields") or {}
+            try:
+                latest_failed = await _open_ad_failures(period, latest_fields)
+            except Exception as e:
+                latest_failed = []
+                block_reason = f"广告失败状态读取失败：{type(e).__name__}"
+            if latest_failed:
+                block_reason = _ad_failure_message(latest_failed)
+            if not block_reason:
+                await _upsert_status(period, status_update, tok)
+                status = await _get_status(period, tok) or {}
+                finance_card = build_card("finance_final", summary, status.get("fields") or {})
+                sent = await send_card(finance_card, FINANCE_GROUP_ID)
+                sent_id = _message_id(sent)
+                if sent_id:
+                    await _upsert_status(period, {"最后卡片 message_id": sent_id}, tok)
+        if block_reason:
+            return await _blocked_confirmation(block_reason)
         processed = build_processed_card(month, state, actor, detail)
         feedback = await patch_or_fallback(message_id, processed, chat_id) if patch else {}
-        sent = await send_card(finance_card, FINANCE_GROUP_ID)
-        sent_id = _message_id(sent)
-        if sent_id:
-            await _upsert_status(period, {"最后卡片 message_id": sent_id}, tok)
         return {"status": "ok", "action": action, "period": period, "state": state, "processed_card": processed, "feedback": feedback, "next_card": finance_card, "next_kind": "finance_final", "send_result": sent}
 
     if action == "ml_profit_ops_reject":
@@ -874,7 +1286,25 @@ async def confirm_action(payload: dict[str, Any]) -> dict[str, Any]:
         return {"status": "ok", "action": action, "period": period, "state": "退回重算", "processed_card": processed, "feedback": feedback}
 
     if action == "ml_profit_finance_confirm":
-        await _upsert_status(period, {"状态": "财务已确认终稿", "财务确认人": actor, "财务确认时间": now_ms}, tok)
+        block_reason = ""
+        async with _status_mutation_lock(period):
+            latest = await _get_status(period, tok) or {}
+            latest_fields = latest.get("fields") or {}
+            try:
+                latest_failed = await _open_ad_failures(period, latest_fields)
+            except Exception as e:
+                latest_failed = []
+                block_reason = f"广告失败状态读取失败：{type(e).__name__}"
+            if latest_failed:
+                block_reason = _ad_failure_message(latest_failed)
+            if not block_reason:
+                await _upsert_status(
+                    period,
+                    {"状态": "财务已确认终稿", "财务确认人": actor, "财务确认时间": now_ms},
+                    tok,
+                )
+        if block_reason:
+            return await _blocked_confirmation(block_reason)
         processed = build_processed_card(month, "财务已确认终稿", actor, "月结终稿完成")
         feedback = await patch_or_fallback(message_id, processed, chat_id) if patch else {}
         return {"status": "ok", "action": action, "period": period, "state": "财务已确认终稿", "processed_card": processed, "feedback": feedback}

@@ -6,6 +6,7 @@ M2: tokens persisted to SQLite; admin endpoints for seed/list/refresh.
 import os
 import json
 import secrets
+import time
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Depends, Header, BackgroundTasks
 from fastapi.concurrency import run_in_threadpool
@@ -48,6 +49,9 @@ def health():
     return {
         "ok": True,
         "ad_sync_fail_closed": True,
+        "ad_sync_failure_visible": True,
+        "ad_sync_failure_durable": True,
+        "ad_sync_failure_restart_safe": True,
         "ad_sync_preview": True,
     }
 
@@ -1543,6 +1547,7 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
         return {"status": "skipped_cbt", "seller_id": seller_id, "month": month,
                 "note": "CBT-FULL 走官方导出解析(cbt_export_ingest.py), 不走主sync(缓存仅85%不全)."}
     period = period_label or f"month_{month}"
+    sync_started_at = time.time_ns()
 
     cached_rows = await db.cache_list_orders_for_month(seller_id, month)
     if not cached_rows:
@@ -1678,13 +1683,32 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
             )
             ad_currency = advertising.AD_CURRENCY_BY_ADVERTISER.get(ad_advertiser_id, "?")
         except Exception as e:
-            ad_error = f"{type(e).__name__}: {e}"[:500]
+            ad_error = type(e).__name__
+            print(
+                f"[ERROR] advertising fetch failed: seller_id={seller_id} month={month} "
+                f"error={type(e).__name__} detail={str(e)[:500]}"
+            )
+            failure_message = (
+                f"广告费抓取失败：{SHOP_LABEL[seller_id]} / {month}。"
+                "本次未写入，原报表数据保持不变；禁止将抓取失败自动记为 0。"
+            )
+            if commit:
+                try:
+                    from app import ml_close
+
+                    await ml_close.record_advertising_failure(
+                        period=period,
+                        shop=SHOP_LABEL[seller_id],
+                        message=failure_message,
+                    )
+                except Exception as notify_error:
+                    print(
+                        f"[ERROR] failed to publish advertising fetch failure: "
+                        f"seller_id={seller_id} month={month} error={type(notify_error).__name__}"
+                    )
             raise HTTPException(
                 502,
-                detail=(
-                    f"advertising data unavailable for seller_id={seller_id}, month={month}; "
-                    "Feishu rows were not changed. " + ad_error
-                ),
+                detail=failure_message,
             ) from e
     ad_sku_cost: dict[str, float] = {k: v.get("cost", 0.0) for k, v in ad_sku_metrics.items()}
     ad_unallocated_cost = ad_unallocated_metrics.get("cost", 0.0)
@@ -2082,6 +2106,20 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
 
         verified_items = await _search_scope("read-back")
         _verify_scope(verified_items, "read-back")
+
+    try:
+        from app import ml_close
+
+        await ml_close.clear_advertising_failure(
+            period,
+            shop_label,
+            success_started_at=sync_started_at,
+        )
+    except Exception as clear_error:
+        print(
+            f"[ERROR] failed to clear advertising fetch failure: "
+            f"seller_id={seller_id} month={month} error={type(clear_error).__name__}"
+        )
 
     return {"status": "synced", "seller_id": seller_id, "shop": SHOP_LABEL[seller_id],
             "month": month, "period": period, "rows_written": len(records),

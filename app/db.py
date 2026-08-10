@@ -9,6 +9,9 @@ For Zeabur, /data should be mounted as a persistent volume; otherwise the DB is
 ephemeral (resets on redeploy) and tokens must be re-seeded.
 """
 
+import asyncio
+import hashlib
+import json
 import os
 import time
 import aiosqlite
@@ -107,6 +110,16 @@ CREATE INDEX IF NOT EXISTS idx_event_status ON ml_event_queue(status);
 CREATE INDEX IF NOT EXISTS idx_event_topic ON ml_event_queue(topic);
 -- idempotency: same resource + sent_at = duplicate notification
 CREATE UNIQUE INDEX IF NOT EXISTS uq_event_resource_sent ON ml_event_queue(resource, sent_at);
+
+-- Durable fail-closed marker for monthly advertising syncs.
+CREATE TABLE IF NOT EXISTS ml_ad_sync_failure (
+    period          TEXT NOT NULL,
+    shop            TEXT NOT NULL,
+    message         TEXT,
+    failed_at       INTEGER NOT NULL,
+    PRIMARY KEY (period, shop)
+);
+CREATE INDEX IF NOT EXISTS idx_ad_sync_failure_period ON ml_ad_sync_failure(period);
 """
 
 
@@ -125,6 +138,144 @@ async def init_db() -> None:
         # Now safe to create the app_key index (column guaranteed to exist)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_tokens_app_key ON tokens(app_key)")
         await db.commit()
+
+
+async def set_ad_sync_failure(
+    period: str,
+    shop: str,
+    message: str,
+    failed_at: int | None = None,
+) -> None:
+    now = failed_at if failed_at is not None else time.time_ns()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO ml_ad_sync_failure (period, shop, message, failed_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(period, shop) DO UPDATE SET
+                message = excluded.message,
+                failed_at = excluded.failed_at
+            """,
+            (period, shop, message[:1000], now),
+        )
+        await db.commit()
+
+
+async def clear_ad_sync_failure(period: str, shop: str, not_after: int | None = None) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        if not_after is None:
+            cur = await db.execute(
+                "DELETE FROM ml_ad_sync_failure WHERE period = ? AND shop = ?",
+                (period, shop),
+            )
+        else:
+            cur = await db.execute(
+                """
+                DELETE FROM ml_ad_sync_failure
+                WHERE period = ? AND shop = ? AND failed_at <= ?
+                """,
+                (period, shop, not_after),
+            )
+        await db.commit()
+        return cur.rowcount > 0
+
+
+def _ad_failure_fallback_dir() -> str:
+    return os.getenv("AD_FAILURE_FALLBACK_DIR") or f"{DB_PATH}.ad_failures"
+
+
+def _ad_failure_fallback_path(period: str, shop: str) -> str:
+    key = hashlib.sha256(f"{period}\0{shop}".encode("utf-8")).hexdigest()
+    return os.path.join(_ad_failure_fallback_dir(), f"{key}.json")
+
+
+def _write_ad_failure_fallback(period: str, shop: str, message: str, failed_at: int) -> None:
+    directory = _ad_failure_fallback_dir()
+    os.makedirs(directory, exist_ok=True)
+    path = _ad_failure_fallback_path(period, shop)
+    temp_path = f"{path}.{os.getpid()}.{time.time_ns()}.tmp"
+    payload = {
+        "period": period,
+        "shop": shop,
+        "message": message[:1000],
+        "failed_at": failed_at,
+    }
+    try:
+        with open(temp_path, "x", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+async def set_ad_sync_failure_fallback(
+    period: str,
+    shop: str,
+    message: str,
+    failed_at: int,
+) -> None:
+    await asyncio.to_thread(_write_ad_failure_fallback, period, shop, message, failed_at)
+
+
+def _list_ad_sync_failure_fallbacks(period: str) -> list[dict[str, Any]]:
+    directory = _ad_failure_fallback_dir()
+    if not os.path.isdir(directory):
+        return []
+    rows: list[dict[str, Any]] = []
+    for name in sorted(os.listdir(directory)):
+        if not name.endswith(".json"):
+            continue
+        with open(os.path.join(directory, name), encoding="utf-8") as handle:
+            row = json.load(handle)
+        if isinstance(row, dict) and row.get("period") == period and row.get("shop"):
+            rows.append(row)
+    return rows
+
+
+async def list_ad_sync_failure_fallbacks(period: str) -> list[dict[str, Any]]:
+    return await asyncio.to_thread(_list_ad_sync_failure_fallbacks, period)
+
+
+def _clear_ad_sync_failure_fallback(
+    period: str,
+    shop: str,
+    not_after: int | None,
+) -> bool:
+    path = _ad_failure_fallback_path(period, shop)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            row = json.load(handle)
+    except FileNotFoundError:
+        return False
+    failed_at = int(row.get("failed_at") or 0)
+    if not_after is not None and failed_at > not_after:
+        return False
+    try:
+        os.remove(path)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+async def clear_ad_sync_failure_fallback(
+    period: str,
+    shop: str,
+    not_after: int | None = None,
+) -> bool:
+    return await asyncio.to_thread(_clear_ad_sync_failure_fallback, period, shop, not_after)
+
+
+async def list_ad_sync_failures(period: str) -> list[dict[str, Any]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT period, shop, message, failed_at FROM ml_ad_sync_failure WHERE period = ? ORDER BY shop",
+            (period,),
+        )
+        return [dict(row) for row in await cur.fetchall()]
 
 
 async def upsert_token(
