@@ -141,6 +141,62 @@ class ProductMappingTests(unittest.TestCase):
         )
 
 
+class ProductSourceCredentialTests(unittest.IsolatedAsyncioTestCase):
+    async def test_existing_report_app_credentials_are_product_read_fallback(self):
+        token_loader = AsyncMock(side_effect=["report-token", "product-token"])
+        record_loader = AsyncMock(side_effect=[[], [], []])
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "FEISHU_APP_ID": "cli-report-app",
+                    "FEISHU_APP_SECRET": "report-secret",
+                },
+                clear=True,
+            ),
+            patch.object(unified_report, "_tenant_token", token_loader),
+            patch.object(unified_report, "_list_bitable_records", record_loader),
+        ):
+            await unified_report._load_sources()
+
+        self.assertEqual(
+            [
+                unittest.mock.call("cli-report-app", "report-secret"),
+                unittest.mock.call("cli-report-app", "report-secret"),
+            ],
+            token_loader.await_args_list,
+        )
+
+    async def test_product_secret_without_id_uses_product_app_not_report_app(self):
+        token_loader = AsyncMock(side_effect=["report-token", "product-token"])
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "FEISHU_APP_ID": "cli-report-app",
+                    "FEISHU_APP_SECRET": "report-secret",
+                    "ML_PRODUCT_FEISHU_APP_SECRET": "product-secret",
+                },
+                clear=True,
+            ),
+            patch.object(unified_report, "_tenant_token", token_loader),
+            patch.object(
+                unified_report,
+                "_list_bitable_records",
+                AsyncMock(side_effect=[[], [], []]),
+            ),
+        ):
+            await unified_report._load_sources()
+
+        self.assertEqual(
+            unittest.mock.call(
+                "cli_a93785277ef8dcb0", "product-secret"
+            ),
+            token_loader.await_args_list[1],
+        )
+
+
 class WorkbookBuildTests(unittest.IsolatedAsyncioTestCase):
     def test_builds_approved_47_columns_and_erp_display_fields(self):
         prepared = unified_report.prepare_report(

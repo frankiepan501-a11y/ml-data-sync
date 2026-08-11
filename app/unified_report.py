@@ -532,16 +532,19 @@ async def _list_bitable_records(token: str, app_token: str, table_id: str) -> li
 async def _load_sources() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     report_app_id = os.getenv("FEISHU_APP_ID", "cli_a9f6ae86fce8dbd8")
     report_secret = os.getenv("FEISHU_APP_SECRET", "")
-    product_app_id = (
-        os.getenv("ML_PRODUCT_FEISHU_APP_ID")
-        or os.getenv("FEISHU_BITABLE_APP_ID")
-        or "cli_a93785277ef8dcb0"
-    )
-    product_secret = (
-        os.getenv("ML_PRODUCT_FEISHU_APP_SECRET")
-        or os.getenv("FEISHU_BITABLE_APP_SECRET")
-        or ""
-    )
+    dedicated_product_app_id = os.getenv("ML_PRODUCT_FEISHU_APP_ID")
+    dedicated_product_secret = os.getenv("ML_PRODUCT_FEISHU_APP_SECRET")
+    legacy_product_app_id = os.getenv("FEISHU_BITABLE_APP_ID")
+    legacy_product_secret = os.getenv("FEISHU_BITABLE_APP_SECRET")
+    if dedicated_product_app_id or dedicated_product_secret:
+        product_app_id = dedicated_product_app_id or "cli_a93785277ef8dcb0"
+        product_secret = dedicated_product_secret or ""
+    elif legacy_product_app_id or legacy_product_secret:
+        product_app_id = legacy_product_app_id or "cli_a93785277ef8dcb0"
+        product_secret = legacy_product_secret or ""
+    else:
+        product_app_id = report_app_id
+        product_secret = report_secret
     report_token = await _tenant_token(report_app_id, report_secret)
     product_token = await _tenant_token(product_app_id, product_secret)
     report_records = await _list_bitable_records(report_token, REPORT_APP_TOKEN, REPORT_TABLE_ID)
