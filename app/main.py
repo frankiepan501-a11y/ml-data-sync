@@ -1142,6 +1142,8 @@ async def ml_unified_monthly(month: str | None = None, period: str | None = None
                 "issues": exc.issues,
             },
         ) from exc
+    except unified_report.ReportGenerationInProgressError as exc:
+        raise HTTPException(409, detail=str(exc)) from exc
     except unified_report.ReportGenerationError as exc:
         raise HTTPException(502, detail=f"月报生成失败：{exc}") from exc
 

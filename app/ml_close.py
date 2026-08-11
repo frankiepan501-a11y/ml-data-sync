@@ -12,6 +12,7 @@ import datetime as _dt
 import json
 import os
 import time
+import uuid
 import weakref
 from collections import defaultdict
 from typing import Any
@@ -37,6 +38,8 @@ _STATUS_LOCKS_BY_LOOP: weakref.WeakKeyDictionary[
     asyncio.AbstractEventLoop, dict[str, asyncio.Lock]
 ] = weakref.WeakKeyDictionary()
 _EMERGENCY_AD_FAILURES: dict[str, dict[str, int]] = {}
+_ACTION_EPOCHS: dict[str, int] = {}
+_ACTION_KEY_EPOCHS: dict[str, dict[str, int]] = {}
 
 STATUSES = [
     "待数据同步",
@@ -399,6 +402,95 @@ async def _get_status(period: str, tok: str | None = None) -> dict[str, Any] | N
     return None
 
 
+async def _commit_audit_snapshot(
+    result: dict[str, Any],
+    tok: str,
+    base_error: str,
+    extra_fields: dict[str, Any] | None = None,
+) -> None:
+    """Commit an already calculated audit while the caller owns status order."""
+    period = _text(result.get("period"))
+    month = _text(result.get("month"))
+    latest = await _get_status(period, tok)
+    latest_fields = latest.get("fields", {}) if latest else {}
+    latest_state = _text(latest_fields.get("状态"))
+    latest_result = _last_result(latest_fields)
+    latest_marker_error = ""
+    try:
+        latest_failed_ad_shops = await _open_ad_failures(period, latest_fields)
+    except Exception as exc:
+        latest_failed_ad_shops = _failed_ad_shops(latest_fields)
+        latest_marker_error = f"广告失败状态读取失败：{type(exc).__name__}"
+    latest_base_error = (
+        f"{base_error}；{latest_marker_error}"
+        if base_error and latest_marker_error
+        else (base_error or latest_marker_error)
+    )
+    last_error = _with_ad_failure(latest_base_error, latest_failed_ad_shops)
+    state, next_card = _close_state(
+        bool(result.get("report_rows")),
+        bool(result.get("gap_row_count")),
+        latest_state,
+        last_error,
+    )
+    result.update(
+        {
+            "status": "ok" if not last_error else "error",
+            "state": state,
+            "next_card": next_card,
+            "last_error": last_error,
+            "failed_ad_shops": latest_failed_ad_shops,
+        }
+    )
+    previous_gross = round(float(_num(latest_result.get("gross_profit_rmb"))), 2)
+    gross_profit = round(float(_num(result.get("gross_profit_rmb"))), 2)
+    gross_delta = round(gross_profit - previous_gross, 2) if previous_gross else 0.0
+    status_result = {
+        "failure_type": "advertising_fetch" if latest_failed_ad_shops else "",
+        "failed_ad_shops": latest_failed_ad_shops,
+        "status": result["status"],
+        "period": period,
+        "month": month,
+        "state": state,
+        "next_card": next_card,
+        "report_rows": int(_num(result.get("report_rows"))),
+        "store_count": int(_num(result.get("store_count"))),
+        "order_count": int(_num(result.get("order_count"))),
+        "unit_count": _num(result.get("unit_count")),
+        "revenue_rmb": _num(result.get("revenue_rmb")),
+        "gross_profit_rmb": gross_profit,
+        "ad_total_rmb": _num(result.get("ad_total_rmb")),
+        "purchase_gap_count": int(_num(result.get("purchase_gap_count"))),
+        "freight_gap_count": int(_num(result.get("freight_gap_count"))),
+        "gap_row_count": int(_num(result.get("gap_row_count"))),
+        "head_total_rmb": _num(result.get("head_total_rmb")),
+        "ovs_total_rmb": _num(result.get("ovs_total_rmb")),
+        "cbt_state": _text(result.get("cbt_state")),
+        "last_error": last_error[:500],
+    }
+    fields = {
+        "月份": month,
+        "状态": state,
+        "报表行数": status_result["report_rows"],
+        "店铺覆盖数": status_result["store_count"],
+        "CBT解析状态": status_result["cbt_state"],
+        "成本缺口数": status_result["gap_row_count"],
+        "采购缺口数": status_result["purchase_gap_count"],
+        "头程/海外仓缺口数": status_result["freight_gap_count"],
+        "最近重算时间": int(time.time() * 1000),
+        "报表链接": _report_url(),
+        "缺口视图链接": _report_url(),
+        "上次全额毛利": previous_gross,
+        "全额毛利差异": gross_delta,
+        "最后错误": last_error[:1800],
+        "最后结果JSON": json.dumps(status_result, ensure_ascii=False),
+        "重算次数": int(_num(latest_fields.get("重算次数"))) + 1,
+    }
+    if extra_fields:
+        fields.update(extra_fields)
+    result["status_record"] = await _upsert_status(period, fields, tok)
+
+
 async def audit(
     month: str | None = None,
     period: str | None = None,
@@ -522,87 +614,14 @@ async def audit(
         "gap_view_url": _report_url(),
         "gap_rows": gap_rows,
         "cost_summary": cost_summary or {},
+        "_base_error": base_error,
         "last_error": last_error,
         "failed_ad_shops": prior_failed_ad_shops,
     }
 
     if commit:
         async with _status_mutation_lock(period):
-            latest = await _get_status(period, tok)
-            latest_fields = latest.get("fields", {}) if latest else {}
-            latest_state = _text(latest_fields.get("状态"))
-            latest_result = _last_result(latest_fields)
-            latest_marker_error = ""
-            try:
-                latest_failed_ad_shops = await _open_ad_failures(period, latest_fields)
-            except Exception as e:
-                latest_failed_ad_shops = _failed_ad_shops(latest_fields)
-                latest_marker_error = f"广告失败状态读取失败：{type(e).__name__}"
-            latest_base_error = (
-                f"{base_error}；{latest_marker_error}"
-                if base_error and latest_marker_error
-                else (base_error or latest_marker_error)
-            )
-            last_error = _with_ad_failure(latest_base_error, latest_failed_ad_shops)
-            state, next_card = _close_state(
-                bool(rows),
-                bool(purchase_gaps or freight_gaps),
-                latest_state,
-                last_error,
-            )
-            result.update(
-                {
-                    "status": "ok" if not last_error else "error",
-                    "state": state,
-                    "next_card": next_card,
-                    "last_error": last_error,
-                    "failed_ad_shops": latest_failed_ad_shops,
-                }
-            )
-            previous_gross = round(float(_num(latest_result.get("gross_profit_rmb"))), 2)
-            gross_delta = round(float(profit) - previous_gross, 2) if previous_gross else 0.0
-            status_result = {
-                "failure_type": "advertising_fetch" if latest_failed_ad_shops else "",
-                "failed_ad_shops": latest_failed_ad_shops,
-                "status": result["status"],
-                "period": period,
-                "month": month,
-                "state": state,
-                "next_card": next_card,
-                "report_rows": len(rows),
-                "store_count": len(stores),
-                "order_count": order_count,
-                "unit_count": unit_count,
-                "revenue_rmb": result["revenue_rmb"],
-                "gross_profit_rmb": result["gross_profit_rmb"],
-                "ad_total_rmb": result["ad_total_rmb"],
-                "purchase_gap_count": len(purchase_gaps),
-                "freight_gap_count": len(freight_gaps),
-                "gap_row_count": len(gap_rows),
-                "head_total_rmb": result["head_total_rmb"],
-                "ovs_total_rmb": result["ovs_total_rmb"],
-                "cbt_state": cbt_state,
-                "last_error": last_error[:500],
-            }
-            fields = {
-                "月份": month,
-                "状态": state,
-                "报表行数": len(rows),
-                "店铺覆盖数": len(stores),
-                "CBT解析状态": cbt_state,
-                "成本缺口数": len(gap_rows),
-                "采购缺口数": len(purchase_gaps),
-                "头程/海外仓缺口数": len(freight_gaps),
-                "最近重算时间": int(time.time() * 1000),
-                "报表链接": _report_url(),
-                "缺口视图链接": _report_url(),
-                "上次全额毛利": previous_gross,
-                "全额毛利差异": gross_delta,
-                "最后错误": last_error[:1800],
-                "最后结果JSON": json.dumps(status_result, ensure_ascii=False),
-                "重算次数": int(_num(latest_fields.get("重算次数"))) + 1,
-            }
-            result["status_record"] = await _upsert_status(period, fields, tok)
+            await _commit_audit_snapshot(result, tok, base_error)
     return result
 
 
@@ -835,16 +854,19 @@ async def record_advertising_failure(
     status_fields: dict[str, Any] = {}
     status_record: dict[str, Any] | None = None
     status_write_error = ""
+    # 先发布可跨进程读取的失败闸，再等月份状态锁。否则财务生成器持锁时，
+    # 新失败会排队到终稿写入之后才可见，造成短暂的假成功。
+    _EMERGENCY_AD_FAILURES.setdefault(period, {})[shop] = failure_version
+    try:
+        await db.set_ad_sync_failure(period, shop, message, failed_at=failure_version)
+    except Exception as e:
+        sqlite_marker_error = f"{type(e).__name__}: {e}"[:500]
+    try:
+        await db.set_ad_sync_failure_fallback(period, shop, message, failure_version)
+    except Exception as e:
+        fallback_marker_error = f"{type(e).__name__}: {e}"[:500]
+
     async with _status_mutation_lock(period):
-        _EMERGENCY_AD_FAILURES.setdefault(period, {})[shop] = failure_version
-        try:
-            await db.set_ad_sync_failure(period, shop, message, failed_at=failure_version)
-        except Exception as e:
-            sqlite_marker_error = f"{type(e).__name__}: {e}"[:500]
-        try:
-            await db.set_ad_sync_failure_fallback(period, shop, message, failure_version)
-        except Exception as e:
-            fallback_marker_error = f"{type(e).__name__}: {e}"[:500]
         try:
             tok = await _tenant_token()
             prior = await _get_status(period, tok)
@@ -1168,14 +1190,45 @@ async def status_endpoint(month: str | None = None, period: str | None = None) -
     }
 
 
-async def recalc_cost(month: str | None = None, period: str | None = None, commit: bool = True) -> dict[str, Any]:
+async def recalc_cost(
+    month: str | None = None,
+    period: str | None = None,
+    commit: bool = True,
+    audit_commit: bool = True,
+) -> dict[str, Any]:
     period, month = normalize_period(month, period)
     cost = await anyio.to_thread.run_sync(meitong_cost.run, period, 12, commit)
-    summary = await audit(period=period, commit=True, run_cost_preview=False, cost_summary=cost)
+    summary = await audit(
+        period=period,
+        commit=audit_commit,
+        run_cost_preview=False,
+        cost_summary=cost,
+    )
     return {"status": "ok", "period": period, "month": month, "cost_summary": cost, "audit": summary}
 
 
 async def confirm_action(payload: dict[str, Any]) -> dict[str, Any]:
+    action_context: dict[str, Any] = {}
+    try:
+        return await _confirm_action_impl(payload, action_context)
+    except Exception as exc:
+        if action_context.get("claimed"):
+            try:
+                await db.fail_ml_close_action(
+                    action_context["period"],
+                    action_context["action_key"],
+                    action_context["owner"],
+                    f"unhandled action failure: {type(exc).__name__}: {exc}",
+                )
+            except Exception:
+                pass
+        raise
+
+
+async def _confirm_action_impl(
+    payload: dict[str, Any],
+    action_context: dict[str, Any],
+) -> dict[str, Any]:
     action = payload.get("action") or payload.get("value", {}).get("action")
     period, month = normalize_period(payload.get("month"), payload.get("period") or payload.get("value", {}).get("period"))
     actor = _text(payload.get("operator_name") or payload.get("operator_id") or payload.get("open_id") or payload.get("user_id"))
@@ -1191,8 +1244,45 @@ async def confirm_action(payload: dict[str, Any]) -> dict[str, Any]:
     chat_id = payload.get("open_chat_id") or payload.get("chat_id") or context.get("open_chat_id") or context.get("chat_id") or ""
     patch = payload.get("patch_message", True) is not False
     now_ms = int(time.time() * 1000)
+    action_key = f"{message_id or period}:{action}"
+    state_mutating_actions = {
+        "ml_profit_recalc_cost",
+        "ml_profit_ops_confirm",
+        "ml_profit_ops_waive_gap",
+        "ml_profit_ops_reject",
+        "ml_profit_finance_confirm",
+        "ml_profit_finance_reject",
+    }
+    confirmation_actions = {
+        "ml_profit_ops_confirm",
+        "ml_profit_ops_waive_gap",
+        "ml_profit_finance_confirm",
+    }
+    action_owner = uuid.uuid4().hex
+    action_claimed = False
+    persistent_deduped = False
+    persistent_processing = False
+    persistent_superseded = False
+    tok: str | None = None
 
-    async def _blocked_confirmation(reason: str) -> dict[str, Any]:
+    async def _blocked_confirmation(
+        reason: str,
+        discard_claim: bool = False,
+    ) -> dict[str, Any]:
+        if action_claimed:
+            try:
+                if discard_claim:
+                    await db.discard_ml_close_action(
+                        period, action_key, action_owner
+                    )
+                else:
+                    await db.fail_ml_close_action(
+                        period, action_key, action_owner, reason
+                    )
+            except Exception as exc:
+                reason = (
+                    f"{reason}；动作台账失败状态写入失败：{type(exc).__name__}"
+                )
         processed = build_processed_card(month, "确认已拦截", actor, reason, ok=False)
         feedback = await patch_or_fallback(message_id, processed, chat_id) if patch else {}
         return {
@@ -1205,15 +1295,159 @@ async def confirm_action(payload: dict[str, Any]) -> dict[str, Any]:
             "feedback": feedback,
         }
 
-    confirmation_actions = {
-        "ml_profit_ops_confirm",
-        "ml_profit_ops_waive_gap",
-        "ml_profit_finance_confirm",
-    }
-    tok = await _tenant_token()
-    action_key = f"{message_id or period}:{action}"
+    # Reject known-invalid callbacks before allocating an action sequence. An
+    # old card must not receive a higher SQLite id and supersede the current,
+    # valid action merely because its callback arrived late.
+    if action in state_mutating_actions:
+        if action in confirmation_actions:
+            try:
+                active_work = await db.get_active_ml_close_month_work(period)
+            except Exception as exc:
+                return await _blocked_confirmation(
+                    f"成本重算状态读取失败：{type(exc).__name__}"
+                )
+            if active_work:
+                return await _blocked_confirmation(
+                    "本月成本正在重算，确认已暂缓；请等待重算完成后再次点击。"
+                )
+        try:
+            tok = await _tenant_token()
+            pre_status = await _get_status(period, tok) or {}
+        except Exception as exc:
+            return await _blocked_confirmation(
+                f"月结状态预检失败：{type(exc).__name__}"
+            )
+        pre_fields = pre_status.get("fields") or {}
+        pre_message_id = _text(pre_fields.get("最后卡片 message_id"))
+        if message_id and pre_message_id and message_id != pre_message_id:
+            return await _blocked_confirmation(
+                "该卡片已不是当前月份的最新操作卡，本次动作已拦截。"
+            )
+        pre_state = _text(pre_fields.get("状态"))
+        if (
+            pre_state == "财务已确认终稿"
+            and action != "ml_profit_finance_confirm"
+        ):
+            return await _blocked_confirmation(
+                "本月已由财务确认终稿，旧卡片不能再修改终稿状态。"
+            )
+        if action in confirmation_actions:
+            try:
+                pre_failed = await _open_ad_failures(period, pre_fields)
+            except Exception as exc:
+                return await _blocked_confirmation(
+                    f"月结确认门禁读取失败：{type(exc).__name__}"
+                )
+            if pre_failed:
+                return await _blocked_confirmation(_ad_failure_message(pre_failed))
+        if action == "ml_profit_finance_confirm":
+            retrying_generator_error = (
+                pre_state == "异常"
+                and _text(pre_fields.get("最后错误")).startswith(
+                    ("月报生成失败：", "月报终态保护失败：")
+                )
+            )
+            if pre_state not in ("运营已确认", "财务已确认终稿") and not retrying_generator_error:
+                return await _blocked_confirmation(
+                    f"当前月结状态为“{pre_state or '未知'}”，请先完成运营确认。"
+                )
+        try:
+            action_claim = await db.claim_ml_close_action(
+                period, action_key, action_owner
+            )
+        except Exception as exc:
+            reason = f"月结动作去重台账不可用：{type(exc).__name__}"
+            processed = build_processed_card(month, "确认已拦截", actor, reason, ok=False)
+            feedback = await patch_or_fallback(message_id, processed, chat_id) if patch else {}
+            return {
+                "status": "blocked",
+                "action": action,
+                "period": period,
+                "state": "异常",
+                "reason": reason,
+                "processed_card": processed,
+                "feedback": feedback,
+            }
+        action_claimed = bool(action_claim.get("claimed"))
+        action_claim_status = _text(action_claim.get("status"))
+        persistent_deduped = not action_claimed and action_claim_status == "completed"
+        persistent_processing = not action_claimed and action_claim_status == "processing"
+        persistent_superseded = not action_claimed and action_claim_status == "superseded"
+        if action_claimed:
+            action_context.update({
+                "claimed": True,
+                "period": period,
+                "action_key": action_key,
+                "owner": action_owner,
+            })
+
+    action_epoch = _ACTION_EPOCHS.get(period, 0)
+    is_new_action_key = action_claimed
+    if action_claimed:
+        keyed_epochs = _ACTION_KEY_EPOCHS.setdefault(period, {})
+        action_epoch += 1
+        _ACTION_EPOCHS[period] = action_epoch
+        keyed_epochs[action_key] = action_epoch
+    if action_claimed and action in confirmation_actions:
+        try:
+            active_work = await db.get_active_ml_close_month_work(period)
+        except Exception as exc:
+            return await _blocked_confirmation(
+                f"成本重算状态读取失败：{type(exc).__name__}"
+            )
+        if active_work:
+            return await _blocked_confirmation(
+                "本月成本正在重算，确认已暂缓；请等待重算完成后再次点击。",
+                discard_claim=True,
+            )
+    if tok is None:
+        try:
+            tok = await _tenant_token()
+        except Exception as exc:
+            return await _blocked_confirmation(
+                f"月结状态授权失败：{type(exc).__name__}"
+            )
+
+    # Reject/recalculate must publish cancellation before waiting on the local
+    # month lock, but first reject a known stale card so an old callback cannot
+    # cancel an already approved report after a deployment has created a fresh
+    # (initially empty) action ledger.
+    if is_new_action_key and action in {
+        "ml_profit_recalc_cost",
+        "ml_profit_ops_reject",
+        "ml_profit_finance_reject",
+    }:
+        try:
+            pre_status = await _get_status(period, tok) or {}
+        except Exception as exc:
+            return await _blocked_confirmation(
+                f"月结状态读取失败：{type(exc).__name__}"
+            )
+        pre_fields = pre_status.get("fields") or {}
+        pre_message_id = _text(pre_fields.get("最后卡片 message_id"))
+        if message_id and pre_message_id and message_id != pre_message_id:
+            return await _blocked_confirmation(
+                "该卡片已不是当前月份的最新操作卡，本次动作已拦截。",
+                discard_claim=True,
+            )
+        if _text(pre_fields.get("状态")) == "财务已确认终稿":
+            return await _blocked_confirmation(
+                "本月已由财务确认终稿，旧卡片不能取消或退回终稿。",
+                discard_claim=True,
+            )
+        try:
+            await db.cancel_unified_report_generation(
+                period, f"close action requested: {action}"
+            )
+        except Exception as exc:
+            return await _blocked_confirmation(
+                f"月报生成取消失败：{type(exc).__name__}"
+            )
+
     block_reason = ""
+    discard_claim = False
     deduped = False
+    in_progress = False
     async with _status_mutation_lock(period):
         current = await _get_status(period, tok) or {}
         current_fields = current.get("fields") or {}
@@ -1225,28 +1459,140 @@ async def confirm_action(payload: dict[str, Any]) -> dict[str, Any]:
                 block_reason = f"广告失败状态读取失败：{type(e).__name__}"
             if current_failed:
                 block_reason = _ad_failure_message(current_failed)
-        if not block_reason and action and _text(current_fields.get("最后按钮动作Key")) == action_key:
+        if not block_reason and action == "ml_profit_finance_confirm":
+            current_state = _text(current_fields.get("状态"))
+            retrying_generator_error = (
+                current_state == "异常"
+                and _text(current_fields.get("最后错误")).startswith(
+                    ("月报生成失败：", "月报终态保护失败：")
+                )
+            )
+            if current_state not in ("运营已确认", "财务已确认终稿") and not retrying_generator_error:
+                block_reason = f"当前月结状态为“{current_state or '未知'}”，请先完成运营确认。"
+                discard_claim = True
+        current_message_id = _text(current_fields.get("最后卡片 message_id"))
+        if (
+            not block_reason
+            and action in state_mutating_actions
+            and message_id
+            and current_message_id
+            and message_id != current_message_id
+        ):
+            block_reason = "该卡片已不是当前月份的最新操作卡，本次动作已拦截。"
+            discard_claim = True
+        if not block_reason and persistent_deduped:
             deduped = True
-        elif not block_reason and action:
+        elif not block_reason and persistent_processing:
+            in_progress = True
+        elif not block_reason and persistent_superseded:
+            block_reason = "该卡片动作已被更新的月结操作取代，本次执行已拦截。"
+        elif (
+            not block_reason
+            and action not in state_mutating_actions
+            and action
+            and _text(current_fields.get("最后按钮动作Key")) == action_key
+        ):
+            deduped = True
+        elif not block_reason and action not in state_mutating_actions and action:
             await _upsert_status(period, {"最后按钮动作Key": action_key, "最后按钮动作时间": now_ms}, tok)
 
     if block_reason:
-        return await _blocked_confirmation(block_reason)
+        return await _blocked_confirmation(
+            block_reason,
+            discard_claim=discard_claim,
+        )
+    if in_progress:
+        processed = build_processed_card(
+            month,
+            "处理中",
+            actor,
+            "该操作仍在执行，请稍后查看结果，不要重复点击。",
+        )
+        feedback = await patch_or_fallback(message_id, processed, chat_id) if patch else {}
+        return {
+            "status": "processing",
+            "action": action,
+            "period": period,
+            "deduped": True,
+            "processed_card": processed,
+            "feedback": feedback,
+        }
     if deduped:
         processed = build_processed_card(month, "已处理", actor, "重复点击已拦截，未重复执行")
         feedback = await patch_or_fallback(message_id, processed, chat_id) if patch else {}
         return {"status": "ok", "action": action, "period": period, "deduped": True, "processed_card": processed, "feedback": feedback}
 
     if action == "ml_profit_recalc_cost":
-        recalc = await recalc_cost(period=period, commit=True)
+        try:
+            work_claim = await db.claim_ml_close_month_work(
+                period,
+                "cost_recalc",
+                action_key,
+                action_owner,
+            )
+        except Exception as exc:
+            return await _blocked_confirmation(
+                f"成本重算占位失败：{type(exc).__name__}"
+            )
+        if not work_claim.get("claimed"):
+            return await _blocked_confirmation(
+                "本次重算已被更新的月结操作取代，未开始写入成本。"
+            )
+        try:
+            recalc = await recalc_cost(period=period, commit=True, audit_commit=False)
+        except Exception as exc:
+            await db.finish_ml_close_month_work(
+                period,
+                action_owner,
+                "failed",
+                f"{type(exc).__name__}: {exc}",
+            )
+            raise
+        await db.finish_ml_close_month_work(
+            period,
+            action_owner,
+            "completed",
+        )
         kind = recalc["audit"].get("next_card")
-        next_card = build_card(kind, recalc["audit"])
-        processed = build_processed_card(month, "已重新核算成本", actor, f"下一步卡片：{kind}")
+        next_card: dict[str, Any] = {}
+        processed: dict[str, Any] = {}
+        sent: dict[str, Any] = {}
+        async with _status_mutation_lock(period):
+            async with db.ml_close_action_finalization_guard(
+                period, action_key, action_owner
+            ) as latest_action:
+                if not latest_action:
+                    block_reason = "重算期间收到新的月结操作，本次重算状态写入已拦截。"
+                else:
+                    guard_status = await _get_status(period, tok) or {}
+                    guard_fields = guard_status.get("fields") or {}
+                    if _text(guard_fields.get("状态")) == "财务已确认终稿":
+                        block_reason = "本月已由财务确认终稿，本次重算状态写入已拦截。"
+                    else:
+                        await _commit_audit_snapshot(
+                            recalc["audit"],
+                            tok,
+                            _text(recalc["audit"].get("_base_error")),
+                            {
+                                "最后按钮动作Key": action_key,
+                                "最后按钮动作时间": now_ms,
+                            },
+                        )
+                        kind = recalc["audit"].get("next_card")
+                        next_card = build_card(kind, recalc["audit"])
+                        processed = build_processed_card(
+                            month,
+                            "已重新核算成本",
+                            actor,
+                            f"下一步卡片：{kind}",
+                        )
+                        sent = await send_card(next_card, ML_GROUP_ID)
+                        sent_id = _message_id(sent)
+                        if sent_id:
+                            await _upsert_status(period, {"最后卡片 message_id": sent_id}, tok)
+        if block_reason:
+            return await _blocked_confirmation(block_reason)
         feedback = await patch_or_fallback(message_id, processed, chat_id) if patch else {}
-        sent = await send_card(next_card, ML_GROUP_ID)
-        sent_id = _message_id(sent)
-        if sent_id:
-            await _upsert_status(period, {"最后卡片 message_id": sent_id}, tok)
         return {"status": "ok", "action": action, "period": period, "recalc": recalc, "processed_card": processed, "feedback": feedback, "next_card": next_card, "next_kind": kind, "send_result": sent}
 
     summary = await audit(period=period, commit=False, run_cost_preview=False)
@@ -1258,7 +1604,13 @@ async def confirm_action(payload: dict[str, Any]) -> dict[str, Any]:
     if action in ("ml_profit_ops_confirm", "ml_profit_ops_waive_gap"):
         state = "运营已确认"
         detail = "运营确认终稿" if action == "ml_profit_ops_confirm" else "运营确认本月缺口不影响终稿"
-        status_update = {"状态": state, "运营确认人": actor, "运营确认时间": now_ms}
+        status_update = {
+            "状态": state,
+            "运营确认人": actor,
+            "运营确认时间": now_ms,
+            "最后按钮动作Key": action_key,
+            "最后按钮动作时间": now_ms,
+        }
         block_reason = ""
         finance_card: dict[str, Any] = {}
         sent: dict[str, Any] = {}
@@ -1272,14 +1624,29 @@ async def confirm_action(payload: dict[str, Any]) -> dict[str, Any]:
                 block_reason = f"广告失败状态读取失败：{type(e).__name__}"
             if latest_failed:
                 block_reason = _ad_failure_message(latest_failed)
+            if not block_reason and _text(latest_fields.get("状态")) == "财务已确认终稿":
+                block_reason = "本月已由财务确认终稿，旧运营卡片不能覆盖终稿状态。"
+            if not block_reason and _ACTION_EPOCHS.get(period) != action_epoch:
+                block_reason = "确认期间收到新的月结操作，本次运营确认已拦截。"
             if not block_reason:
-                await _upsert_status(period, status_update, tok)
-                status = await _get_status(period, tok) or {}
-                finance_card = build_card("finance_final", summary, status.get("fields") or {})
-                sent = await send_card(finance_card, FINANCE_GROUP_ID)
-                sent_id = _message_id(sent)
-                if sent_id:
-                    await _upsert_status(period, {"最后卡片 message_id": sent_id}, tok)
+                async with db.ml_close_action_finalization_guard(
+                    period, action_key, action_owner
+                ) as latest_action:
+                    if not latest_action:
+                        block_reason = "确认期间收到新的月结操作，本次运营确认已拦截。"
+                    else:
+                        guard_status = await _get_status(period, tok) or {}
+                        guard_fields = guard_status.get("fields") or {}
+                        if _text(guard_fields.get("状态")) == "财务已确认终稿":
+                            block_reason = "本月已由财务确认终稿，旧运营卡片不能覆盖终稿状态。"
+                        else:
+                            await _upsert_status(period, status_update, tok)
+                            status = await _get_status(period, tok) or {}
+                            finance_card = build_card("finance_final", summary, status.get("fields") or {})
+                            sent = await send_card(finance_card, FINANCE_GROUP_ID)
+                            sent_id = _message_id(sent)
+                            if sent_id:
+                                await _upsert_status(period, {"最后卡片 message_id": sent_id}, tok)
         if block_reason:
             return await _blocked_confirmation(block_reason)
         processed = build_processed_card(month, state, actor, detail)
@@ -1287,40 +1654,71 @@ async def confirm_action(payload: dict[str, Any]) -> dict[str, Any]:
         return {"status": "ok", "action": action, "period": period, "state": state, "processed_card": processed, "feedback": feedback, "next_card": finance_card, "next_kind": "finance_final", "send_result": sent}
 
     if action == "ml_profit_ops_reject":
-        await _upsert_status(period, {"状态": "退回重算", "最后错误": "运营退回重算"}, tok)
+        async with _status_mutation_lock(period):
+            latest = await _get_status(period, tok) or {}
+            latest_fields = latest.get("fields") or {}
+            if _text(latest_fields.get("状态")) == "财务已确认终稿":
+                block_reason = "本月已由财务确认终稿，旧运营卡片不能退回终稿。"
+            if not block_reason and _ACTION_EPOCHS.get(period) != action_epoch:
+                block_reason = "退回期间收到新的月结操作，本次运营退回已拦截。"
+            if not block_reason:
+                async with db.ml_close_action_finalization_guard(
+                    period, action_key, action_owner
+                ) as latest_action:
+                    if not latest_action:
+                        block_reason = "退回期间收到新的月结操作，本次运营退回已拦截。"
+                    else:
+                        guard_status = await _get_status(period, tok) or {}
+                        guard_fields = guard_status.get("fields") or {}
+                        if _text(guard_fields.get("状态")) == "财务已确认终稿":
+                            block_reason = "本月已由财务确认终稿，旧运营卡片不能退回终稿。"
+                        else:
+                            await _upsert_status(
+                                period,
+                                {
+                                    "状态": "退回重算",
+                                    "最后错误": "运营退回重算",
+                                    "最后按钮动作Key": action_key,
+                                    "最后按钮动作时间": now_ms,
+                                },
+                                tok,
+                            )
+        if block_reason:
+            return await _blocked_confirmation(block_reason)
         processed = build_processed_card(month, "退回重算", actor, "运营发现问题，需补数后重新核算", ok=False)
         feedback = await patch_or_fallback(message_id, processed, chat_id) if patch else {}
         return {"status": "ok", "action": action, "period": period, "state": "退回重算", "processed_card": processed, "feedback": feedback}
 
     if action == "ml_profit_finance_confirm":
+        from app import unified_report
+
         block_reason = ""
-        async with _status_mutation_lock(period):
-            latest = await _get_status(period, tok) or {}
-            latest_fields = latest.get("fields") or {}
-            try:
-                latest_failed = await _open_ad_failures(period, latest_fields)
-            except Exception as e:
-                latest_failed = []
-                block_reason = f"广告失败状态读取失败：{type(e).__name__}"
-            if latest_failed:
-                block_reason = _ad_failure_message(latest_failed)
-        if block_reason:
-            return await _blocked_confirmation(block_reason)
+        report: dict[str, Any] = {}
 
-        # 财务确认的交付物是统一格式月报。必须先生成并回读验证成功，才能把
-        # 月结状态写成“财务已确认终稿”；映射/API 失败时不能留下假终态。
-        try:
-            from app import unified_report
-
-            report = await unified_report.generate(period, commit=True)
-        except Exception as exc:
-            reason = f"月报生成失败：{exc}"
-            await _upsert_status(
+        async def _publish_retryable_finance_error(
+            reason: str,
+            required_report_hash: str | None = None,
+        ) -> bool:
+            async with db.ml_close_action_finalization_guard(
                 period,
-                {"状态": "异常", "最后错误": reason[:1000], "最后按钮动作Key": ""},
-                tok,
-            )
-            return await _blocked_confirmation(reason)
+                action_key,
+                action_owner,
+                required_report_hash,
+                complete_on_success=False,
+            ) as latest_action:
+                if not latest_action:
+                    return False
+                await _upsert_status(
+                    period,
+                    {
+                        "状态": "异常",
+                        "最后错误": reason[:1000],
+                        "最后按钮动作Key": action_key,
+                        "最后按钮动作时间": now_ms,
+                    },
+                    tok,
+                )
+                return True
 
         async with _status_mutation_lock(period):
             latest = await _get_status(period, tok) or {}
@@ -1335,7 +1733,9 @@ async def confirm_action(payload: dict[str, Any]) -> dict[str, Any]:
             latest_state = _text(latest_fields.get("状态"))
             retrying_generator_error = (
                 latest_state == "异常"
-                and _text(latest_fields.get("最后错误")).startswith("月报生成失败：")
+                and _text(latest_fields.get("最后错误")).startswith(
+                    ("月报生成失败：", "月报终态保护失败：")
+                )
             )
             if (
                 not block_reason
@@ -1343,18 +1743,82 @@ async def confirm_action(payload: dict[str, Any]) -> dict[str, Any]:
                 and not retrying_generator_error
             ):
                 block_reason = f"当前月结状态为“{latest_state or '未知'}”，请先完成运营确认。"
+            if not block_reason and _ACTION_EPOCHS.get(period) != action_epoch:
+                block_reason = "生成前收到新的月结操作，本次财务确认已拦截。"
+
+            # 同一个月份从状态门禁、生成、回读到写终态都在同一把锁内，避免
+            # “财务确认”和“退回重算”交叉覆盖。生成器自身另有跨进程持久占位。
             if not block_reason:
-                await _upsert_status(
-                    period,
-                    {
-                        "状态": "财务已确认终稿",
-                        "财务确认人": actor,
-                        "财务确认时间": now_ms,
-                        "报表链接": report.get("url") or "",
-                        "最后错误": "",
-                    },
-                    tok,
+                try:
+                    report = await unified_report.generate(period, commit=True)
+                except unified_report.ReportGenerationInProgressError as exc:
+                    block_reason = f"月报生成失败：{exc}"
+                    await _publish_retryable_finance_error(block_reason)
+                except Exception as exc:
+                    block_reason = f"月报生成失败：{exc}"
+                    await _publish_retryable_finance_error(block_reason)
+
+            if not block_reason:
+                # 外部接口失败标记不依赖本进程锁，所以生成后再读一次，确保
+                # 生成期间没有新出现的广告抓取失败。
+                latest = await _get_status(period, tok) or {}
+                latest_fields = latest.get("fields") or {}
+                try:
+                    latest_failed = await _open_ad_failures(period, latest_fields)
+                except Exception as e:
+                    latest_failed = []
+                    block_reason = f"广告失败状态读取失败：{type(e).__name__}"
+                if latest_failed:
+                    block_reason = _ad_failure_message(latest_failed)
+                latest_state = _text(latest_fields.get("状态"))
+                retrying_generator_error = (
+                    latest_state == "异常"
+                    and _text(latest_fields.get("最后错误")).startswith(
+                        ("月报生成失败：", "月报终态保护失败：")
+                    )
                 )
+                if (
+                    not block_reason
+                    and latest_state not in ("运营已确认", "财务已确认终稿")
+                    and not retrying_generator_error
+                ):
+                    block_reason = f"生成期间月结状态变为“{latest_state or '未知'}”，终稿写入已拦截。"
+                if not block_reason and _ACTION_EPOCHS.get(period) != action_epoch:
+                    block_reason = "生成期间收到新的月结操作，终稿写入已拦截。"
+                if not block_reason:
+                    try:
+                        async with db.ml_close_action_finalization_guard(
+                            period,
+                            action_key,
+                            action_owner,
+                            _text(report.get("content_hash")),
+                        ) as generation_ready:
+                            if not generation_ready:
+                                block_reason = "月报生成被新的退回/失败操作中断，终稿写入已拦截。"
+                            else:
+                                # SQLite write lock is deliberately held across this Feishu
+                                # write. Reject/recalc/ad-failure must publish cancellation
+                                # through the same DB first, so their state write is ordered
+                                # after this one instead of being overwritten by it.
+                                await _upsert_status(
+                                    period,
+                                    {
+                                        "状态": "财务已确认终稿",
+                                        "财务确认人": actor,
+                                        "财务确认时间": now_ms,
+                                        "报表链接": report.get("url") or "",
+                                        "最后错误": "",
+                                        "最后按钮动作Key": action_key,
+                                        "最后按钮动作时间": now_ms,
+                                    },
+                                    tok,
+                                )
+                    except Exception as e:
+                        block_reason = f"月报终态保护失败：{type(e).__name__}"
+                        await _publish_retryable_finance_error(
+                            block_reason,
+                            _text(report.get("content_hash")),
+                        )
         if block_reason:
             return await _blocked_confirmation(block_reason)
         processed = build_processed_card(
@@ -1376,7 +1840,37 @@ async def confirm_action(payload: dict[str, Any]) -> dict[str, Any]:
         }
 
     if action == "ml_profit_finance_reject":
-        await _upsert_status(period, {"状态": "退回重算", "最后错误": "财务退回运营复核"}, tok)
+        async with _status_mutation_lock(period):
+            latest = await _get_status(period, tok) or {}
+            latest_fields = latest.get("fields") or {}
+            if _text(latest_fields.get("状态")) == "财务已确认终稿":
+                block_reason = "本月已确认终稿，旧财务退回卡片已失效。"
+            if not block_reason and _ACTION_EPOCHS.get(period) != action_epoch:
+                block_reason = "退回期间收到新的月结操作，本次财务退回已拦截。"
+            if not block_reason:
+                async with db.ml_close_action_finalization_guard(
+                    period, action_key, action_owner
+                ) as latest_action:
+                    if not latest_action:
+                        block_reason = "退回期间收到新的月结操作，本次财务退回已拦截。"
+                    else:
+                        guard_status = await _get_status(period, tok) or {}
+                        guard_fields = guard_status.get("fields") or {}
+                        if _text(guard_fields.get("状态")) == "财务已确认终稿":
+                            block_reason = "本月已确认终稿，旧财务退回卡片已失效。"
+                        else:
+                            await _upsert_status(
+                                period,
+                                {
+                                    "状态": "退回重算",
+                                    "最后错误": "财务退回运营复核",
+                                    "最后按钮动作Key": action_key,
+                                    "最后按钮动作时间": now_ms,
+                                },
+                                tok,
+                            )
+        if block_reason:
+            return await _blocked_confirmation(block_reason)
         processed = build_processed_card(month, "退回运营复核", actor, "财务退回，需运营复核后再确认", ok=False)
         feedback = await patch_or_fallback(message_id, processed, chat_id) if patch else {}
         return {"status": "ok", "action": action, "period": period, "state": "退回重算", "processed_card": processed, "feedback": feedback}

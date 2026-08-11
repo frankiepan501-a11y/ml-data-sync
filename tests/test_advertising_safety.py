@@ -5,11 +5,25 @@ import os
 import tempfile
 import time
 import unittest
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, patch
 
 from fastapi import HTTPException
 
 from app import advertising, db, lingxing, main, ml_close
+
+
+@asynccontextmanager
+async def _ready_action_guard(
+    period,
+    action_key,
+    owner,
+    required_report_hash=None,
+    complete_on_success=True,
+):
+    yield True
+    if complete_on_success:
+        await db.complete_ml_close_action(period, action_key, owner)
 
 
 class _FakeResponse:
@@ -586,12 +600,32 @@ class MonthlyCloseAdvertisingFailureTests(unittest.IsolatedAsyncioTestCase):
         self.fallback_set_patcher = patch.object(db, "set_ad_sync_failure_fallback", AsyncMock())
         self.fallback_clear_patcher = patch.object(db, "clear_ad_sync_failure_fallback", AsyncMock())
         self.fallback_list_patcher = patch.object(db, "list_ad_sync_failure_fallbacks", AsyncMock(return_value=[]))
+        self.action_claim_patcher = patch.object(
+            db,
+            "claim_ml_close_action",
+            AsyncMock(return_value={"claimed": True, "status": "processing"}),
+        )
+        self.action_complete_patcher = patch.object(db, "complete_ml_close_action", AsyncMock())
+        self.action_fail_patcher = patch.object(db, "fail_ml_close_action", AsyncMock())
+        self.action_discard_patcher = patch.object(db, "discard_ml_close_action", AsyncMock())
+        self.action_guard_patcher = patch.object(
+            db, "ml_close_action_finalization_guard", _ready_action_guard
+        )
+        self.month_work_get_patcher = patch.object(
+            db, "get_active_ml_close_month_work", AsyncMock(return_value=None)
+        )
         self.db_set_failure = self.db_set_patcher.start()
         self.db_clear_failure = self.db_clear_patcher.start()
         self.db_list_failures = self.db_list_patcher.start()
         self.fallback_set_failure = self.fallback_set_patcher.start()
         self.fallback_clear_failure = self.fallback_clear_patcher.start()
         self.fallback_list_failures = self.fallback_list_patcher.start()
+        self.action_claim = self.action_claim_patcher.start()
+        self.action_complete = self.action_complete_patcher.start()
+        self.action_fail = self.action_fail_patcher.start()
+        self.action_discard = self.action_discard_patcher.start()
+        self.action_guard_patcher.start()
+        self.month_work_get_patcher.start()
 
     def tearDown(self):
         ml_close._EMERGENCY_AD_FAILURES.clear()
@@ -601,6 +635,12 @@ class MonthlyCloseAdvertisingFailureTests(unittest.IsolatedAsyncioTestCase):
         self.fallback_set_patcher.stop()
         self.fallback_clear_patcher.stop()
         self.fallback_list_patcher.stop()
+        self.action_claim_patcher.stop()
+        self.action_complete_patcher.stop()
+        self.action_fail_patcher.stop()
+        self.action_discard_patcher.stop()
+        self.action_guard_patcher.stop()
+        self.month_work_get_patcher.stop()
 
     async def test_status_gate_uses_durable_failure_even_if_feishu_says_confirmed(self):
         self.db_list_failures.return_value = [{"shop": "ML 本土3店"}]

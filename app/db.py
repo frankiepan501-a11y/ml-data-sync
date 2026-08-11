@@ -15,6 +15,7 @@ import json
 import os
 import time
 import aiosqlite
+from contextlib import asynccontextmanager
 from typing import Any
 
 DB_PATH = os.getenv("SQLITE_PATH", "/data/ml_sync.db")
@@ -120,6 +121,51 @@ CREATE TABLE IF NOT EXISTS ml_ad_sync_failure (
     PRIMARY KEY (period, shop)
 );
 CREATE INDEX IF NOT EXISTS idx_ad_sync_failure_period ON ml_ad_sync_failure(period);
+
+-- One durable owner per monthly unified report. This prevents two service
+-- processes from copying the same template at the same time.
+CREATE TABLE IF NOT EXISTS ml_unified_report_generation (
+    period              TEXT PRIMARY KEY,
+    status              TEXT NOT NULL,       -- generating / complete / failed / cancelled
+    owner               TEXT NOT NULL,
+    wiki_token          TEXT,
+    spreadsheet_token   TEXT,
+    url                 TEXT,
+    content_hash        TEXT,
+    error               TEXT,
+    updated_at          INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_unified_report_status
+    ON ml_unified_report_generation(status);
+
+-- Durable callback ledger. Keeping every completed action key prevents a
+-- delayed retry of an old Feishu card from becoming "new" after a later card
+-- has replaced the single last-action field in the status table.
+CREATE TABLE IF NOT EXISTS ml_close_action (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    period          TEXT NOT NULL,
+    action_key      TEXT NOT NULL,
+    status          TEXT NOT NULL,       -- processing / completed / failed
+    owner           TEXT NOT NULL,
+    error           TEXT,
+    updated_at      INTEGER NOT NULL,
+    UNIQUE (period, action_key)
+);
+CREATE INDEX IF NOT EXISTS idx_ml_close_action_status
+    ON ml_close_action(period, status);
+
+-- Long-running cost writes are separate from the short final-state commit.
+-- Confirmation actions must not read the monthly report while this work is
+-- only partially written.
+CREATE TABLE IF NOT EXISTS ml_close_month_work (
+    period          TEXT PRIMARY KEY,
+    kind            TEXT NOT NULL,
+    action_key      TEXT NOT NULL,
+    owner           TEXT NOT NULL,
+    status          TEXT NOT NULL,       -- processing / completed / failed
+    error           TEXT,
+    updated_at      INTEGER NOT NULL
+);
 """
 
 
@@ -140,6 +186,500 @@ async def init_db() -> None:
         await db.commit()
 
 
+async def claim_unified_report_generation(
+    period: str,
+    owner: str,
+    expected_content_hash: str | None = None,
+    stale_after_seconds: int = 1800,
+) -> dict[str, Any]:
+    """Atomically claim one month for generation across service processes.
+
+    A failed claim can be retried immediately. A generating claim can only be
+    taken over after its lease is stale; the caller must still discover and
+    resume any existing Wiki node before copying a new template.
+    """
+    now = int(time.time())
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("BEGIN IMMEDIATE")
+        cur = await conn.execute(
+            "SELECT * FROM ml_unified_report_generation WHERE period = ?",
+            (period,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            await conn.execute(
+                """
+                INSERT INTO ml_unified_report_generation
+                    (period, status, owner, updated_at)
+                VALUES (?, 'generating', ?, ?)
+                """,
+                (period, owner, now),
+            )
+            await conn.commit()
+            return {"period": period, "status": "generating", "owner": owner, "claimed": True}
+
+        current = dict(row)
+        stale = current["status"] == "generating" and int(current["updated_at"] or 0) <= now - stale_after_seconds
+        changed_complete = (
+            current["status"] == "complete"
+            and expected_content_hash is not None
+            and current.get("content_hash") != expected_content_hash
+        )
+        if current["status"] in ("failed", "cancelled") or stale or changed_complete:
+            await conn.execute(
+                """
+                UPDATE ml_unified_report_generation
+                SET status = 'generating', owner = ?, content_hash = NULL,
+                    error = NULL, updated_at = ?
+                WHERE period = ?
+                """,
+                (owner, now, period),
+            )
+            await conn.commit()
+            return {**current, "status": "generating", "owner": owner, "claimed": True}
+
+        await conn.commit()
+        return {**current, "claimed": current["owner"] == owner and current["status"] == "generating"}
+
+
+async def get_unified_report_generation(period: str) -> dict[str, Any] | None:
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute(
+            "SELECT * FROM ml_unified_report_generation WHERE period = ?",
+            (period,),
+        )
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def cancel_unified_report_generation(period: str, reason: str) -> bool:
+    """Publish a cross-process cancellation before a reject waits on local locks."""
+    now = int(time.time())
+    async with aiosqlite.connect(DB_PATH, timeout=120) as conn:
+        cur = await conn.execute(
+            """
+            UPDATE ml_unified_report_generation
+            SET status = 'cancelled', error = ?, updated_at = ?
+            WHERE period = ? AND status IN ('generating', 'complete')
+            """,
+            (reason[:1000], now, period),
+        )
+        await conn.commit()
+        return cur.rowcount > 0
+
+
+@asynccontextmanager
+async def unified_report_finalization_guard(period: str, content_hash: str):
+    """Hold the cross-process DB write lock across the final Feishu state write.
+
+    Reject/recalculate/ad-failure paths publish cancellation through the same
+    SQLite database before writing their Feishu state, so they either cancel
+    first or are guaranteed to run after this finalization finishes.
+    """
+    conn = await aiosqlite.connect(DB_PATH, timeout=120)
+    try:
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("BEGIN IMMEDIATE")
+        cur = await conn.execute(
+            "SELECT status, content_hash FROM ml_unified_report_generation WHERE period = ?",
+            (period,),
+        )
+        row = await cur.fetchone()
+        ready = bool(
+            row
+            and row["status"] == "complete"
+            and row["content_hash"] == content_hash
+        )
+        yield ready
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+        raise
+    finally:
+        await conn.close()
+
+
+async def claim_ml_close_action(
+    period: str,
+    action_key: str,
+    owner: str,
+    stale_after_seconds: int = 1800,
+) -> dict[str, Any]:
+    """Claim a Feishu close action once across processes.
+
+    Completed keys are permanent for the month. Failed keys can be retried,
+    while an actively processing key can only be reclaimed after its lease is
+    stale.
+    """
+    now = int(time.time())
+    async with aiosqlite.connect(DB_PATH, timeout=120) as conn:
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("BEGIN IMMEDIATE")
+        cur = await conn.execute(
+            "SELECT * FROM ml_close_action WHERE period = ? AND action_key = ?",
+            (period, action_key),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            await conn.execute(
+                """
+                INSERT INTO ml_close_action
+                    (period, action_key, status, owner, updated_at)
+                VALUES (?, ?, 'processing', ?, ?)
+                """,
+                (period, action_key, owner, now),
+            )
+            await conn.commit()
+            return {
+                "period": period,
+                "action_key": action_key,
+                "status": "processing",
+                "owner": owner,
+                "claimed": True,
+            }
+
+        current = dict(row)
+        stale = (
+            current["status"] == "processing"
+            and int(current["updated_at"] or 0) <= now - stale_after_seconds
+        )
+        if current["status"] == "failed" or stale:
+            cur = await conn.execute(
+                "SELECT MAX(id) FROM ml_close_action WHERE period = ?",
+                (period,),
+            )
+            max_id_row = await cur.fetchone()
+            max_id = max_id_row[0] if max_id_row else None
+            if current["id"] != max_id:
+                await conn.commit()
+                return {**current, "status": "superseded", "claimed": False}
+            await conn.execute(
+                """
+                UPDATE ml_close_action
+                SET status = 'processing', owner = ?, error = NULL, updated_at = ?
+                WHERE period = ? AND action_key = ?
+                """,
+                (owner, now, period, action_key),
+            )
+            await conn.commit()
+            return {
+                **current,
+                "status": "processing",
+                "owner": owner,
+                "claimed": True,
+            }
+
+        await conn.commit()
+        return {**current, "claimed": False}
+
+
+async def complete_ml_close_action(period: str, action_key: str, owner: str) -> None:
+    now = int(time.time())
+    async with aiosqlite.connect(DB_PATH, timeout=120) as conn:
+        cur = await conn.execute(
+            """
+            UPDATE ml_close_action
+            SET status = 'completed', error = NULL, updated_at = ?
+            WHERE period = ? AND action_key = ?
+              AND status = 'processing' AND owner = ?
+            """,
+            (now, period, action_key, owner),
+        )
+        if cur.rowcount != 1:
+            await conn.rollback()
+            raise RuntimeError(f"monthly close action claim lost: {period} {action_key}")
+        await conn.commit()
+
+
+async def fail_ml_close_action(
+    period: str,
+    action_key: str,
+    owner: str,
+    error: str,
+) -> None:
+    now = int(time.time())
+    async with aiosqlite.connect(DB_PATH, timeout=120) as conn:
+        await conn.execute(
+            """
+            UPDATE ml_close_action
+            SET status = 'failed', error = ?, updated_at = ?
+            WHERE period = ? AND action_key = ?
+              AND status = 'processing' AND owner = ?
+            """,
+            (error[:1000], now, period, action_key, owner),
+        )
+        await conn.commit()
+
+
+async def discard_ml_close_action(period: str, action_key: str, owner: str) -> None:
+    """Remove a claim proven invalid before it performed any business write."""
+    async with aiosqlite.connect(DB_PATH, timeout=120) as conn:
+        await conn.execute(
+            """
+            DELETE FROM ml_close_action
+            WHERE period = ? AND action_key = ?
+              AND status = 'processing' AND owner = ?
+            """,
+            (period, action_key, owner),
+        )
+        await conn.commit()
+
+
+@asynccontextmanager
+async def ml_close_action_finalization_guard(
+    period: str,
+    action_key: str,
+    owner: str,
+    required_report_hash: str | None = None,
+    complete_on_success: bool = True,
+):
+    """Let only the latest distinct monthly action publish its final state.
+
+    The SQLite write lock is held across the Feishu state mutation. If a newer
+    action has already been claimed, an older action cannot overwrite it. If a
+    newer action arrives while this guard is held, it runs afterwards and
+    becomes the final decision.
+    """
+    conn = await aiosqlite.connect(DB_PATH, timeout=120)
+    try:
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("BEGIN IMMEDIATE")
+        cur = await conn.execute(
+            """
+            SELECT id, status, owner
+            FROM ml_close_action
+            WHERE period = ? AND action_key = ?
+            """,
+            (period, action_key),
+        )
+        row = await cur.fetchone()
+        cur = await conn.execute(
+            "SELECT MAX(id) FROM ml_close_action WHERE period = ?",
+            (period,),
+        )
+        max_id_row = await cur.fetchone()
+        max_id = max_id_row[0] if max_id_row else None
+        ready = bool(
+            row
+            and row["status"] == "processing"
+            and row["owner"] == owner
+            and row["id"] == max_id
+        )
+        if ready and required_report_hash is not None:
+            cur = await conn.execute(
+                """
+                SELECT status, content_hash
+                FROM ml_unified_report_generation
+                WHERE period = ?
+                """,
+                (period,),
+            )
+            report_row = await cur.fetchone()
+            ready = bool(
+                report_row
+                and report_row["status"] == "complete"
+                and report_row["content_hash"] == required_report_hash
+            )
+        yield ready
+        if ready and complete_on_success:
+            await conn.execute(
+                """
+                UPDATE ml_close_action
+                SET status = 'completed', error = NULL, updated_at = ?
+                WHERE period = ? AND action_key = ?
+                  AND status = 'processing' AND owner = ?
+                """,
+                (int(time.time()), period, action_key, owner),
+            )
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+        raise
+    finally:
+        await conn.close()
+
+
+async def claim_ml_close_month_work(
+    period: str,
+    kind: str,
+    action_key: str,
+    owner: str,
+    stale_after_seconds: int = 1800,
+) -> dict[str, Any]:
+    """Claim a long-running monthly write only if its action is still latest."""
+    now = int(time.time())
+    async with aiosqlite.connect(DB_PATH, timeout=120) as conn:
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("BEGIN IMMEDIATE")
+        cur = await conn.execute(
+            """
+            SELECT id, status, owner
+            FROM ml_close_action
+            WHERE period = ? AND action_key = ?
+            """,
+            (period, action_key),
+        )
+        action_row = await cur.fetchone()
+        cur = await conn.execute(
+            "SELECT MAX(id) FROM ml_close_action WHERE period = ?",
+            (period,),
+        )
+        max_id_row = await cur.fetchone()
+        max_id = max_id_row[0] if max_id_row else None
+        action_ready = bool(
+            action_row
+            and action_row["status"] == "processing"
+            and action_row["owner"] == owner
+            and action_row["id"] == max_id
+        )
+        if not action_ready:
+            await conn.commit()
+            return {"claimed": False, "status": "superseded"}
+
+        cur = await conn.execute(
+            "SELECT * FROM ml_close_month_work WHERE period = ?",
+            (period,),
+        )
+        row = await cur.fetchone()
+        current = dict(row) if row else None
+        active = bool(
+            current
+            and current["status"] == "processing"
+            and int(current["updated_at"] or 0) > now - stale_after_seconds
+        )
+        if active:
+            await conn.commit()
+            return {**current, "claimed": current["owner"] == owner}
+
+        await conn.execute(
+            """
+            INSERT INTO ml_close_month_work
+                (period, kind, action_key, owner, status, error, updated_at)
+            VALUES (?, ?, ?, ?, 'processing', NULL, ?)
+            ON CONFLICT(period) DO UPDATE SET
+                kind = excluded.kind,
+                action_key = excluded.action_key,
+                owner = excluded.owner,
+                status = 'processing',
+                error = NULL,
+                updated_at = excluded.updated_at
+            """,
+            (period, kind, action_key, owner, now),
+        )
+        await conn.commit()
+        return {
+            "period": period,
+            "kind": kind,
+            "action_key": action_key,
+            "owner": owner,
+            "status": "processing",
+            "claimed": True,
+        }
+
+
+async def get_active_ml_close_month_work(
+    period: str,
+    stale_after_seconds: int = 1800,
+) -> dict[str, Any] | None:
+    now = int(time.time())
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute(
+            "SELECT * FROM ml_close_month_work WHERE period = ?",
+            (period,),
+        )
+        row = await cur.fetchone()
+        if not row:
+            return None
+        current = dict(row)
+        if (
+            current["status"] == "processing"
+            and int(current["updated_at"] or 0) > now - stale_after_seconds
+        ):
+            return current
+        return None
+
+
+async def finish_ml_close_month_work(
+    period: str,
+    owner: str,
+    status: str,
+    error: str = "",
+) -> None:
+    if status not in ("completed", "failed"):
+        raise ValueError(f"invalid monthly work status: {status}")
+    async with aiosqlite.connect(DB_PATH, timeout=120) as conn:
+        await conn.execute(
+            """
+            UPDATE ml_close_month_work
+            SET status = ?, error = ?, updated_at = ?
+            WHERE period = ? AND owner = ? AND status = 'processing'
+            """,
+            (status, error[:1000], int(time.time()), period, owner),
+        )
+        await conn.commit()
+
+
+async def set_unified_report_target(
+    period: str,
+    owner: str,
+    wiki_token: str,
+    spreadsheet_token: str,
+    url: str,
+) -> None:
+    now = int(time.time())
+    async with aiosqlite.connect(DB_PATH) as conn:
+        cur = await conn.execute(
+            """
+            UPDATE ml_unified_report_generation
+            SET wiki_token = ?, spreadsheet_token = ?, url = ?, updated_at = ?
+            WHERE period = ? AND status = 'generating' AND owner = ?
+            """,
+            (wiki_token, spreadsheet_token, url, now, period, owner),
+        )
+        if cur.rowcount != 1:
+            await conn.rollback()
+            raise RuntimeError(f"monthly report generation claim lost: {period}")
+        await conn.commit()
+
+
+async def complete_unified_report_generation(
+    period: str,
+    owner: str,
+    content_hash: str,
+) -> None:
+    now = int(time.time())
+    async with aiosqlite.connect(DB_PATH) as conn:
+        cur = await conn.execute(
+            """
+            UPDATE ml_unified_report_generation
+            SET status = 'complete', content_hash = ?, error = NULL, updated_at = ?
+            WHERE period = ? AND status = 'generating' AND owner = ?
+            """,
+            (content_hash, now, period, owner),
+        )
+        if cur.rowcount != 1:
+            await conn.rollback()
+            raise RuntimeError(f"monthly report generation claim lost: {period}")
+        await conn.commit()
+
+
+async def fail_unified_report_generation(period: str, owner: str, error: str) -> None:
+    now = int(time.time())
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute(
+            """
+            UPDATE ml_unified_report_generation
+            SET status = 'failed', error = ?, updated_at = ?
+            WHERE period = ? AND status = 'generating' AND owner = ?
+            """,
+            (error[:1000], now, period, owner),
+        )
+        await conn.commit()
+
+
 async def set_ad_sync_failure(
     period: str,
     shop: str,
@@ -147,7 +687,7 @@ async def set_ad_sync_failure(
     failed_at: int | None = None,
 ) -> None:
     now = failed_at if failed_at is not None else time.time_ns()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=120) as db:
         await db.execute(
             """
             INSERT INTO ml_ad_sync_failure (period, shop, message, failed_at)
@@ -157,6 +697,14 @@ async def set_ad_sync_failure(
                 failed_at = excluded.failed_at
             """,
             (period, shop, message[:1000], now),
+        )
+        await db.execute(
+            """
+            UPDATE ml_unified_report_generation
+            SET status = 'cancelled', error = ?, updated_at = ?
+            WHERE period = ? AND status IN ('generating', 'complete')
+            """,
+            (f"advertising fetch failed: {shop}"[:1000], int(time.time()), period),
         )
         await db.commit()
 

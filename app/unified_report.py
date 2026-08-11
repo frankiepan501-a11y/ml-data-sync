@@ -13,12 +13,15 @@ import json
 import os
 import re
 import unicodedata
+import uuid
 import weakref
 from collections import defaultdict
 from typing import Any
 from urllib.parse import quote
 
 import httpx
+
+from app import db
 
 
 FEISHU = "https://open.feishu.cn/open-apis"
@@ -75,6 +78,10 @@ class ProductMappingError(RuntimeError):
 
 
 class ReportGenerationError(RuntimeError):
+    pass
+
+
+class ReportGenerationInProgressError(ReportGenerationError):
     pass
 
 
@@ -243,6 +250,7 @@ def resolve_product_mappings(
 
 
 def _formula(text: str) -> dict[str, str]:
+    # Feishu Sheets' values API represents a formula as this typed cell object.
     return {"type": "formula", "text": text}
 
 
@@ -258,6 +266,17 @@ def _sheet_scalar(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     return _text(value)
+
+
+def _sheet_cell_matches(actual: Any, expected: Any) -> bool:
+    if expected is None or expected == "":
+        return _text(actual) == ""
+    if isinstance(expected, (int, float)) and not isinstance(expected, bool):
+        try:
+            return abs(float(actual) - float(expected)) <= 1e-6
+        except (TypeError, ValueError):
+            return False
+    return _text(actual) == _text(expected)
 
 
 def _sort_key(record: dict[str, Any]) -> tuple[int, str]:
@@ -443,6 +462,17 @@ def prepare_report(
     }
 
 
+def report_content_hash(prepared: dict[str, Any]) -> str:
+    """Hash business inputs and ERP display mapping, excluding generation time."""
+    payload = {
+        "main_values": prepared["main_values"],
+        "source_values": prepared["source_values"],
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:16]
+
+
 async def _tenant_token(app_id: str, secret: str) -> str:
     if not secret:
         raise ReportGenerationError(f"Feishu secret missing for app {app_id}")
@@ -502,8 +532,16 @@ async def _list_bitable_records(token: str, app_token: str, table_id: str) -> li
 async def _load_sources() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     report_app_id = os.getenv("FEISHU_APP_ID", "cli_a9f6ae86fce8dbd8")
     report_secret = os.getenv("FEISHU_APP_SECRET", "")
-    product_app_id = os.getenv("ML_PRODUCT_FEISHU_APP_ID", "cli_a93785277ef8dcb0")
-    product_secret = os.getenv("ML_PRODUCT_FEISHU_APP_SECRET", "")
+    product_app_id = (
+        os.getenv("ML_PRODUCT_FEISHU_APP_ID")
+        or os.getenv("FEISHU_BITABLE_APP_ID")
+        or "cli_a93785277ef8dcb0"
+    )
+    product_secret = (
+        os.getenv("ML_PRODUCT_FEISHU_APP_SECRET")
+        or os.getenv("FEISHU_BITABLE_APP_SECRET")
+        or ""
+    )
     report_token = await _tenant_token(report_app_id, report_secret)
     product_token = await _tenant_token(product_app_id, product_secret)
     report_records = await _list_bitable_records(report_token, REPORT_APP_TOKEN, REPORT_TABLE_ID)
@@ -628,7 +666,7 @@ async def _find_existing_report(
             "sheets": sheets,
         }
         if marker.startswith(f"{MARKER_PREFIX}|COMPLETE|{period}|"):
-            return {**base, "complete": True}
+            return {**base, "complete": True, "content_hash": marker.rsplit("|", 1)[-1]}
         if marker == f"{MARKER_PREFIX}|IN_PROGRESS|{period}":
             return {**base, "complete": False}
         raise ReportGenerationError(f"同名报表已存在但不是本生成器产物，未覆盖：{title}")
@@ -779,27 +817,102 @@ async def _write_report(
         len(prepared["main_values"]),
     )
 
-    content_hash = hashlib.sha256(
-        json.dumps(prepared["summary"], ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()[:16]
+    main_last_row = len(prepared["main_values"])
+    source_last_row = len(prepared["source_values"])
+    check_last_row = len(check_values)
+    main_read = await _read_range(
+        token, spreadsheet_token, f"{main['sheetId']}!A1:AU{main_last_row}", "Formula"
+    )
+    source_read = await _read_range(
+        token, spreadsheet_token, f"{source['sheetId']}!A1:AW{source_last_row}", "Formula"
+    )
+    checks_read = await _read_range(
+        token, spreadsheet_token, f"{checks['sheetId']}!A1:T{check_last_row}", "Formula"
+    )
+    validate_report_readback(
+        main_read,
+        prepared["main_values"],
+        source_read,
+        prepared["source_values"],
+        checks_read,
+        check_values,
+    )
+
+    content_hash = report_content_hash(prepared)
     marker = f"{MARKER_PREFIX}|COMPLETE|{prepared['summary']['period']}|{content_hash}"
     await _write_range(token, spreadsheet_token, f"{checks['sheetId']}!E1:E1", [[marker]])
-
-    last_row = len(prepared["main_values"])
-    main_read = await _read_range(
-        token, spreadsheet_token, f"{main['sheetId']}!A1:AU{last_row}", "Formula"
-    )
     marker_read = await _read_range(
         token, spreadsheet_token, f"{checks['sheetId']}!E1:E1", "FormattedValue"
     )
-    if len(main_read) != last_row or main_read[0][:47] != REPORT_HEADERS:
-        raise ReportGenerationError("统一毛利报表写后回读失败：标题或行数不一致")
-    if any(len(row) < 7 or not _text(row[5]) or not _text(row[6]) for row in main_read[1:]):
-        raise ReportGenerationError("统一毛利报表写后回读失败：ERP品名或分类为空")
     actual_marker = _text(marker_read[0][0]) if marker_read and marker_read[0] else ""
     if actual_marker != marker:
         raise ReportGenerationError("统一毛利报表写后回读失败：完成标记不一致")
     return {"marker": marker, "content_hash": content_hash}
+
+
+def validate_report_readback(
+    actual_rows: list[list[Any]],
+    expected_rows: list[list[Any]],
+    actual_source_rows: list[list[Any]],
+    expected_source_rows: list[list[Any]],
+    actual_check_rows: list[list[Any]],
+    expected_check_rows: list[list[Any]],
+) -> None:
+    """Fail closed unless headers, row count, ERP display and every formula survived."""
+    if len(actual_rows) != len(expected_rows) or not actual_rows or actual_rows[0][:47] != REPORT_HEADERS:
+        raise ReportGenerationError("统一毛利报表写后回读失败：标题或行数不一致")
+    if any(len(row) < 7 or not _text(row[5]) or not _text(row[6]) for row in actual_rows[1:]):
+        raise ReportGenerationError("统一毛利报表写后回读失败：ERP品名或分类为空")
+
+    formula_mismatches: list[str] = []
+    value_mismatches: list[str] = []
+    for row_number, (actual, expected) in enumerate(zip(actual_rows[1:], expected_rows[1:]), start=2):
+        for column_index, expected_cell in enumerate(expected):
+            actual_cell = actual[column_index] if column_index < len(actual) else None
+            if isinstance(expected_cell, dict) and expected_cell.get("type") == "formula":
+                if _text(actual_cell) != _text(expected_cell.get("text")):
+                    formula_mismatches.append(f"{_column_letter(column_index + 1)}{row_number}")
+                continue
+            if not _sheet_cell_matches(actual_cell, expected_cell):
+                value_mismatches.append(f"{_column_letter(column_index + 1)}{row_number}")
+    if formula_mismatches:
+        preview = "、".join(formula_mismatches[:10])
+        more = f"，另有 {len(formula_mismatches) - 10} 个" if len(formula_mismatches) > 10 else ""
+        raise ReportGenerationError(f"统一毛利报表写后回读失败：公式未正确写入 {preview}{more}")
+    if value_mismatches:
+        preview = "、".join(value_mismatches[:10])
+        more = f"，另有 {len(value_mismatches) - 10} 个" if len(value_mismatches) > 10 else ""
+        raise ReportGenerationError(f"统一毛利报表写后回读失败：固定值未正确写入 {preview}{more}")
+
+    if (
+        len(actual_source_rows) != len(expected_source_rows)
+        or not actual_source_rows
+        or actual_source_rows[0][:49] != expected_source_rows[0][:49]
+    ):
+        raise ReportGenerationError("统一毛利报表写后回读失败：数据源标题或行数不一致")
+    for row_number, (actual, expected) in enumerate(
+        zip(actual_source_rows[1:], expected_source_rows[1:]), start=2
+    ):
+        if any(
+            column >= len(actual) or not _sheet_cell_matches(actual[column], expected[column])
+            for column in range(49)
+        ):
+            raise ReportGenerationError(f"统一毛利报表写后回读失败：数据源第 {row_number} 行不一致")
+
+    if (
+        len(actual_check_rows) != len(expected_check_rows)
+        or not actual_check_rows
+        or actual_check_rows[0][:5] != expected_check_rows[0][:5]
+    ):
+        raise ReportGenerationError("统一毛利报表写后回读失败：检查表标题、行数或进行中标记不一致")
+    for row_number, (actual, expected) in enumerate(
+        zip(actual_check_rows[1:], expected_check_rows[1:]), start=2
+    ):
+        if any(
+            column >= len(actual) or not _sheet_cell_matches(actual[column], expected[column])
+            for column in range(3)
+        ):
+            raise ReportGenerationError(f"统一毛利报表写后回读失败：检查表第 {row_number} 行不一致")
 
 
 async def generate(period: str, commit: bool = False) -> dict[str, Any]:
@@ -813,36 +926,65 @@ async def generate(period: str, commit: bool = False) -> dict[str, Any]:
     async with _generation_lock(period):
         token = await _report_token()
         existing = await _find_existing_report(token, period, month)
-        if existing and existing.get("complete"):
-            return {
-                "status": "ok",
-                "mode": "commit",
-                "period": period,
-                "month": month,
-                "deduped": True,
-                "wiki_token": existing["wiki_token"],
-                "spreadsheet_token": existing["spreadsheet_token"],
-                "url": existing["url"],
-            }
-
         report_records, maintenance_records, cost_records = await _load_sources()
         prepared = prepare_report(period, report_records, maintenance_records, cost_records)
         base = {"status": "ok", "mode": "commit", **prepared["summary"]}
-        target = existing or await _copy_or_resume_report(token, period, month)
-        if target.get("complete"):
+        expected_hash = report_content_hash(prepared)
+        owner = f"{os.getpid()}:{uuid.uuid4().hex}"
+        claim = await db.claim_unified_report_generation(period, owner, expected_hash)
+        if not claim.get("claimed"):
+            if claim.get("status") == "complete":
+                target = existing or claim
+                required = (target.get("wiki_token"), target.get("spreadsheet_token"), target.get("url"))
+                marker_matches = bool(
+                    existing
+                    and existing.get("complete")
+                    and existing.get("content_hash") == expected_hash
+                )
+                if claim.get("content_hash") == expected_hash and marker_matches and all(required):
+                    return {
+                        **base,
+                        "deduped": True,
+                        "content_hash": expected_hash,
+                        "wiki_token": target["wiki_token"],
+                        "spreadsheet_token": target["spreadsheet_token"],
+                        "url": target["url"],
+                    }
+                raise ReportGenerationError("月报生成记录与飞书完成标记不一致，已停止避免重复建表")
+            raise ReportGenerationInProgressError(f"{month} 统一毛利月报正在生成，请稍后重试")
+
+        try:
+            target = existing or await _copy_or_resume_report(token, period, month)
+            await db.set_unified_report_target(
+                period,
+                owner,
+                target["wiki_token"],
+                target["spreadsheet_token"],
+                target["url"],
+            )
+            if target.get("complete") and target.get("content_hash") == expected_hash:
+                await db.complete_unified_report_generation(period, owner, expected_hash)
+                return {
+                    **base,
+                    "deduped": True,
+                    "content_hash": expected_hash,
+                    "wiki_token": target["wiki_token"],
+                    "spreadsheet_token": target["spreadsheet_token"],
+                    "url": target["url"],
+                }
+            verification = await _write_report(token, target, prepared)
+            await db.complete_unified_report_generation(period, owner, verification["content_hash"])
             return {
                 **base,
-                "deduped": True,
+                "deduped": False,
                 "wiki_token": target["wiki_token"],
                 "spreadsheet_token": target["spreadsheet_token"],
                 "url": target["url"],
+                **verification,
             }
-        verification = await _write_report(token, target, prepared)
-        return {
-            **base,
-            "deduped": False,
-            "wiki_token": target["wiki_token"],
-            "spreadsheet_token": target["spreadsheet_token"],
-            "url": target["url"],
-            **verification,
-        }
+        except Exception as exc:
+            try:
+                await db.fail_unified_report_generation(period, owner, str(exc))
+            except Exception:
+                pass
+            raise
