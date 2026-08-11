@@ -53,6 +53,8 @@ def health():
         "ad_sync_failure_durable": True,
         "ad_sync_failure_restart_safe": True,
         "ad_sync_preview": True,
+        "ml_unified_report_generator": True,
+        "ml_product_mapping_fail_closed": True,
     }
 
 
@@ -1109,6 +1111,39 @@ async def ml_close_confirm(req: Request, action: str | None = None, month: str |
         return await ml_close.confirm_action(payload)
     except Exception as e:
         return {"status": "error", "exc": type(e).__name__, "msg": str(e), "traceback": traceback.format_exc()[:3000]}
+
+
+@app.post("/report/ml-unified-monthly", dependencies=[Depends(require_service_token)])
+async def ml_unified_monthly(month: str | None = None, period: str | None = None,
+                             commit: bool = False):
+    """Preview or replay the finance-approved 47-column ML monthly report.
+
+    Preview is read-only. Direct commit is allowed only for an already finance-confirmed
+    month; the finance button uses the generator internally before writing that final state.
+    """
+    from app import ml_close, unified_report
+
+    normalized_period, _ = ml_close.normalize_period(month, period)
+    if commit:
+        close_status = await ml_close.status_endpoint(period=normalized_period)
+        if close_status.get("state") != "财务已确认终稿":
+            raise HTTPException(
+                409,
+                f"{normalized_period} 尚未财务确认终稿；只允许 commit=false 预览。",
+            )
+    try:
+        return await unified_report.generate(normalized_period, commit=commit)
+    except unified_report.ProductMappingError as exc:
+        raise HTTPException(
+            409,
+            detail={
+                "error": "ERP_PRODUCT_MAPPING_FAILED",
+                "message": str(exc),
+                "issues": exc.issues,
+            },
+        ) from exc
+    except unified_report.ReportGenerationError as exc:
+        raise HTTPException(502, detail=f"月报生成失败：{exc}") from exc
 
 
 @app.post("/report/meitong-diag", dependencies=[Depends(require_service_token)])

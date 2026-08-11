@@ -778,9 +778,16 @@ def build_card(kind: str, summary: dict[str, Any], status_fields: dict[str, Any]
     return card
 
 
-def build_processed_card(month: str, result: str, actor: str = "", detail: str = "", ok: bool = True) -> dict[str, Any]:
+def build_processed_card(
+    month: str,
+    result: str,
+    actor: str = "",
+    detail: str = "",
+    ok: bool = True,
+    report_url: str = "",
+) -> dict[str, Any]:
     template = "grey" if ok else "red"
-    report_url = _report_url()
+    report_url = report_url or _report_url()
     return {
         "config": {"wide_screen_mode": True},
         "header": {"template": template, "title": _plain(f"✅ [FIN·P2] 美客多毛利已处理 · {month}")},
@@ -1297,17 +1304,76 @@ async def confirm_action(payload: dict[str, Any]) -> dict[str, Any]:
                 block_reason = f"广告失败状态读取失败：{type(e).__name__}"
             if latest_failed:
                 block_reason = _ad_failure_message(latest_failed)
+        if block_reason:
+            return await _blocked_confirmation(block_reason)
+
+        # 财务确认的交付物是统一格式月报。必须先生成并回读验证成功，才能把
+        # 月结状态写成“财务已确认终稿”；映射/API 失败时不能留下假终态。
+        try:
+            from app import unified_report
+
+            report = await unified_report.generate(period, commit=True)
+        except Exception as exc:
+            reason = f"月报生成失败：{exc}"
+            await _upsert_status(
+                period,
+                {"状态": "异常", "最后错误": reason[:1000], "最后按钮动作Key": ""},
+                tok,
+            )
+            return await _blocked_confirmation(reason)
+
+        async with _status_mutation_lock(period):
+            latest = await _get_status(period, tok) or {}
+            latest_fields = latest.get("fields") or {}
+            try:
+                latest_failed = await _open_ad_failures(period, latest_fields)
+            except Exception as e:
+                latest_failed = []
+                block_reason = f"广告失败状态读取失败：{type(e).__name__}"
+            if latest_failed:
+                block_reason = _ad_failure_message(latest_failed)
+            latest_state = _text(latest_fields.get("状态"))
+            retrying_generator_error = (
+                latest_state == "异常"
+                and _text(latest_fields.get("最后错误")).startswith("月报生成失败：")
+            )
+            if (
+                not block_reason
+                and latest_state not in ("运营已确认", "财务已确认终稿")
+                and not retrying_generator_error
+            ):
+                block_reason = f"当前月结状态为“{latest_state or '未知'}”，请先完成运营确认。"
             if not block_reason:
                 await _upsert_status(
                     period,
-                    {"状态": "财务已确认终稿", "财务确认人": actor, "财务确认时间": now_ms},
+                    {
+                        "状态": "财务已确认终稿",
+                        "财务确认人": actor,
+                        "财务确认时间": now_ms,
+                        "报表链接": report.get("url") or "",
+                        "最后错误": "",
+                    },
                     tok,
                 )
         if block_reason:
             return await _blocked_confirmation(block_reason)
-        processed = build_processed_card(month, "财务已确认终稿", actor, "月结终稿完成")
+        processed = build_processed_card(
+            month,
+            "财务已确认终稿",
+            actor,
+            "统一格式月报已生成并通过写后回读。",
+            report_url=report.get("url") or "",
+        )
         feedback = await patch_or_fallback(message_id, processed, chat_id) if patch else {}
-        return {"status": "ok", "action": action, "period": period, "state": "财务已确认终稿", "processed_card": processed, "feedback": feedback}
+        return {
+            "status": "ok",
+            "action": action,
+            "period": period,
+            "state": "财务已确认终稿",
+            "report": report,
+            "processed_card": processed,
+            "feedback": feedback,
+        }
 
     if action == "ml_profit_finance_reject":
         await _upsert_status(period, {"状态": "退回重算", "最后错误": "财务退回运营复核"}, tok)
