@@ -63,6 +63,7 @@ def health():
         "ml_month_order_detail_refreshed_20260907": True,
         "ml_month_ab_gate_persisted_20260907": True,
         "ml_month_refresh_clock_skew_20260907": True,
+        "ml_month_detail_failure_visible_20260907": True,
     }
 
 
@@ -906,6 +907,7 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
         cache_hits = 0
         new_fetches = 0
         capped = False
+        detail_failures: list[dict] = []
         for pack in packs:
             if capped:
                 break
@@ -944,8 +946,10 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
                     await db.cache_put_order(int(order_id), seller_id, detail)
                 elif rd.status_code == 429:
                     skipped_429 += 1
+                    detail_failures.append({"order_id": int(order_id), "status": 429})
                 else:
                     skipped_other += 1
+                    detail_failures.append({"order_id": int(order_id), "status": rd.status_code})
 
     # 3. aggregate by seller_sku
     by_sku: dict[str, dict] = {}
@@ -1004,6 +1008,7 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
         "capped": capped,
         "skipped_429": skipped_429,
         "skipped_other": skipped_other,
+        "detail_failures": detail_failures,
         "unique_skus": len(rows),
         "rows": rows,
         "_platform_order_ids": platform_order_ids,
@@ -2369,6 +2374,7 @@ async def admin_backfill_orders(seller_id: int, recent_n: int = 200, parent_user
             "new_fetches": agg.get("new_fetches"),
             "skipped_429": agg.get("skipped_429"),
             "skipped_other": agg.get("skipped_other"),
+            "detail_failures": agg.get("detail_failures"),
             "capped": agg.get("capped"),
             "note": "Repeat until new_fetches=0 & capped=false, then /report/sync-feishu-monthly."}
 
