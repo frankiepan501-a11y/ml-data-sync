@@ -33,3 +33,19 @@
 
 - 本土 1 店的 OAuth 授权已失效；该店目前不在活跃月结店铺中，本次不重新授权。
 - n8n Code 节点里的服务认证值仍应迁移到 credential 并轮换；这是独立安全整改，不与本次数据修复混做。
+
+## 生产结果（2026-09-07）
+
+- 最终部署 commit：`c02abdd9f7f3eb422fe62934fe5ce08af1cb8f9d`；`/health` 标记 `ml_month_ab_gate_strict_20260907=true`。
+- 月度 n8n：`9ZvARULB0wIp19yp`，active，8 节点，版本 `e1d97580-cf71-47e8-8c18-f88bd92c40c7`。
+- CBT n8n：`j5I4vcjwarGgols0`，active，3 节点，版本 `a8d9d9e6-efa8-4567-a78e-a991d4671c92`。
+- Base 旧版 65 行已迁到 `month_2026-08_original_20260907`；当前修正版 62 行，未静默覆盖旧证据。
+- CBT：官方导出 B 与修复计算 A 的件数、营收、佣金、物流、VAT、退款、广告、Full 仓储费均已对账通过。
+- 巴西：平台目标月 710 单详情，生成 6 行汇总；本土3店：平台目标月 1,014 单详情，生成 36 行汇总。
+- 生产审计回读：`state=退回重算`、`ready_for_finance=false`、`ab_verified=false`、`next_card=none`。缺少本土两店官方导出 B 时，系统不会自动放行。
+- 完整测试：92 passed。财务证据包：`D:/Documents/财务与资产/outputs/mercadolibre-september-repair-20260907/美客多2026-08修复对账.xlsx`。
+
+## 尚未完成
+
+- P0：取得巴西、本土3店 2026-08 官方订单/广告/账单导出，逐字段完成 A/B 对账。
+- 对账通过前不得显式传 `ab_verified=true`，不得更新公司汇总或将本月标成财务可用。
