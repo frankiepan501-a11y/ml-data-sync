@@ -62,6 +62,7 @@ def health():
         "ml_month_ab_gate_strict_20260907": True,
         "ml_month_order_detail_refreshed_20260907": True,
         "ml_month_ab_gate_persisted_20260907": True,
+        "ml_month_refresh_clock_skew_20260907": True,
     }
 
 
