@@ -18,7 +18,8 @@
 
 - `app/cbt_ingest.py`：三类官方工作簿内容期间校验；订单从真实首行读取，并以通过期间校验后的整份官方导出作为 B 口径（保留官方文件内的时区边界行）；修正版逐 SKU、逐原币/RMB 字段回读；旧版改到独立历史周期标签保留，不删除。
 - `app/ml_close.py`：处于“退回重算”的月份，定时成本审计不能自动推进；只有 A/B 对账完成后的显式 `ab_verified=true` 才能解除。
-- `app/main.py`：CBT 校验失败返回非 2xx；本土与 CBT 分别使用正确的日期参数；巴西/墨西哥按当地月界；正式同步无缓存时返回 422。目标月订单详情按单次固定 cutoff 强制刷新，服务端拒绝未来 cutoff；HTTP 206 的有效订单载荷按 2xx 接受，非 2xx 返回失败订单号与状态。
+- `app/main.py`：CBT 校验失败返回非 2xx；本土与 CBT 分别使用正确的日期参数；巴西/墨西哥按当地月界；正式同步无缓存时返回 422。目标月订单详情按单次固定 cutoff 强制刷新，服务端拒绝未来 cutoff；HTTP 206 必须通过财务字段完整性校验。领星采购成本缺失时在 Base 写入前停止并保留旧行，预演显式返回缺失 SKU。
+- `app/ml_close.py`：A/B 通过结果绑定报表内容摘要；销售、广告、采购或物流成本重写前撤销旧结果；统一月报 `commit=true` 二次核对当前版本、A/B 与财务就绪状态。
 - `ops/repair_ml_monthly_workflows.py`：对两条生产 n8n 工作流执行完整 GET、定点修改、完整 PUT 和回读 hash 核验。
 - `ops/update_ml_close_workflows.py`：同步修改重建器，防止以后重建工作流时把 CBT 显式月份修复覆盖掉。
 
@@ -36,14 +37,15 @@
 
 ## 生产结果（2026-09-07）
 
-- 最终部署 commit：`36a64f6`；`/health` 的 A/B 锁、详情强制刷新、时钟偏差保护和 HTTP 206 兼容标记均为 true。
-- 月度 n8n：`9ZvARULB0wIp19yp`，active，8 节点，版本 `c6cec72f-5365-47e9-9323-09c51959e217`。
+- 最终部署关键 commit：`4ff8150`（财务字段/A-B 版本闸）、`d35e41c`（采购成本拒写）、`b777624`（健康标记）；n8n 重试 commit `b7dbf15`。
+- 月度 n8n：`9ZvARULB0wIp19yp`，active，8 节点，版本 `610a941e-e799-4448-aff3-7a045e3fde3c`。
 - CBT n8n：`j5I4vcjwarGgols0`，active，3 节点，版本 `a8d9d9e6-efa8-4567-a78e-a991d4671c92`。
 - Base 旧版 65 行已迁到 `month_2026-08_original_20260907`；当前修正版 62 行，未静默覆盖旧证据。
 - CBT：官方导出 B 与修复计算 A 的件数、营收、佣金、物流、VAT、退款、广告、Full 仓储费均已对账通过。
 - 巴西：平台目标月 710/710 单详情强制刷新完成，生成 6 行汇总；本土3店：平台目标月 1,014/1,014 单详情强制刷新完成，生成 36 行汇总。
 - 生产审计回读：`state=退回重算`、`ready_for_finance=false`、`ab_verified=false`、`next_card=none`。缺少本土两店官方导出 B 时，系统不会自动放行。
-- 完整测试：99 passed。财务证据包：`D:/Documents/财务与资产/outputs/mercadolibre-september-repair-20260907/美客多2026-08修复对账.xlsx`，SHA256=`90A76F1A20613995418F3AD8765B40BB00A3BCF515ACEFCA9520FB5330B33735`。
+- 本土3店首次重写后审计发现 30 行采购成本缺失并导致毛利虚高；月结未放行。新增拒写保护后，预演确认领星产品 553 个、采购缺口 0，再次重写 36 行，最终采购缺口 0、全额毛利 RMB 43,892.39。
+- 完整测试：103 passed。财务证据包：`D:/Documents/财务与资产/outputs/mercadolibre-september-repair-20260907/美客多2026-08修复对账.xlsx`，SHA256=`207D0A71CA01556992FA53B08AFE0F5BA4E6AA5188B6E77903CA62CBBB5D61E8`。
 
 ## 尚未完成
 
