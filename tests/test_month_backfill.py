@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, patch
 
 from fastapi import BackgroundTasks, HTTPException
 
-from app import main
+from app import main, ml_close
 
 
 class MonthBackfillTests(unittest.IsolatedAsyncioTestCase):
@@ -12,6 +12,7 @@ class MonthBackfillTests(unittest.IsolatedAsyncioTestCase):
         response = SimpleNamespace(status_code=200, json=lambda: {"results": [], "paging": {"total": 0}})
         with (
             patch.object(main.db, "get_token", AsyncMock(return_value={"access_token": "x", "app_key": "local_br"})),
+            patch.object(main.db, "cache_list_orders_for_month", AsyncMock(return_value=[])),
             patch.object(main, "_ml_get", AsyncMock(return_value=response)) as request,
         ):
             await main._report_sku_recent_impl(
@@ -31,6 +32,7 @@ class MonthBackfillTests(unittest.IsolatedAsyncioTestCase):
         response = SimpleNamespace(status_code=200, json=lambda: {"results": [], "paging": {"total": 0}})
         with (
             patch.object(main.db, "get_token", AsyncMock(return_value={"access_token": "x", "app_key": "cbt"})),
+            patch.object(main.db, "cache_list_orders_for_month", AsyncMock(return_value=[])),
             patch.object(main, "_ml_get", AsyncMock(return_value=response)) as request,
         ):
             await main._report_sku_recent_impl(
@@ -101,6 +103,16 @@ class MonthBackfillTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(HTTPException) as raised:
                 main.sync_meitong_cost("month_2026-08", commit=True)
         self.assertEqual(raised.exception.status_code, 502)
+
+    def test_rejected_month_stays_blocked_until_ab_is_explicitly_verified(self):
+        self.assertEqual(
+            ml_close._close_state(True, False, "退回重算", ""),
+            ("退回重算", "none"),
+        )
+        self.assertEqual(
+            ml_close._close_state(True, False, "退回重算", "", ab_verified=True),
+            ("待运营确认", "ops_final"),
+        )
 
 
 if __name__ == "__main__":

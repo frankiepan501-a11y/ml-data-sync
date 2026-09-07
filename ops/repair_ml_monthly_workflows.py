@@ -83,8 +83,8 @@ for (const seller_id of sellers) {{
     if (!response || response.status !== 'backfilled') {{
       throw new Error(`ML month backfill failed seller=${{seller_id}} month=${{month}} response=${{JSON.stringify(response).slice(0,300)}}`);
     }}
-    results.push({{seller_id, attempt, platform_total: response.platform_total, window_orders: response.window_orders, orders_with_detail: response.orders_with_detail, new_fetches: response.new_fetches, skipped_429: response.skipped_429, skipped_other: response.skipped_other, capped: response.capped}});
-    if (Number.isInteger(response.platform_total) && response.new_fetches === 0 && response.capped === false && (response.skipped_429 || 0) === 0 && (response.skipped_other || 0) === 0 && response.window_orders === response.platform_total && response.orders_with_detail === response.platform_total) {{
+    results.push({{seller_id, attempt, platform_total: response.platform_total, window_orders: response.window_orders, orders_with_detail: response.orders_with_detail, cached_month_unique: response.cached_month_unique, new_fetches: response.new_fetches, skipped_429: response.skipped_429, skipped_other: response.skipped_other, capped: response.capped}});
+    if (Number.isInteger(response.platform_total) && response.new_fetches === 0 && response.capped === false && (response.skipped_429 || 0) === 0 && (response.skipped_other || 0) === 0 && response.window_orders === response.platform_total && response.cached_month_unique === response.platform_total) {{
       completed = true;
       break;
     }}
@@ -210,12 +210,8 @@ def _safe_hash(workflow: dict) -> str:
     # n8n mutates versionId/updatedAt and other server-owned metadata on every PUT.
     # Only hash the fields this script owns and sends back.
     safe = copy.deepcopy(_put_body(workflow))
-    for node in safe.get("nodes", []):
-        parameters = node.get("parameters") or {}
-        if "headerParameters" in parameters:
-            parameters["headerParameters"] = "[REDACTED]"
-        if node.get("name") == "Backfill 本土店 (own-token)":
-            parameters["jsCode"] = re.sub(r"(?m)^\s*const tok\s*=.*$", "const tok = '[REDACTED]';", parameters.get("jsCode", ""))
+    # Secrets are included in the digest so an accidental credential rewrite is
+    # detectable, but only the irreversible digest is ever printed.
     encoded = json.dumps(safe, ensure_ascii=False, sort_keys=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -260,7 +256,11 @@ def commit_one(prepared: dict) -> dict:
             "no_op": True,
         })
         return summary
-    if current.get("versionId") != before.get("versionId") or _safe_hash(current) != _safe_hash(before):
+    if (
+        current.get("versionId") != before.get("versionId")
+        or _safe_hash(current) != _safe_hash(before)
+        or bool(current.get("active")) != bool(before.get("active"))
+    ):
         raise RuntimeError(f"workflow {workflow_id} changed after review; aborting PUT")
     written = _request("PUT", f"/workflows/{workflow_id}", _put_body(patched))
     if before.get("active") and not written.get("active"):

@@ -205,12 +205,14 @@ def _num(r, i):
 
 
 def _parse_orders(data: bytes, month: str):
-    start, end = _month_bounds(month)
     wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     ws = wb["Orders US"] if "Orders US" in wb.sheetnames else wb.worksheets[0]
+    # The selected workbook has already passed target-month evidence validation.
+    # Treat the official export itself as source B, including its timezone boundary
+    # rows (for example Jul-31 displayed in an August export).
     rows = [
         row for row in ws.iter_rows(min_row=7, max_row=ws.max_row, values_only=True)
-        if (parsed := _parse_date(row[2] if len(row) > 2 else None)) and start <= parsed <= end
+        if _parse_date(row[2] if len(row) > 2 else None)
     ]
     wb.close()
     listing2sku = {}
@@ -437,10 +439,15 @@ async def run(month: str, commit: bool = False, fx: float = 6.8628,
         raise RuntimeError("CBT 飞书安全生成超过单批 500 行限制；旧数据未修改")
 
     verify_fields = (
-        "订单数", "件数", "营收(原币)", "ML佣金(原币)", "物流费(原币)",
+        "订单数", "件数", "我的汇率", "客单价(原币)",
+        "营收(原币)", "营收(RMB)", "ML佣金(原币)", "ML佣金(RMB)",
+        "物流费(原币)", "物流费(RMB)",
         "VAT估算(原币)", "退款金额(原币)", "广告费(原币)",
-        "采购成本(RMB)", F_FULL, "头程成本(RMB)", "海外仓成本(RMB)",
+        "VAT估算(RMB)", "退款金额(RMB)", "广告费(RMB)",
+        "卖家折扣(原币)", "卖家折扣(RMB)", "采购成本(RMB)",
+        "简易毛利(RMB)", F_FULL, "头程成本(RMB)", "海外仓成本(RMB)",
     )
+    verify_text_fields = ("SKU", "平台", "店铺", "周期", "币种", "商品标题")
 
     def _verify_items(items, phase):
         if len(items) != len(fresh_records):
@@ -458,6 +465,11 @@ async def run(month: str, commit: bool = False, fx: float = 6.8628,
             raise RuntimeError(f"CBT 飞书{phase}失败：SKU 集合不一致")
         for sku, expected_fields in expected_by_sku.items():
             actual_fields = actual_by_sku[sku]
+            for field_name in verify_text_fields:
+                if _txt(actual_fields.get(field_name)) != _txt(expected_fields.get(field_name)):
+                    raise RuntimeError(
+                        f"CBT 飞书{phase}失败：SKU={sku} field={field_name} 文本不一致"
+                    )
             for field_name in verify_fields:
                 expected = float(expected_fields.get(field_name) or 0)
                 actual = float(actual_fields.get(field_name) or 0)
@@ -550,16 +562,16 @@ async def run(month: str, commit: bool = False, fx: float = 6.8628,
 
         created_id_set = set(created_ids)
 
-        pre_archive = _scope(await _bitable_all(tok))
-        created_items = [item for item in pre_archive if item.get("record_id") in created_id_set]
         try:
+            pre_archive = _scope(await _bitable_all(tok))
+            created_items = [item for item in pre_archive if item.get("record_id") in created_id_set]
             _verify_items(created_items, "写入前核验")
-        except RuntimeError as verify_error:
+        except Exception as verify_error:
             try:
                 await _delete_checked(created_ids, "写入前核验回滚")
             except RuntimeError as rollback_error:
                 raise RuntimeError(f"{verify_error}；且新行回滚失败：{rollback_error}") from verify_error
-            raise
+            raise RuntimeError(f"CBT 飞书写入前回读/核验失败：{verify_error}；新行已回滚") from verify_error
 
         existing_ids = [item.get("record_id") for item in existing_items if item.get("record_id")]
         if existing_ids:

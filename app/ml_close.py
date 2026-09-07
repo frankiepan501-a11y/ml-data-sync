@@ -220,6 +220,7 @@ def _close_state(
     has_cost_gaps: bool,
     prior_state: str,
     last_error: str,
+    ab_verified: bool = False,
 ) -> tuple[str, str]:
     if last_error:
         return "异常", "error"
@@ -227,6 +228,8 @@ def _close_state(
         return "待数据同步", "instruction"
     if has_cost_gaps:
         return "成本缺失待补", "cost_gap"
+    if prior_state == "退回重算" and not ab_verified:
+        return "退回重算", "none"
     if prior_state in ("运营已确认", "财务已确认终稿"):
         return prior_state, "none"
     return "待运营确认", "ops_final"
@@ -497,6 +500,7 @@ async def audit(
     commit: bool = False,
     run_cost_preview: bool = True,
     cost_summary: dict[str, Any] | None = None,
+    ab_verified: bool = False,
 ) -> dict[str, Any]:
     period, month = normalize_period(month, period)
     tok = await _tenant_token()
@@ -576,7 +580,9 @@ async def audit(
         cost_failure = _text(cost_summary.get("msg")) or json.dumps(cost_summary, ensure_ascii=False)[:500]
         base_error = f"{base_error}；{cost_failure}" if base_error else cost_failure
     last_error = _with_ad_failure(base_error, prior_failed_ad_shops)
-    state, next_card = _close_state(bool(rows), bool(purchase_gaps or freight_gaps), prior_state, last_error)
+    state, next_card = _close_state(
+        bool(rows), bool(purchase_gaps or freight_gaps), prior_state, last_error, ab_verified
+    )
 
     result = {
         "status": "ok" if not last_error else "error",
@@ -617,6 +623,7 @@ async def audit(
         "_base_error": base_error,
         "last_error": last_error,
         "failed_ad_shops": prior_failed_ad_shops,
+        "ab_verified": ab_verified,
     }
 
     if commit:
@@ -1195,6 +1202,7 @@ async def recalc_cost(
     period: str | None = None,
     commit: bool = True,
     audit_commit: bool = True,
+    ab_verified: bool = False,
 ) -> dict[str, Any]:
     period, month = normalize_period(month, period)
     cost = await anyio.to_thread.run_sync(meitong_cost.run, period, 12, commit)
@@ -1203,6 +1211,7 @@ async def recalc_cost(
         commit=audit_commit,
         run_cost_preview=False,
         cost_summary=cost,
+        ab_verified=ab_verified,
     )
     return {"status": "ok", "period": period, "month": month, "cost_summary": cost, "audit": summary}
 

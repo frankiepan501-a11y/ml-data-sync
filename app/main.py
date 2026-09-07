@@ -690,7 +690,13 @@ async def cbt_ingest(month: str, commit: bool = False, fx: float = 6.8628,
             from app import meitong_cost, ml_close
             period = f"month_{month}"
             cost = await run_in_threadpool(meitong_cost.run, period, 12, True)
-            close = await ml_close.audit(period=period, commit=True, run_cost_preview=False, cost_summary=cost)
+            close = await ml_close.audit(
+                period=period,
+                commit=True,
+                run_cost_preview=False,
+                cost_summary=cost,
+                ab_verified=True,
+            )
             result["post_ingest"] = {"sync_meitong_cost": cost, "ml_close_audit": close}
         return result
     except HTTPException:
@@ -958,12 +964,17 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
                 cell["last_seen"] = max(cell["last_seen"] or dc, dc)
 
     rows = sorted(by_sku.values(), key=lambda x: x["revenue_total"], reverse=True)
+    cached_month_unique = None
+    if windowed:
+        cached_month_rows = await db.cache_list_orders_for_month(seller_id, date_from[:7])
+        cached_month_unique = len({int(item["order_id"]) for item in cached_month_rows})
     return {
         "seller_id": seller_id,
         "recent_n_requested": recent_n,
         "packs_returned": len(packs),
         "platform_total": platform_total,
         "orders_with_detail": len(order_details),
+        "cached_month_unique": cached_month_unique,
         "cache_hits": cache_hits,
         "new_fetches": new_fetches,
         "capped": capped,
@@ -1087,23 +1098,36 @@ def sync_meitong_cost(period: str, months: int = 12, commit: bool = False):
 
 @app.post("/report/ml-close/audit", dependencies=[Depends(require_service_token)])
 async def ml_close_audit(month: str | None = None, period: str | None = None,
-                         commit: bool = False, run_cost_preview: bool = True):
+                         commit: bool = False, run_cost_preview: bool = True,
+                         ab_verified: bool = False):
     """Audit ML monthly close state and optionally upsert the close status table."""
     import traceback
     from app import ml_close
     try:
-        return await ml_close.audit(month=month, period=period, commit=commit, run_cost_preview=run_cost_preview)
+        return await ml_close.audit(
+            month=month,
+            period=period,
+            commit=commit,
+            run_cost_preview=run_cost_preview,
+            ab_verified=ab_verified,
+        )
     except Exception as e:
         return {"status": "error", "exc": type(e).__name__, "msg": str(e), "traceback": traceback.format_exc()[:3000]}
 
 
 @app.post("/report/ml-close/recalc-cost", dependencies=[Depends(require_service_token)])
-async def ml_close_recalc_cost(month: str | None = None, period: str | None = None, commit: bool = True):
+async def ml_close_recalc_cost(month: str | None = None, period: str | None = None,
+                               commit: bool = True, ab_verified: bool = False):
     """Recalculate Meitong/Mokeduo/Sanmu cost, then run close audit."""
     import traceback
     from app import ml_close
     try:
-        return await ml_close.recalc_cost(month=month, period=period, commit=commit)
+        return await ml_close.recalc_cost(
+            month=month,
+            period=period,
+            commit=commit,
+            ab_verified=ab_verified,
+        )
     except Exception as e:
         return {"status": "error", "exc": type(e).__name__, "msg": str(e), "traceback": traceback.format_exc()[:3000]}
 
@@ -2274,6 +2298,7 @@ async def admin_backfill_orders(seller_id: int, recent_n: int = 200, parent_user
             "window_orders": agg.get("packs_returned"),
             "platform_total": agg.get("platform_total"),
             "orders_with_detail": agg.get("orders_with_detail"),
+            "cached_month_unique": agg.get("cached_month_unique"),
             "cache_hits": agg.get("cache_hits"),
             "new_fetches": agg.get("new_fetches"),
             "skipped_429": agg.get("skipped_429"),

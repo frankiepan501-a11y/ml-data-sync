@@ -179,7 +179,7 @@ class CbtIngestPeriodSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["totals"]["units"], 3)
         self.assertEqual(result["totals"]["K"], 30)
 
-    async def test_orders_parser_includes_first_data_row_and_excludes_prior_month_boundary(self):
+    async def test_orders_parser_includes_first_data_row_and_official_export_boundary(self):
         workbook = openpyxl.load_workbook(io.BytesIO(_orders_file("2026-08", "AUG-SKU")))
         sheet = workbook.active
         row = [None] * 73
@@ -200,11 +200,12 @@ class CbtIngestPeriodSafetyTests(unittest.IsolatedAsyncioTestCase):
 
         rows, _listing_map = cbt_ingest._parse_orders(data, "2026-08")
 
-        self.assertEqual(set(rows), {"AUG-SKU"})
+        self.assertEqual(set(rows), {"AUG-SKU", "BOUNDARY-SKU"})
         self.assertEqual(rows["AUG-SKU"]["orders"], 3)
         self.assertEqual(rows["AUG-SKU"]["units"], 3)
         self.assertEqual(rows["AUG-SKU"]["K"], 30)
-        self.assertNotIn("BOUNDARY-SKU", rows)
+        self.assertEqual(rows["BOUNDARY-SKU"]["units"], 9)
+        self.assertEqual(rows["BOUNDARY-SKU"]["K"], 99)
 
     async def test_run_rejects_month_when_any_required_export_does_not_match(self):
         files = [
