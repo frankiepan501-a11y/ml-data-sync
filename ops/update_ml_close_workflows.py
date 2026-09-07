@@ -136,24 +136,23 @@ def update_cbt_ingest() -> None:
     sched = trigger(wf)
     nodes = [
         sched,
-        http_node("cbt-ingest", "CBT ingest", 500, 300, "https://ml-sync.zeabur.app/report/cbt-ingest?commit=true", 300000),
         code_node(
-            "build-next-card",
-            "Build next card request",
-            740,
+            "build-target-month",
+            "Build target month",
+            380,
             300,
-            """const j = $input.first().json;
-const audit = j.post_ingest?.ml_close_audit || {};
-const period = audit.period || (j.month ? `month_${j.month}` : '');
-const kind = audit.next_card || 'cost_gap';
-return [{ json: { period, kind, url: `https://ml-sync.zeabur.app/report/ml-close/card?period=${encodeURIComponent(period)}&kind=${encodeURIComponent(kind)}&send=true` } }];""",
+            """const now = new Date(Date.now() + 8 * 3600 * 1000);
+const d = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+const month = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+return [{ json: { month } }];""",
         ),
-        http_node("send-next-card", "Send next card", 980, 300, "={{$json.url}}", 180000),
+        # Recurring execution only validates that the three official files match
+        # the target month. A controlled A/B check is required before commit.
+        http_node("cbt-ingest", "CBT ingest", 560, 300, "=https://ml-sync.zeabur.app/report/cbt-ingest?month={{$json.month}}&commit=false", 300000),
     ]
     connections = {
-        sched["name"]: {"main": [[{"node": "CBT ingest", "type": "main", "index": 0}]]},
-        "CBT ingest": {"main": [[{"node": "Build next card request", "type": "main", "index": 0}]]},
-        "Build next card request": {"main": [[{"node": "Send next card", "type": "main", "index": 0}]]},
+        sched["name"]: {"main": [[{"node": "Build target month", "type": "main", "index": 0}]]},
+        "Build target month": {"main": [[{"node": "CBT ingest", "type": "main", "index": 0}]]},
     }
     put_wf(wf, nodes, connections)
 

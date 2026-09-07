@@ -36,7 +36,7 @@ ML 4+ 店铺 OAuth tokens
   飞书多维表格「跨平台 SKU 月销表」
         ▲
         │
-  n8n 月度 cron（每月 1 号 09:00 BJ）
+  n8n 月度 cron（每月 2 号 02:00 BJ，本土店）
 ```
 
 ## 技术栈
@@ -86,7 +86,16 @@ uvicorn app.main:app --reload --port 8000
 - `GET|POST /report/ml-close/status`：给全渠道汇总器做 gate，只有 `运营已确认` 或 `财务已确认终稿` 才允许放行财务终稿。
 - `POST /report/ml-close/confirm`：处理飞书按钮回调，并把原卡 PATCH 成结果态。
 
-CBT-FULL 仍以官方导出 3 文件为准；本土店和巴西店走 ML API/cache，不要求运营上传。`/report/cbt-ingest?commit=true` 成功后会自动触发 `sync-meitong-cost(commit=true)` 和月结审计，避免 CBT 入表后成本状态停在旧版本。
+CBT-FULL 仍以官方导出 3 文件为准；本土店和巴西店走 ML API/cache，不要求运营上传。`/report/cbt-ingest?month=YYYY-MM&commit=false` 必须显式传月份，定时任务只校验三份文件的业务期间，不自动覆盖数据。人工完成 A/B 对账后，才可用 `commit=true&preserve_existing_as=month_YYYY-MM_<历史标签>` 生成修正版；旧行会改到历史标签保留，不会删除。只有显式 `finalize=true` 才会继续成本与月结审计。
+
+本土店月度补数只处理当前活跃的巴西店 `2378517428` 和本土 3 店 `3383185411`，分别用站点当地 `-03:00` / `-06:00` 的自然月边界。只有平台月度订单数与已缓存明细数一致、无限流、无其他明细失败时，才进入飞书写入。
+
+### 2026-09-07 月度取数串月与漏月末修复
+
+- 问题：CBT 只按“最近修改”选文件，可将 7 月数据写成 8 月；本土店在当地月末未结束时运行，且月份参数用错字段名，会被 ML 静默忽略并扫全历史。
+- 修复：CBT 按 Orders/广告/账单工作簿内容核对目标月，任一不匹配即停止；写入改为整个 `CBT + month` 安全替换并回读。本土店恢复 `/orders/search` 要求的 `order.date_created.*` 参数，按站点当地月界补齐，定时改为北京时间每月 2 号 02:00。
+- 防复发：只保留两家活跃本土店；不再吞掉 HTTP/业务失败；补数未收敛或平台数与缓存明细数不一致时阻断月结。
+- 验证：单元测试覆盖 CBT 跨月拒绝、旧 SKU 残留清理、飞书回读不一致回滚、本土/CBT 两套日期参数、当地时区边界和 n8n 完整工作流修复。
 
 ### 2026-07-07 广告费修复记录
 

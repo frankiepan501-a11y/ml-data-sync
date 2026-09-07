@@ -55,6 +55,7 @@ def health():
         "ad_sync_preview": True,
         "ml_unified_report_generator": True,
         "ml_product_mapping_fail_closed": True,
+        "ml_month_period_safe_20260907": True,
     }
 
 
@@ -664,27 +665,42 @@ async def cbt_pnl_api(seller_id: int, month: str, parent_user_id: int = 15025208
 
 
 @app.post("/report/cbt-ingest", dependencies=[Depends(require_service_token)])
-async def cbt_ingest(month: str | None = None, commit: bool = False, fx: float = 6.8628,
-                     folder_token: str | None = None):
+async def cbt_ingest(month: str, commit: bool = False, fx: float = 6.8628,
+                     folder_token: str | None = None,
+                     preserve_existing_as: str | None = None,
+                     finalize: bool = False):
     """CBT-FULL 官方导出(B)解析 → 按SKU update 飞书报表(task3云化, 2026-06-18).
     俊辉每月把3导出(Orders+账单+广告)传飞书云盘文件夹(env CBT_EXPORT_FOLDER_TOKEN), 本端点下载解析.
-    month 缺省=上月. 默认 commit=false dry-run; commit=true 才写飞书(保留美通头程/海外仓列, 全额毛利是公式不写)."""
-    import datetime, traceback
+    month 必须显式传入. 默认 commit=false dry-run; commit=true 才写飞书。
+    存在不同的旧版时，必须传 preserve_existing_as 保留旧版证据。
+    finalize=true 仅能在 A/B 对账通过后使用。"""
+    import traceback
     from app import cbt_ingest as _ci
-    if not month:
-        last = datetime.date.today().replace(day=1) - datetime.timedelta(days=1)
-        month = last.strftime("%Y-%m")
     try:
-        result = await _ci.run(month, commit=commit, fx=fx, folder_token=folder_token)
-        if commit and result.get("status") == "ok":
+        result = await _ci.run(
+            month,
+            commit=commit,
+            fx=fx,
+            folder_token=folder_token,
+            preserve_existing_as=preserve_existing_as,
+        )
+        if result.get("status") != "ok":
+            raise HTTPException(status_code=422, detail=result)
+        if commit and finalize and result.get("status") == "ok":
             from app import meitong_cost, ml_close
             period = f"month_{month}"
             cost = await run_in_threadpool(meitong_cost.run, period, 12, True)
             close = await ml_close.audit(period=period, commit=True, run_cost_preview=False, cost_summary=cost)
             result["post_ingest"] = {"sync_meitong_cost": cost, "ml_close_audit": close}
         return result
+    except HTTPException:
+        raise
     except Exception as e:
-        return {"status": "error", "exc": type(e).__name__, "msg": str(e), "traceback": traceback.format_exc()[:1500]}
+        raise HTTPException(
+            status_code=502,
+            detail={"status": "error", "exc": type(e).__name__, "msg": str(e),
+                    "traceback": traceback.format_exc()[:1500]},
+        ) from e
 
 
 import asyncio as _asyncio
@@ -817,6 +833,7 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
         # 1. pull pack list (last N) — orders/search is critical; allow ONE 30s retry on 429
         windowed = bool(date_from and date_to)
         packs: list[dict] = []
+        platform_total: int | None = None
         offset = 0
         while True:
             if windowed:
@@ -827,20 +844,44 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
                 page_size = min(50, recent_n - len(packs))
             params = {"seller": seller_id, "limit": page_size, "offset": offset, "sort": "date_desc"}
             if windowed:
-                # 🚨 marketplace/orders/search 的日期过滤参数无"order."前缀(带前缀被静默忽略→返回全时段)
-                params["date_created.from"] = date_from
-                params["date_created.to"] = date_to
+                # The two endpoints use different parameter names. Mixing them is
+                # silently accepted but makes the API return an unbounded history.
+                prefix = "" if is_cbt else "order."
+                params[f"{prefix}date_created.from"] = date_from
+                params[f"{prefix}date_created.to"] = date_to
             r = await _ml_get(client, orders_search_url, headers, params)
             if r.status_code == 429:
                 await _asyncio.sleep(30)
                 r = await _ml_get(client, orders_search_url, headers, params)
             if r.status_code != 200:
                 raise HTTPException(502, f"orders/search failed after retry status={r.status_code} body={r.text[:300]}")
-            rr = r.json().get("results", [])
+            payload = r.json()
+            if windowed:
+                reported_total = (payload.get("paging") or {}).get("total")
+                if not isinstance(reported_total, int) or reported_total < 0:
+                    raise HTTPException(502, "orders/search monthly response missing paging.total")
+                if platform_total is None:
+                    platform_total = reported_total
+                elif platform_total != reported_total:
+                    raise HTTPException(502, "orders/search paging.total changed during pagination")
+            rr = payload.get("results", [])
             if not rr:
+                if windowed and len(packs) != platform_total:
+                    raise HTTPException(
+                        502,
+                        f"orders/search pagination truncated expected={platform_total} actual={len(packs)}",
+                    )
                 break
             packs.extend(rr)
-            if len(rr) < page_size:
+            if windowed:
+                if len(packs) == platform_total:
+                    break
+                if len(packs) > platform_total or len(rr) < page_size:
+                    raise HTTPException(
+                        502,
+                        f"orders/search pagination mismatch expected={platform_total} actual={len(packs)}",
+                    )
+            elif len(rr) < page_size:
                 break
             offset += page_size
 
@@ -921,6 +962,7 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
         "seller_id": seller_id,
         "recent_n_requested": recent_n,
         "packs_returned": len(packs),
+        "platform_total": platform_total,
         "orders_with_detail": len(order_details),
         "cache_hits": cache_hits,
         "new_fetches": new_fetches,
@@ -1029,9 +1071,18 @@ def sync_meitong_cost(period: str, months: int = 12, commit: bool = False):
     import traceback
     from app import meitong_cost
     try:
-        return meitong_cost.run(period, months, commit)
+        result = meitong_cost.run(period, months, commit)
+        if result.get("status") == "error":
+            raise HTTPException(status_code=502, detail=result)
+        return result
+    except HTTPException:
+        raise
     except Exception as e:
-        return {"status": "error", "exc": type(e).__name__, "msg": str(e), "traceback": traceback.format_exc()}
+        raise HTTPException(
+            status_code=502,
+            detail={"status": "error", "exc": type(e).__name__, "msg": str(e),
+                    "traceback": traceback.format_exc()[:1500]},
+        ) from e
 
 
 @app.post("/report/ml-close/audit", dependencies=[Depends(require_service_token)])
@@ -1560,7 +1611,13 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, background_task
         return {"status": "accepted", "mode": "background", "seller_id": seller_id, "month": month,
                 "commit": commit,
                 "note": "Aggregation runs in background; verify via Feishu 数据拉取时间 in ~3-5min."}
-    return await _sync_feishu_monthly_impl(seller_id, month, period_label, commit)
+    result = await _sync_feishu_monthly_impl(seller_id, month, period_label, commit)
+    if commit and result.get("status") != "synced":
+        raise HTTPException(
+            422,
+            f"monthly sync blocked seller={seller_id} month={month} status={result.get('status')}",
+        )
+    return result
 
 
 async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: str = "",
@@ -2197,9 +2254,15 @@ async def admin_backfill_orders(seller_id: int, recent_n: int = 200, parent_user
     date_from = date_to = None
     if month:
         yyyy, mm = (int(x) for x in month.split("-"))
-        date_from = f"{yyyy}-{mm:02d}-01T00:00:00.000-00:00"
+        # Local stores must use the site's civil-month boundary. Mercado Libre's
+        # bare /orders/search endpoint also requires the `order.` prefix below.
+        offsets = {2378517428: "-03:00", 3383185411: "-06:00"}
+        if seller_id not in offsets:
+            raise HTTPException(400, f"monthly backfill is not configured for seller_id={seller_id}")
+        offset = offsets[seller_id]
+        date_from = f"{yyyy}-{mm:02d}-01T00:00:00.000{offset}"
         ty, tm = (yyyy + 1, 1) if mm == 12 else (yyyy, mm + 1)
-        date_to = f"{ty}-{tm:02d}-01T00:00:00.000-00:00"
+        date_to = f"{ty}-{tm:02d}-01T00:00:00.000{offset}"
     agg = await _report_sku_recent_impl(
         seller_id, recent_n, parent,
         date_from=date_from, date_to=date_to,
@@ -2209,10 +2272,12 @@ async def admin_backfill_orders(seller_id: int, recent_n: int = 200, parent_user
     return {"status": "backfilled", "seller_id": seller_id, "parent_user_id": parent,
             "mode": ("month:" + month) if month else f"recent_{recent_n}",
             "window_orders": agg.get("packs_returned"),
+            "platform_total": agg.get("platform_total"),
             "orders_with_detail": agg.get("orders_with_detail"),
             "cache_hits": agg.get("cache_hits"),
             "new_fetches": agg.get("new_fetches"),
             "skipped_429": agg.get("skipped_429"),
+            "skipped_other": agg.get("skipped_other"),
             "capped": agg.get("capped"),
             "note": "Repeat until new_fetches=0 & capped=false, then /report/sync-feishu-monthly."}
 
