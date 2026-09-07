@@ -9,7 +9,7 @@
 RMB = USD × fx. 采购 = 领星 cg_price × units(走 lingxing).
 """
 import calendar
-import io, os, json, time, re
+import io, os, json, time, re, math
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
 import httpx
@@ -433,6 +433,22 @@ async def run(month: str, commit: bool = False, fx: float = 6.8628,
         for field_name in preserved_cost_fields:
             if old_fields.get(field_name) is not None:
                 fld[field_name] = old_fields[field_name]
+        numeric_fields = {
+            "订单数", "件数", "我的汇率", "客单价(原币)", "营收(原币)", "营收(RMB)",
+            "ML佣金(原币)", "ML佣金(RMB)", "物流费(原币)", "物流费(RMB)",
+            "VAT估算(原币)", "VAT估算(RMB)", "退款金额(原币)", "退款金额(RMB)",
+            "广告费(原币)", "广告费(RMB)", "采购成本(RMB)", F_FULL,
+            "卖家折扣(原币)", "卖家折扣(RMB)", "简易毛利(RMB)",
+            "头程成本(RMB)", "海外仓成本(RMB)",
+        }
+        for field_name in numeric_fields.intersection(fld):
+            try:
+                number = float(fld[field_name])
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(f"CBT SKU={sku} 数字字段无法转换：{field_name}") from exc
+            if not math.isfinite(number):
+                raise RuntimeError(f"CBT SKU={sku} 数字字段不是有限数：{field_name}")
+            fld[field_name] = int(number) if field_name in {"订单数", "件数"} else number
         fresh_records.append({"fields": fld})
 
     if len(existing_items) > 500 or len(fresh_records) > 500:
@@ -542,7 +558,7 @@ async def run(month: str, commit: bool = False, fx: float = 6.8628,
         if created.status_code != 200 or created_payload.get("code") != 0:
             raise RuntimeError(
                 "CBT 飞书新快照创建失败，旧数据已保留："
-                f"status={created.status_code} code={created_payload.get('code')}"
+                f"status={created.status_code} code={created_payload.get('code')} msg={created_payload.get('msg')}"
             )
         created_ids = [
             item.get("record_id")
