@@ -56,6 +56,7 @@ def health():
         "ml_unified_report_generator": True,
         "ml_product_mapping_fail_closed": True,
         "ml_month_period_safe_20260907": True,
+        "ml_month_numeric_normalized_20260907": True,
     }
 
 
