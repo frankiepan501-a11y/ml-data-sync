@@ -2209,6 +2209,9 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
             "ad_total_local": ad_total_local_value,
             "ad_total_rmb": ad_total_rmb_value,
             "ad_unallocated_local": round(ad_unallocated_cost, 2),
+            "lingxing_product_count": len(products),
+            "lingxing_error": lingxing_error,
+            "missing_purchase_cost_skus": sorted(set(skus_missing_cost)),
             "ad_rows": [
                 {
                     "sku": fields.get("SKU"),
@@ -2219,6 +2222,18 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
                 if fields.get("广告费(原币)")
             ],
         }
+
+    # Fail closed before touching the production Base.  A temporary Lingxing
+    # empty response used to replace otherwise valid monthly rows with blank
+    # purchase costs, which made gross profit look materially too high.
+    if skus_missing_cost:
+        missing = sorted(set(skus_missing_cost))
+        raise HTTPException(
+            422,
+            "采购成本未完整取得；本次未写入，原报表数据保持不变。"
+            f" missing_skus={missing[:20]}"
+            + (f" lingxing_error={lingxing_error}" if lingxing_error else ""),
+        )
 
     from app import ml_close
     await ml_close.invalidate_ab_verification(period, "local_monthly_sync")

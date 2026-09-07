@@ -209,6 +209,10 @@ class MonthlySyncSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.invalidate_patcher.stop()
 
     @staticmethod
+    def _products():
+        return {"SKU1": {"cg_price": 10.0, "product_name": "Example"}}
+
+    @staticmethod
     def _cached_order():
         return {
             "currency": "MXN",
@@ -314,6 +318,31 @@ class MonthlySyncSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(10.0, result["ad_total_local"])
         self.assertEqual(4.0, result["ad_total_rmb"])
         self.assertEqual(1, result["rows_previewed"])
+        self.assertEqual(["SKU1"], result["missing_purchase_cost_skus"])
+        feishu_token.assert_not_awaited()
+
+    async def test_missing_purchase_cost_blocks_commit_before_feishu_write(self):
+        feishu_token = AsyncMock(side_effect=AssertionError("Feishu write must not be reached"))
+        metrics = copy.deepcopy(_ad_row()["metrics"])
+        with (
+            patch.object(db, "cache_list_orders_for_scope", AsyncMock(return_value=[self._cached_order()])),
+            patch.object(lingxing, "fetch_all_products", AsyncMock(return_value={})),
+            patch.object(lingxing, "fetch_fx_rate", AsyncMock(return_value={"MXN": 0.4})),
+            patch.object(advertising, "fetch_ad_items_for_month", AsyncMock(return_value=[_ad_row()])),
+            patch.object(
+                advertising,
+                "attribute_ad_metrics_by_item_id",
+                AsyncMock(return_value=({"SKU1": metrics}, {}, [])),
+            ),
+            patch.object(advertising, "fetch_shop_visits_for_month", AsyncMock(return_value=0)),
+            patch.object(main, "_feishu_tenant_token", feishu_token),
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                await main._sync_feishu_monthly_impl(3383185411, "2026-07", commit=True)
+
+        self.assertEqual(422, ctx.exception.status_code)
+        self.assertIn("采购成本未完整取得", str(ctx.exception.detail))
+        self.invalidate_ab.assert_not_awaited()
         feishu_token.assert_not_awaited()
 
     async def _run_commit_with_feishu_responses(self, responses):
@@ -322,7 +351,7 @@ class MonthlySyncSafetyTests(unittest.IsolatedAsyncioTestCase):
         clear_recorder = AsyncMock(return_value={"status": "unchanged"})
         with (
             patch.object(db, "cache_list_orders_for_scope", AsyncMock(return_value=[self._cached_order()])),
-            patch.object(lingxing, "fetch_all_products", AsyncMock(return_value={})),
+            patch.object(lingxing, "fetch_all_products", AsyncMock(return_value=self._products())),
             patch.object(lingxing, "fetch_fx_rate", AsyncMock(return_value={"MXN": 0.4})),
             patch.object(advertising, "fetch_ad_items_for_month", AsyncMock(return_value=[_ad_row()])),
             patch.object(
@@ -344,7 +373,7 @@ class MonthlySyncSafetyTests(unittest.IsolatedAsyncioTestCase):
         metrics = copy.deepcopy(_ad_row()["metrics"])
         with (
             patch.object(db, "cache_list_orders_for_scope", AsyncMock(return_value=[self._cached_order()])),
-            patch.object(lingxing, "fetch_all_products", AsyncMock(return_value={})),
+            patch.object(lingxing, "fetch_all_products", AsyncMock(return_value=self._products())),
             patch.object(lingxing, "fetch_fx_rate", AsyncMock(return_value={"MXN": 0.4})),
             patch.object(advertising, "fetch_ad_items_for_month", AsyncMock(return_value=[_ad_row()])),
             patch.object(
@@ -366,7 +395,7 @@ class MonthlySyncSafetyTests(unittest.IsolatedAsyncioTestCase):
         metrics = copy.deepcopy(_ad_row()["metrics"])
         with (
             patch.object(db, "cache_list_orders_for_scope", AsyncMock(return_value=[self._cached_order()])),
-            patch.object(lingxing, "fetch_all_products", AsyncMock(return_value={})),
+            patch.object(lingxing, "fetch_all_products", AsyncMock(return_value=self._products())),
             patch.object(lingxing, "fetch_fx_rate", AsyncMock(return_value={"MXN": 0.4})),
             patch.object(advertising, "fetch_ad_items_for_month", AsyncMock(return_value=[_ad_row()])),
             patch.object(
@@ -403,7 +432,7 @@ class MonthlySyncSafetyTests(unittest.IsolatedAsyncioTestCase):
         metrics = copy.deepcopy(_ad_row()["metrics"])
         with (
             patch.object(db, "cache_list_orders_for_scope", AsyncMock(return_value=[self._cached_order()])),
-            patch.object(lingxing, "fetch_all_products", AsyncMock(return_value={})),
+            patch.object(lingxing, "fetch_all_products", AsyncMock(return_value=self._products())),
             patch.object(lingxing, "fetch_fx_rate", AsyncMock(return_value={"MXN": 0.4})),
             patch.object(advertising, "fetch_ad_items_for_month", AsyncMock(return_value=[_ad_row()])),
             patch.object(
@@ -430,7 +459,7 @@ class MonthlySyncSafetyTests(unittest.IsolatedAsyncioTestCase):
         metrics = copy.deepcopy(_ad_row()["metrics"])
         with (
             patch.object(db, "cache_list_orders_for_scope", AsyncMock(return_value=[self._cached_order()])),
-            patch.object(lingxing, "fetch_all_products", AsyncMock(return_value={})),
+            patch.object(lingxing, "fetch_all_products", AsyncMock(return_value=self._products())),
             patch.object(lingxing, "fetch_fx_rate", AsyncMock(return_value={"MXN": 0.4})),
             patch.object(advertising, "fetch_ad_items_for_month", AsyncMock(return_value=[_ad_row()])),
             patch.object(
