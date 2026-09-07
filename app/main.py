@@ -68,6 +68,7 @@ def health():
         "ml_month_partial_financial_fields_guarded_20260907": True,
         "ml_month_ab_report_hash_20260907": True,
         "ml_unified_ab_gate_20260907": True,
+        "ml_month_purchase_cost_fail_closed_20260907": True,
     }
 
 
