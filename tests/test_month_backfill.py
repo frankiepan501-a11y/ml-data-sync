@@ -56,16 +56,48 @@ class MonthBackfillTests(unittest.IsolatedAsyncioTestCase):
             "skipped_429": 0,
             "skipped_other": 0,
             "capped": False,
+            "platform_total": 0,
+            "_platform_order_ids": [],
         }
-        with patch.object(main, "_report_sku_recent_impl", AsyncMock(return_value=result)) as impl:
+        with (
+            patch.object(main, "_report_sku_recent_impl", AsyncMock(return_value=result)) as impl,
+            patch.object(main.db, "cache_list_orders_for_month", AsyncMock(return_value=[])),
+        ):
             await main.admin_backfill_orders(2378517428, month="2026-08")
         self.assertEqual(impl.await_args.kwargs["date_from"], "2026-08-01T00:00:00.000-03:00")
         self.assertEqual(impl.await_args.kwargs["date_to"], "2026-09-01T00:00:00.000-03:00")
 
-        with patch.object(main, "_report_sku_recent_impl", AsyncMock(return_value=result)) as impl:
+        with (
+            patch.object(main, "_report_sku_recent_impl", AsyncMock(return_value=result)) as impl,
+            patch.object(main.db, "cache_list_orders_for_month", AsyncMock(return_value=[])),
+        ):
             await main.admin_backfill_orders(3383185411, month="2026-08")
         self.assertEqual(impl.await_args.kwargs["date_from"], "2026-08-01T00:00:00.000-06:00")
         self.assertEqual(impl.await_args.kwargs["date_to"], "2026-09-01T00:00:00.000-06:00")
+
+    async def test_complete_backfill_prunes_only_cache_ids_outside_platform_window(self):
+        result = {
+            "packs_returned": 2,
+            "platform_total": 2,
+            "orders_with_detail": 2,
+            "cached_month_unique": 3,
+            "new_fetches": 0,
+            "skipped_429": 0,
+            "skipped_other": 0,
+            "capped": False,
+            "_platform_order_ids": [101, 102],
+        }
+        cached = [{"order_id": 101}, {"order_id": 102}, {"order_id": 999}]
+        with (
+            patch.object(main, "_report_sku_recent_impl", AsyncMock(return_value=result)),
+            patch.object(main.db, "cache_list_orders_for_month", AsyncMock(return_value=cached)),
+            patch.object(main.db, "cache_delete_orders", AsyncMock(return_value=1)) as delete,
+        ):
+            response = await main.admin_backfill_orders(2378517428, month="2026-08")
+
+        delete.assert_awaited_once_with(2378517428, [999])
+        self.assertEqual(response["cached_month_unique"], 2)
+        self.assertEqual(response["cache_extras_pruned"], 1)
 
     async def test_monthly_search_rejects_missing_platform_total(self):
         response = SimpleNamespace(status_code=200, json=lambda: {"results": []})

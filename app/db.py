@@ -1074,6 +1074,25 @@ async def cache_list_orders_for_month(seller_id: int, month: str) -> list[dict[s
     return rows
 
 
+async def cache_delete_orders(seller_id: int, order_ids: list[int]) -> int:
+    """Delete explicitly identified stale cache rows for one seller.
+
+    This is only used after a complete platform month-window read proves those
+    IDs are outside the authoritative set. The API remains the recoverable source.
+    """
+    unique_ids = sorted({int(order_id) for order_id in order_ids})
+    if not unique_ids:
+        return 0
+    placeholders = ",".join("?" for _ in unique_ids)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            f"DELETE FROM ml_order_cache WHERE seller_id = ? AND order_id IN ({placeholders})",
+            (seller_id, *unique_ids),
+        )
+        await db.commit()
+        return int(cur.rowcount or 0)
+
+
 async def cache_list_orders_since(seller_id: int, since_iso: str) -> list[dict[str, Any]]:
     """Return all cached orders for seller with date_created >= since_iso (YYYY-MM-DD).
     Used by /procurement/ml-stock for 30d/14d sales windows."""

@@ -57,6 +57,7 @@ def health():
         "ml_product_mapping_fail_closed": True,
         "ml_month_period_safe_20260907": True,
         "ml_month_numeric_normalized_20260907": True,
+        "ml_month_cache_reconciled_20260907": True,
     }
 
 
@@ -965,6 +966,12 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
                 cell["last_seen"] = max(cell["last_seen"] or dc, dc)
 
     rows = sorted(by_sku.values(), key=lambda x: x["revenue_total"], reverse=True)
+    platform_order_ids = sorted({
+        int(sub["id"])
+        for pack in packs
+        for sub in (pack.get("orders") or [pack])
+        if sub.get("id") is not None
+    })
     cached_month_unique = None
     if windowed:
         cached_month_rows = await db.cache_list_orders_for_month(seller_id, date_from[:7])
@@ -983,6 +990,7 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
         "skipped_other": skipped_other,
         "unique_skus": len(rows),
         "rows": rows,
+        "_platform_order_ids": platform_order_ids,
         "_note": "Token bucket: 80/min search, 1200/min detail. Order details cached in SQLite. Uses global_price (listing USD).",
     }
 
@@ -2293,6 +2301,30 @@ async def admin_backfill_orders(seller_id: int, recent_n: int = 200, parent_user
         date_from=date_from, date_to=date_to,
         max_detail_fetch=(max_detail_fetch if month else None),
     )
+    cache_extras_pruned = 0
+    if month:
+        platform_ids = {int(order_id) for order_id in (agg.get("_platform_order_ids") or [])}
+        platform_total = agg.get("platform_total")
+        complete_detail_pass = (
+            isinstance(platform_total, int)
+            and len(platform_ids) == platform_total
+            and not agg.get("capped")
+            and not agg.get("skipped_429")
+            and not agg.get("skipped_other")
+            and agg.get("orders_with_detail") == platform_total
+        )
+        if complete_detail_pass:
+            cached_rows = await db.cache_list_orders_for_month(seller_id, month)
+            cached_ids = {int(item["order_id"]) for item in cached_rows}
+            extras = sorted(cached_ids - platform_ids)
+            if extras:
+                cache_extras_pruned = await db.cache_delete_orders(seller_id, extras)
+                if cache_extras_pruned != len(extras):
+                    raise HTTPException(
+                        502,
+                        f"stale cache reconciliation failed expected={len(extras)} deleted={cache_extras_pruned}",
+                    )
+            agg["cached_month_unique"] = len(cached_ids - set(extras))
     # Discard aggregation; the side-effect of cache_put_order is what we want.
     return {"status": "backfilled", "seller_id": seller_id, "parent_user_id": parent,
             "mode": ("month:" + month) if month else f"recent_{recent_n}",
@@ -2300,6 +2332,7 @@ async def admin_backfill_orders(seller_id: int, recent_n: int = 200, parent_user
             "platform_total": agg.get("platform_total"),
             "orders_with_detail": agg.get("orders_with_detail"),
             "cached_month_unique": agg.get("cached_month_unique"),
+            "cache_extras_pruned": cache_extras_pruned,
             "cache_hits": agg.get("cache_hits"),
             "new_fetches": agg.get("new_fetches"),
             "skipped_429": agg.get("skipped_429"),
