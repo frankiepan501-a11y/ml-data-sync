@@ -64,7 +64,7 @@ class MonthBackfillTests(unittest.IsolatedAsyncioTestCase):
             patch.object(main.db, "cache_replace_month_scope", AsyncMock(return_value=0)),
             patch.object(main.db, "cache_list_orders_for_scope", AsyncMock(return_value=[])),
         ):
-            await main.admin_backfill_orders(2378517428, month="2026-08")
+            await main.admin_backfill_orders(2378517428, month="2026-08", refresh_after=1000)
         self.assertEqual(impl.await_args.kwargs["date_from"], "2026-08-01T00:00:00.000-03:00")
         self.assertEqual(impl.await_args.kwargs["date_to"], "2026-09-01T00:00:00.000-03:00")
 
@@ -73,7 +73,7 @@ class MonthBackfillTests(unittest.IsolatedAsyncioTestCase):
             patch.object(main.db, "cache_replace_month_scope", AsyncMock(return_value=0)),
             patch.object(main.db, "cache_list_orders_for_scope", AsyncMock(return_value=[])),
         ):
-            await main.admin_backfill_orders(3383185411, month="2026-08")
+            await main.admin_backfill_orders(3383185411, month="2026-08", refresh_after=1000)
         self.assertEqual(impl.await_args.kwargs["date_from"], "2026-08-01T00:00:00.000-06:00")
         self.assertEqual(impl.await_args.kwargs["date_to"], "2026-09-01T00:00:00.000-06:00")
 
@@ -95,11 +95,49 @@ class MonthBackfillTests(unittest.IsolatedAsyncioTestCase):
             patch.object(main.db, "cache_replace_month_scope", AsyncMock(return_value=2)) as replace,
             patch.object(main.db, "cache_list_orders_for_scope", AsyncMock(return_value=cached)),
         ):
-            response = await main.admin_backfill_orders(2378517428, month="2026-08")
+            response = await main.admin_backfill_orders(2378517428, month="2026-08", refresh_after=1000)
 
         replace.assert_awaited_once_with(2378517428, "2026-08", [101, 102])
         self.assertEqual(response["cached_month_unique"], 2)
         self.assertTrue(response["month_scope_replaced"])
+
+    async def test_month_backfill_requires_a_stable_refresh_cutoff(self):
+        with self.assertRaisesRegex(HTTPException, "refresh_after"):
+            await main.admin_backfill_orders(2378517428, month="2026-08")
+
+    async def test_month_backfill_refreshes_stale_cached_order_details(self):
+        search = SimpleNamespace(
+            status_code=200,
+            json=lambda: {"results": [{"id": 101}], "paging": {"total": 1}},
+        )
+        detail_payload = {
+            "id": 101,
+            "status": "cancelled",
+            "date_created": "2026-08-10T10:00:00.000-03:00",
+            "order_items": [],
+        }
+        detail = SimpleNamespace(status_code=200, json=lambda: detail_payload)
+        with (
+            patch.object(main.db, "get_token", AsyncMock(return_value={"access_token": "x", "app_key": "local_br"})),
+            patch.object(main.db, "cache_get_order", AsyncMock(return_value={"fetched_at": 999, "_payload": {"id": 101, "status": "paid"}})),
+            patch.object(main.db, "cache_put_order", AsyncMock()) as cache_put,
+            patch.object(main.db, "cache_list_orders_for_scope", AsyncMock(return_value=[])),
+            patch.object(main, "_ml_get", AsyncMock(side_effect=[search, detail])) as request,
+        ):
+            result = await main._report_sku_recent_impl(
+                2378517428,
+                200,
+                2378517428,
+                date_from="2026-08-01T00:00:00.000-03:00",
+                date_to="2026-09-01T00:00:00.000-03:00",
+                max_detail_fetch=100,
+                refresh_after=1000,
+            )
+
+        self.assertEqual(request.await_count, 2)
+        cache_put.assert_awaited_once_with(101, 2378517428, detail_payload)
+        self.assertEqual(result["new_fetches"], 1)
+        self.assertEqual(result["orders_with_detail"], 1)
 
     async def test_monthly_search_rejects_missing_platform_total(self):
         response = SimpleNamespace(status_code=200, json=lambda: {"results": []})
@@ -151,6 +189,20 @@ class MonthBackfillTests(unittest.IsolatedAsyncioTestCase):
             ml_close._close_state(True, False, "退回重算", "", ab_verified=True),
             ("待运营确认", "ops_final"),
         )
+        self.assertEqual(
+            ml_close._close_state(True, False, "", "", ab_verified=False),
+            ("退回重算", "none"),
+        )
+        self.assertEqual(
+            ml_close._close_state(True, False, "待数据同步", "", ab_verified=False),
+            ("退回重算", "none"),
+        )
+
+    def test_ab_verification_is_persisted_unless_explicitly_revoked(self):
+        prior = {"最后结果JSON": '{"ab_verified": true}'}
+        self.assertTrue(ml_close._resolve_ab_verified(prior, None))
+        self.assertFalse(ml_close._resolve_ab_verified(prior, False))
+        self.assertTrue(ml_close._resolve_ab_verified({}, True))
 
 
 if __name__ == "__main__":

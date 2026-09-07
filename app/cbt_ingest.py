@@ -611,15 +611,15 @@ async def run(month: str, commit: bool = False, fx: float = 6.8628,
             if existing_ids and {item.get("record_id") for item in archived_items} != set(existing_ids):
                 raise RuntimeError("CBT 飞书旧版证据归档回读不一致")
             _verify_items(final_items, "最终回读核验")
-        except RuntimeError as verify_error:
+        except Exception as verify_error:
             recovery_errors = []
             try:
                 await _delete_checked(created_ids, "最终核验失败后的新行回滚")
-            except RuntimeError as exc:
+            except Exception as exc:
                 recovery_errors.append(str(exc))
             try:
                 await _relabel_checked(existing_ids, period, "最终核验失败后的旧版恢复")
-            except RuntimeError as exc:
+            except Exception as exc:
                 recovery_errors.append(str(exc))
             suffix = "；恢复成功" if not recovery_errors else "；恢复失败：" + " | ".join(recovery_errors)
             raise RuntimeError(f"{verify_error}{suffix}") from verify_error

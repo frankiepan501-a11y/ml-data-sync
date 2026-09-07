@@ -9,6 +9,7 @@ Env:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import urllib.request
@@ -50,20 +51,43 @@ def get_wf(wid: str) -> dict:
     return wf
 
 
-def put_wf(wf: dict, nodes: list[dict], connections: dict) -> None:
-    body = {
+def _owned_body(wf: dict, nodes: list[dict] | None = None, connections: dict | None = None) -> dict:
+    return {
         "name": wf["name"],
-        "nodes": nodes,
-        "connections": connections,
+        "nodes": wf.get("nodes") if nodes is None else nodes,
+        "connections": wf.get("connections") if connections is None else connections,
         "settings": wf.get("settings") or {},
     }
+
+
+def _owned_hash(wf: dict, nodes: list[dict] | None = None, connections: dict | None = None) -> str:
+    raw = json.dumps(
+        _owned_body(wf, nodes, connections),
+        ensure_ascii=False,
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def put_wf(wf: dict, nodes: list[dict], connections: dict) -> None:
+    current = get_wf(wf["id"])
+    if (
+        current.get("versionId") != wf.get("versionId")
+        or _owned_hash(current) != _owned_hash(wf)
+        or bool(current.get("active")) != bool(wf.get("active"))
+    ):
+        raise RuntimeError(f"workflow {wf['id']} changed after GET; aborting PUT")
+    body = _owned_body(wf, nodes, connections)
     out = req("PUT", f"/workflows/{wf['id']}", body, timeout=120) or {}
     if wf.get("active") and not out.get("active"):
-        try:
-            req("POST", f"/workflows/{wf['id']}/activate", {}, timeout=60)
-        except Exception:
-            pass
-    print(f"updated {wf['id']} {wf['name']}")
+        req("POST", f"/workflows/{wf['id']}/activate", {}, timeout=60)
+    after = get_wf(wf["id"])
+    if (
+        _owned_hash(after) != _owned_hash(wf, nodes, connections)
+        or bool(after.get("active")) != bool(wf.get("active"))
+    ):
+        raise RuntimeError(f"workflow {wf['id']} read-back verification failed")
+    print(f"updated and verified {wf['id']} {wf['name']}")
 
 
 def trigger(wf: dict) -> dict:

@@ -385,6 +385,55 @@ class CbtIngestPeriodSafetyTests(unittest.IsolatedAsyncioTestCase):
         delete_payloads = [call[2]["records"] for call in client.calls if call[1].endswith("/batch_delete")]
         self.assertEqual(delete_payloads, [["new-1"]])
 
+    async def test_final_transport_failure_restores_archived_old_rows(self):
+        files = [
+            _file("Orders.xlsx", "orders", "20"),
+            _file("report-pads.xlsx", "ads", "20"),
+            _file("BILL.xlsx", "bill", "20"),
+        ]
+        payloads = {
+            "orders": _orders_file("2026-08", "AUG-SKU"),
+            "ads": _ads_file("2026-08", "AUG-SKU"),
+            "bill": _bill_file("2026-08"),
+        }
+        existing = [{"record_id": "old-1", "fields": {"店铺": "ML CBT-FULL (1502236229)", "周期": "month_2026-08", "SKU": "AUG-SKU"}}]
+        client = _WriteClient()
+        reads = 0
+
+        async def download(_token, file_token):
+            return payloads[file_token]
+
+        async def bitable_all(_token):
+            nonlocal reads
+            reads += 1
+            if reads == 1:
+                return existing
+            if reads == 2:
+                return existing + [{"record_id": "new-1", "fields": client.created_records[0]["fields"]}]
+            raise ValueError("temporary JSON decode failure")
+
+        with (
+            patch.object(cbt_ingest, "_ft", AsyncMock(return_value="token")),
+            patch.object(cbt_ingest, "_list_folder", AsyncMock(return_value=files)),
+            patch.object(cbt_ingest, "_download", side_effect=download),
+            patch.object(cbt_ingest, "_ensure_full_field", AsyncMock()),
+            patch.object(cbt_ingest, "_bitable_all", side_effect=bitable_all),
+            patch.object(cbt_ingest.lingxing, "fetch_all_products", AsyncMock(return_value={})),
+            patch.object(cbt_ingest.httpx, "AsyncClient", return_value=client),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "temporary JSON decode failure.*恢复成功"):
+                await cbt_ingest.run(
+                    "2026-08",
+                    commit=True,
+                    folder_token="folder",
+                    preserve_existing_as="month_2026-08_original_20260907",
+                )
+
+        delete_payloads = [call[2]["records"] for call in client.calls if call[1].endswith("/batch_delete")]
+        self.assertEqual(delete_payloads, [["new-1"]])
+        update_payloads = [call[2]["records"] for call in client.calls if call[1].endswith("/batch_update")]
+        self.assertEqual(update_payloads[-1], [{"record_id": "old-1", "fields": {"周期": "month_2026-08"}}])
+
     async def test_commit_rejects_per_sku_value_swap_even_when_aggregate_matches(self):
         workbook = openpyxl.load_workbook(io.BytesIO(_orders_file("2026-08", "SKU-A")))
         sheet = workbook.active

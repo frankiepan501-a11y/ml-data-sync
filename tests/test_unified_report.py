@@ -753,8 +753,12 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
             "state": "运营已确认",
             "next_card": "finance_final",
             "last_error": "",
+            "ab_verified": True,
         }
-        self.current = {"record_id": "status-1", "fields": {"状态": "运营已确认"}}
+        self.current = {
+            "record_id": "status-1",
+            "fields": {"状态": "运营已确认", "最后结果JSON": '{"ab_verified": true}'},
+        }
         self.action_claim_patcher = patch.object(
             db,
             "claim_ml_close_action",
@@ -918,7 +922,7 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
             "message_id": "om-duplicate-finance",
             "operator_name": "财务",
         }
-        mutable_fields = {"状态": "运营已确认"}
+        mutable_fields = {"状态": "运营已确认", "最后结果JSON": '{"ab_verified": true}'}
         entered = asyncio.Event()
         release = asyncio.Event()
 
@@ -1018,7 +1022,7 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
             "message_id": "om-finance-retry",
             "operator_name": "财务",
         }
-        fields = {"状态": "运营已确认"}
+        fields = {"状态": "运营已确认", "最后结果JSON": '{"ab_verified": true}'}
         ledger: dict[str, str] = {}
         final_attempts = 0
 
@@ -1089,7 +1093,7 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
             "message_id": "om-audit-retry",
             "operator_name": "财务",
         }
-        fields = {"状态": "运营已确认"}
+        fields = {"状态": "运营已确认", "最后结果JSON": '{"ab_verified": true}'}
         ledger: dict[str, str] = {}
 
         async def claim_action(period_value, action_key, owner):
@@ -1160,6 +1164,7 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
         message_id = "om-ops-choice"
         fields = {
             "状态": "待运营确认",
+            "最后结果JSON": '{"ab_verified": true}',
             "最后卡片 message_id": message_id,
         }
         latest_action_key = ""
@@ -1248,6 +1253,7 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
         stale_message_id = "om-stale-ops"
         fields = {
             "状态": "待运营确认",
+            "最后结果JSON": '{"ab_verified": true}',
             "最后卡片 message_id": current_message_id,
         }
         latest_action_key = ""
@@ -1340,6 +1346,7 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
         message_id = "om-recalc-choice"
         fields = {
             "状态": "待运营确认",
+            "最后结果JSON": '{"ab_verified": true}',
             "最后卡片 message_id": message_id,
         }
         latest_action_key = ""

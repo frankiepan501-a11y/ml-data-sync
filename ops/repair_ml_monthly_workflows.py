@@ -68,6 +68,7 @@ def _backfill_code(previous_code: str) -> str:
 const d = new Date(now.getFullYear(), now.getMonth() - 1, 1);
 const month = `${{d.getFullYear()}}-${{String(d.getMonth()+1).padStart(2,'0')}}`;
 const sellers = [2378517428, 3383185411];
+const refreshAfter = Math.floor(Date.now() / 1000);
 {token_line}
 const results = [];
 for (const seller_id of sellers) {{
@@ -75,7 +76,7 @@ for (const seller_id of sellers) {{
   for (let attempt = 1; attempt <= 30; attempt++) {{
     const response = await this.helpers.httpRequest({{
       method: 'POST',
-      url: `https://ml-sync.zeabur.app/admin/backfill-orders?seller_id=${{seller_id}}&month=${{month}}&max_detail_fetch=100`,
+      url: `https://ml-sync.zeabur.app/admin/backfill-orders?seller_id=${{seller_id}}&month=${{month}}&max_detail_fetch=100&refresh_after=${{refreshAfter}}`,
       headers: {{ Authorization: tok }},
       json: true,
       timeout: 120000,

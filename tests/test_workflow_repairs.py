@@ -1,7 +1,13 @@
 import copy
+import os
 import unittest
 
+os.environ.setdefault("N8N_BASE_URL", "https://n8n.invalid/api/v1")
+os.environ.setdefault("N8N_API_KEY", "test-key")
+os.environ.setdefault("ML_SYNC_SERVICE_AUTH_TOKEN", "test-service-token")
+
 from ops import repair_ml_monthly_workflows as repair
+from ops import update_ml_close_workflows as legacy_update
 
 
 def _node(name, type_, parameters):
@@ -34,6 +40,7 @@ class MonthlyWorkflowRepairTests(unittest.TestCase):
         self.assertEqual(nodes["Monthly 02:00 BJ"]["parameters"]["rule"]["interval"][0]["expression"], "0 2 2 * *")
         backfill_code = nodes["Backfill 本土店 (own-token)"]["parameters"]["jsCode"]
         self.assertIn("month=${month}", backfill_code)
+        self.assertIn("refresh_after=${refreshAfter}", backfill_code)
         self.assertIn("new_fetches === 0", backfill_code)
         self.assertIn("capped === false", backfill_code)
         self.assertIn("response.cached_month_unique === response.platform_total", backfill_code)
@@ -101,6 +108,24 @@ class MonthlyWorkflowRepairTests(unittest.TestCase):
         changed["serverOnly"] = {"value": 1}
 
         self.assertEqual(repair._safe_hash(workflow), repair._safe_hash(changed))
+
+    def test_legacy_updater_fails_closed_when_reactivation_fails(self):
+        workflow = {
+            "id": "wf-1",
+            "name": "safe",
+            "active": True,
+            "versionId": "v1",
+            "settings": {},
+            "nodes": [],
+            "connections": {},
+        }
+        with unittest.mock.patch.object(
+            legacy_update,
+            "req",
+            side_effect=[workflow, {**workflow, "active": False, "versionId": "v2"}, RuntimeError("activate failed")],
+        ):
+            with self.assertRaisesRegex(RuntimeError, "activate failed"):
+                legacy_update.put_wf(workflow, [], {})
 
 
 if __name__ == "__main__":

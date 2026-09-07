@@ -60,6 +60,8 @@ def health():
         "ml_month_cache_reconciled_20260907": True,
         "ml_month_scope_authoritative_20260907": True,
         "ml_month_ab_gate_strict_20260907": True,
+        "ml_month_order_detail_refreshed_20260907": True,
+        "ml_month_ab_gate_persisted_20260907": True,
     }
 
 
@@ -822,7 +824,8 @@ async def report_sku_recent(
 
 async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id: int,
                                   date_from: str | None = None, date_to: str | None = None,
-                                  max_detail_fetch: int | None = None):
+                                  max_detail_fetch: int | None = None,
+                                  refresh_after: int | None = None):
     row = await db.get_token(parent_user_id)
     if not row:
         raise HTTPException(404, "parent token not found in DB; seed first")
@@ -911,9 +914,19 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
                 order_id = sub.get("id")
                 if not order_id:
                     continue
-                # Cache check first — order details are immutable once paid
+                # Month-close facts can still change after first payment
+                # (cancellation/refund/status). A stable refresh_after cutoff lets
+                # repeated capped calls refresh every scoped order exactly once.
                 cached = await db.cache_get_order(int(order_id))
-                if cached and cached.get("_payload"):
+                cached_is_fresh = (
+                    cached
+                    and cached.get("_payload")
+                    and (
+                        refresh_after is None
+                        or int(cached.get("fetched_at") or 0) >= refresh_after
+                    )
+                )
+                if cached_is_fresh:
                     order_details.append(cached["_payload"])
                     cache_hits += 1
                     continue
@@ -1110,7 +1123,7 @@ def sync_meitong_cost(period: str, months: int = 12, commit: bool = False):
 @app.post("/report/ml-close/audit", dependencies=[Depends(require_service_token)])
 async def ml_close_audit(month: str | None = None, period: str | None = None,
                          commit: bool = False, run_cost_preview: bool = True,
-                         ab_verified: bool = False):
+                         ab_verified: bool | None = None):
     """Audit ML monthly close state and optionally upsert the close status table."""
     import traceback
     from app import ml_close
@@ -1128,7 +1141,7 @@ async def ml_close_audit(month: str | None = None, period: str | None = None,
 
 @app.post("/report/ml-close/recalc-cost", dependencies=[Depends(require_service_token)])
 async def ml_close_recalc_cost(month: str | None = None, period: str | None = None,
-                               commit: bool = True, ab_verified: bool = False):
+                               commit: bool = True, ab_verified: bool | None = None):
     """Recalculate Meitong/Mokeduo/Sanmu cost, then run close audit."""
     import traceback
     from app import ml_close
@@ -2273,7 +2286,8 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
 
 @app.post("/admin/backfill-orders", dependencies=[Depends(require_service_token)])
 async def admin_backfill_orders(seller_id: int, recent_n: int = 200, parent_user_id: int = 0,
-                                month: str | None = None, max_detail_fetch: int = 40):
+                                month: str | None = None, max_detail_fetch: int = 40,
+                                refresh_after: int | None = None):
     """One-time historical fill: pull orders into ml_order_cache, no Feishu write.
 
     Two modes:
@@ -2288,6 +2302,12 @@ async def admin_backfill_orders(seller_id: int, recent_n: int = 200, parent_user
     parent = parent_user_id or seller_id
     date_from = date_to = None
     if month:
+        if refresh_after is None or refresh_after <= 0:
+            raise HTTPException(
+                400,
+                "monthly backfill requires refresh_after=<stable unix timestamp> "
+                "so every mutable order detail is refreshed before reconciliation",
+            )
         yyyy, mm = (int(x) for x in month.split("-"))
         # Local stores must use the site's civil-month boundary. Mercado Libre's
         # bare /orders/search endpoint also requires the `order.` prefix below.
@@ -2302,6 +2322,7 @@ async def admin_backfill_orders(seller_id: int, recent_n: int = 200, parent_user
         seller_id, recent_n, parent,
         date_from=date_from, date_to=date_to,
         max_detail_fetch=(max_detail_fetch if month else None),
+        refresh_after=(refresh_after if month else None),
     )
     cache_extras_pruned = 0
     month_scope_replaced = False
@@ -2336,6 +2357,7 @@ async def admin_backfill_orders(seller_id: int, recent_n: int = 200, parent_user
             "cached_month_unique": agg.get("cached_month_unique"),
             "cache_extras_pruned": cache_extras_pruned,
             "month_scope_replaced": month_scope_replaced,
+            "refresh_after": refresh_after,
             "cache_hits": agg.get("cache_hits"),
             "new_fetches": agg.get("new_fetches"),
             "skipped_429": agg.get("skipped_429"),

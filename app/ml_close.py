@@ -226,13 +226,23 @@ def _close_state(
         return "异常", "error"
     if not has_rows:
         return "待数据同步", "instruction"
-    if prior_state == "退回重算" and not ab_verified:
+    if not ab_verified:
         return "退回重算", "none"
     if has_cost_gaps:
         return "成本缺失待补", "cost_gap"
     if prior_state in ("运营已确认", "财务已确认终稿"):
         return prior_state, "none"
     return "待运营确认", "ops_final"
+
+
+def _resolve_ab_verified(
+    prior_fields: dict[str, Any],
+    requested: bool | None,
+) -> bool:
+    """Persist an explicit A/B decision; omission inherits the last audit result."""
+    if requested is not None:
+        return bool(requested)
+    return bool(_last_result(prior_fields).get("ab_verified"))
 
 
 async def _open_ad_failures(period: str, status_fields: dict[str, Any] | None = None) -> list[str]:
@@ -435,6 +445,7 @@ async def _commit_audit_snapshot(
         bool(result.get("gap_row_count")),
         latest_state,
         last_error,
+        bool(result.get("ab_verified")),
     )
     result.update(
         {
@@ -470,6 +481,7 @@ async def _commit_audit_snapshot(
         "ovs_total_rmb": _num(result.get("ovs_total_rmb")),
         "cbt_state": _text(result.get("cbt_state")),
         "last_error": last_error[:500],
+        "ab_verified": bool(result.get("ab_verified")),
     }
     fields = {
         "月份": month,
@@ -500,7 +512,7 @@ async def audit(
     commit: bool = False,
     run_cost_preview: bool = True,
     cost_summary: dict[str, Any] | None = None,
-    ab_verified: bool = False,
+    ab_verified: bool | None = None,
 ) -> dict[str, Any]:
     period, month = normalize_period(month, period)
     tok = await _tenant_token()
@@ -508,6 +520,7 @@ async def audit(
     prior_fields = prior.get("fields", {}) if prior else {}
     prior_state = _text(prior_fields.get("状态"))
     prior_result = _last_result(prior_fields)
+    effective_ab_verified = _resolve_ab_verified(prior_fields, ab_verified)
     marker_error = ""
     try:
         prior_failed_ad_shops = await _open_ad_failures(period, prior_fields)
@@ -581,7 +594,7 @@ async def audit(
         base_error = f"{base_error}；{cost_failure}" if base_error else cost_failure
     last_error = _with_ad_failure(base_error, prior_failed_ad_shops)
     state, next_card = _close_state(
-        bool(rows), bool(purchase_gaps or freight_gaps), prior_state, last_error, ab_verified
+        bool(rows), bool(purchase_gaps or freight_gaps), prior_state, last_error, effective_ab_verified
     )
 
     result = {
@@ -623,7 +636,7 @@ async def audit(
         "_base_error": base_error,
         "last_error": last_error,
         "failed_ad_shops": prior_failed_ad_shops,
-        "ab_verified": ab_verified,
+        "ab_verified": effective_ab_verified,
     }
 
     if commit:
@@ -1126,6 +1139,14 @@ async def card_endpoint(
 
     requested_kind = kind
     kind = "error" if summary.get("next_card") == "error" else (kind or summary.get("next_card") or "instruction")
+    if kind in ("ops_final", "finance_final") and not summary.get("ab_verified"):
+        return {
+            "status": "skipped",
+            "reason": "ab_not_verified",
+            "kind": "none",
+            "period": summary["period"],
+            "summary": summary,
+        }
     async with _status_mutation_lock(summary["period"]):
         status = await _get_status(summary["period"]) or {}
         status_fields = status.get("fields") if status else {}
@@ -1185,12 +1206,14 @@ async def status_endpoint(month: str | None = None, period: str | None = None) -
         failed_ad_shops = _failed_ad_shops(fields)
         marker_error = f"广告失败状态读取失败：{type(e).__name__}"
     state = "异常" if failed_ad_shops or marker_error else (_text(fields.get("状态")) if fields else "待数据同步")
+    ab_verified = _resolve_ab_verified(fields, None)
     return {
         "status": "ok",
         "period": period,
         "month": month,
         "state": state,
-        "ready_for_finance": state in ("运营已确认", "财务已确认终稿"),
+        "ready_for_finance": ab_verified and state in ("运营已确认", "财务已确认终稿"),
+        "ab_verified": ab_verified,
         "failed_ad_shops": failed_ad_shops,
         "marker_error": marker_error,
         "record": status,
@@ -1202,7 +1225,7 @@ async def recalc_cost(
     period: str | None = None,
     commit: bool = True,
     audit_commit: bool = True,
-    ab_verified: bool = False,
+    ab_verified: bool | None = None,
 ) -> dict[str, Any]:
     period, month = normalize_period(month, period)
     cost = await anyio.to_thread.run_sync(meitong_cost.run, period, 12, commit)
@@ -1360,6 +1383,10 @@ async def _confirm_action_impl(
                 return await _blocked_confirmation(
                     f"当前月结状态为“{pre_state or '未知'}”，请先完成运营确认。"
                 )
+        if action in confirmation_actions and not _resolve_ab_verified(pre_fields, None):
+            return await _blocked_confirmation(
+                "A/B 对账尚未完成，本次确认已拦截。"
+            )
         try:
             action_claim = await db.claim_ml_close_action(
                 period, action_key, action_owner
@@ -1461,6 +1488,8 @@ async def _confirm_action_impl(
         current = await _get_status(period, tok) or {}
         current_fields = current.get("fields") or {}
         if action in confirmation_actions:
+            if not _resolve_ab_verified(current_fields, None):
+                block_reason = "A/B 对账尚未完成，本次确认已拦截。"
             try:
                 current_failed = await _open_ad_failures(period, current_fields)
             except Exception as e:

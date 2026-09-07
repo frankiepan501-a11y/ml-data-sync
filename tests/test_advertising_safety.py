@@ -775,7 +775,10 @@ class MonthlyCloseAdvertisingFailureTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_failure_arriving_after_initial_callback_check_blocks_finance_card(self):
         self.db_list_failures.side_effect = [[], [{"shop": "ML 本土3店"}]]
-        current = {"record_id": "rec-status", "fields": {"状态": "待运营确认"}}
+        current = {
+            "record_id": "rec-status",
+            "fields": {"状态": "待运营确认", "最后结果JSON": '{"ab_verified": true}'},
+        }
         clean_summary = {
             "status": "ok",
             "period": "month_2026-07",
@@ -783,6 +786,7 @@ class MonthlyCloseAdvertisingFailureTests(unittest.IsolatedAsyncioTestCase):
             "state": "待运营确认",
             "next_card": "ops_final",
             "last_error": "",
+            "ab_verified": True,
         }
         status_writer = AsyncMock(return_value={"record_id": "rec-status"})
         card_sender = AsyncMock(return_value={"data": {"message_id": "om-finance"}})
