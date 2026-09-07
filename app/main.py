@@ -73,6 +73,7 @@ def health():
         "ml_month_financial_numeric_fail_closed_20260907": True,
         "ml_month_live_ab_hash_guard_20260907": True,
         "ml_month_scope_replace_guard_20260907": True,
+        "ml_unified_source_hash_guard_20260907": True,
     }
 
 
@@ -1337,6 +1338,7 @@ async def ml_unified_monthly(month: str | None = None, period: str | None = None
     from app import ml_close, unified_report
 
     normalized_period, _ = ml_close.normalize_period(month, period)
+    approved_report_hash = ""
     if commit:
         # Recompute the report hash from the live Base.  The status row alone
         # may still describe an older, approved version after a manual edit.
@@ -1353,8 +1355,28 @@ async def ml_unified_monthly(month: str | None = None, period: str | None = None
                 409,
                 f"{normalized_period} 尚未完成当前报表版本的 A/B 与财务终稿确认；只允许 commit=false 预览。",
             )
+        approved_report_hash = str(close_status.get("report_hash") or "")
     try:
-        return await unified_report.generate(normalized_period, commit=commit)
+        report = await unified_report.generate(
+            normalized_period,
+            commit=commit,
+            expected_source_hash=approved_report_hash or None,
+        )
+        if commit:
+            live_after = await ml_close.audit(
+                period=normalized_period,
+                commit=False,
+                run_cost_preview=False,
+            )
+            if (
+                live_after.get("ab_verified") is not True
+                or str(live_after.get("report_hash") or "") != approved_report_hash
+            ):
+                raise HTTPException(
+                    409,
+                    f"{normalized_period} 生成期间生产表已变化；当前版本需重新完成 A/B 对账。",
+                )
+        return report
     except unified_report.ProductMappingError as exc:
         raise HTTPException(
             409,

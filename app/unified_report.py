@@ -473,6 +473,30 @@ def report_content_hash(prepared: dict[str, Any]) -> str:
     ).hexdigest()[:16]
 
 
+def source_report_hash(records: list[dict[str, Any]], period: str) -> str:
+    """Hash the exact production Base rows used by the close A/B approval."""
+    normalized = [
+        {
+            "record_id": _text(row.get("record_id")),
+            "fields": row.get("fields") or {},
+        }
+        for row in records
+        if _text((row.get("fields") or {}).get("周期")) == period
+    ]
+    normalized.sort(key=lambda row: row["record_id"])
+    if not normalized:
+        return ""
+    return hashlib.sha256(
+        json.dumps(
+            normalized,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 async def _tenant_token(app_id: str, secret: str) -> str:
     if not secret:
         raise ReportGenerationError(f"Feishu secret missing for app {app_id}")
@@ -918,7 +942,11 @@ def validate_report_readback(
             raise ReportGenerationError(f"统一毛利报表写后回读失败：检查表第 {row_number} 行不一致")
 
 
-async def generate(period: str, commit: bool = False) -> dict[str, Any]:
+async def generate(
+    period: str,
+    commit: bool = False,
+    expected_source_hash: str | None = None,
+) -> dict[str, Any]:
     """Preview or create one monthly report. Mapping validation always precedes writes."""
     period, month = _period_parts(period)
     if not commit:
@@ -930,8 +958,18 @@ async def generate(period: str, commit: bool = False) -> dict[str, Any]:
         token = await _report_token()
         existing = await _find_existing_report(token, period, month)
         report_records, maintenance_records, cost_records = await _load_sources()
+        loaded_source_hash = source_report_hash(report_records, period)
+        if expected_source_hash and loaded_source_hash != expected_source_hash:
+            raise ReportGenerationError(
+                "统一毛利报表源数据已变化，当前版本需重新完成 A/B 对账"
+            )
         prepared = prepare_report(period, report_records, maintenance_records, cost_records)
-        base = {"status": "ok", "mode": "commit", **prepared["summary"]}
+        base = {
+            "status": "ok",
+            "mode": "commit",
+            "source_report_hash": loaded_source_hash,
+            **prepared["summary"],
+        }
         expected_hash = report_content_hash(prepared)
         owner = f"{os.getpid()}:{uuid.uuid4().hex}"
         claim = await db.claim_unified_report_generation(period, owner, expected_hash)

@@ -1878,7 +1878,11 @@ async def _confirm_action_impl(
             # “财务确认”和“退回重算”交叉覆盖。生成器自身另有跨进程持久占位。
             if not block_reason:
                 try:
-                    report = await unified_report.generate(period, commit=True)
+                    report = await unified_report.generate(
+                        period,
+                        commit=True,
+                        expected_source_hash=approved_report_hash,
+                    )
                 except unified_report.ReportGenerationInProgressError as exc:
                     block_reason = f"月报生成失败：{exc}"
                     await _publish_retryable_finance_error(block_reason)

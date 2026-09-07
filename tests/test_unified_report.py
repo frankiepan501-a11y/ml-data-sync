@@ -321,6 +321,38 @@ class WorkbookBuildTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], complete_writes)
 
 class ReportGenerationAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_expected_source_hash_mismatch_stops_before_report_write(self):
+        sources = (
+            [_source_row()],
+            [_record(**{
+                "ERP SKU": "FF01A-01",
+                "ERP品名": "YS11 Pro 手柄-涂鸦",
+                "产品类型": "游戏手柄",
+            })],
+            [],
+        )
+        with (
+            patch.object(unified_report, "_report_token", AsyncMock(return_value="token")),
+            patch.object(unified_report, "_find_existing_report", AsyncMock(return_value=None)),
+            patch.object(unified_report, "_load_sources", AsyncMock(return_value=sources)),
+            patch.object(db, "claim_unified_report_generation", AsyncMock()) as claim,
+            patch.object(unified_report, "_copy_or_resume_report", AsyncMock()) as copier,
+            patch.object(unified_report, "_write_report", AsyncMock()) as writer,
+        ):
+            with self.assertRaisesRegex(
+                unified_report.ReportGenerationError,
+                "源数据已变化",
+            ):
+                await unified_report.generate(
+                    "month_2026-08",
+                    commit=True,
+                    expected_source_hash="approved-but-stale",
+                )
+
+        claim.assert_not_awaited()
+        copier.assert_not_awaited()
+        writer.assert_not_awaited()
+
     async def test_mapping_failure_happens_before_any_wiki_copy(self):
         with (
             patch.object(unified_report, "_report_token", AsyncMock(return_value="token")),
@@ -993,7 +1025,7 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
             mutable_fields.update(fields)
             return {"record_id": "status-1"}
 
-        async def generate(period_value, commit=True):
+        async def generate(period_value, commit=True, expected_source_hash=None):
             entered.set()
             await release.wait()
             return {

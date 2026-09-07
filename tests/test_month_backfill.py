@@ -336,6 +336,27 @@ class MonthBackfillTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.status_code, 409)
         generate.assert_not_awaited()
 
+    async def test_unified_commit_binds_generator_and_postcheck_to_live_hash(self):
+        approved = {
+            "state": "财务已确认终稿",
+            "ab_verified": True,
+            "report_hash": "approved-live-hash",
+        }
+        generator = AsyncMock(return_value={"status": "ok", "mode": "commit"})
+        with (
+            patch.object(ml_close, "audit", AsyncMock(side_effect=[approved, approved])) as audit,
+            patch("app.unified_report.generate", generator),
+        ):
+            result = await main.ml_unified_monthly(period="month_2026-08", commit=True)
+
+        self.assertEqual("ok", result["status"])
+        generator.assert_awaited_once_with(
+            "month_2026-08",
+            commit=True,
+            expected_source_hash="approved-live-hash",
+        )
+        self.assertEqual(2, audit.await_count)
+
     def test_rejected_month_stays_blocked_until_ab_is_explicitly_verified(self):
         self.assertEqual(
             ml_close._close_state(True, False, "退回重算", ""),
