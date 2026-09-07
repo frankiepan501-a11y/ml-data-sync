@@ -1,6 +1,7 @@
 import copy
 import os
 import unittest
+from unittest import mock
 
 os.environ.setdefault("N8N_BASE_URL", "https://n8n.invalid/api/v1")
 os.environ.setdefault("N8N_API_KEY", "test-key")
@@ -55,6 +56,8 @@ class MonthlyWorkflowRepairTests(unittest.TestCase):
         self.assertNotIn("1407362838", prepare_code)
         self.assertNotIn("recent_n=60", backfill_code)
         self.assertNotIn("catch (e) {}", backfill_code)
+        self.assertIn("transient_error", backfill_code)
+        self.assertIn("attempt < 30", backfill_code)
         self.assertIn("secret-value", backfill_code)
         sync = nodes["POST /report/sync-feishu-monthly"]["parameters"]
         self.assertIn("commit=true", sync["url"])
@@ -120,7 +123,7 @@ class MonthlyWorkflowRepairTests(unittest.TestCase):
             "nodes": [],
             "connections": {},
         }
-        with unittest.mock.patch.object(
+        with mock.patch.object(
             legacy_update,
             "req",
             side_effect=[workflow, {**workflow, "active": False, "versionId": "v2"}, RuntimeError("activate failed")],

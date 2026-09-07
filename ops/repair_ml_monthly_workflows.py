@@ -76,13 +76,23 @@ const results = [];
 for (const seller_id of sellers) {{
   let completed = false;
   for (let attempt = 1; attempt <= 30; attempt++) {{
-    const response = await this.helpers.httpRequest({{
-      method: 'POST',
-      url: `https://ml-sync.zeabur.app/admin/backfill-orders?seller_id=${{seller_id}}&month=${{month}}&max_detail_fetch=100&refresh_after=${{refreshAfter}}`,
-      headers: {{ Authorization: tok }},
-      json: true,
-      timeout: 120000,
-    }});
+    let response;
+    try {{
+      response = await this.helpers.httpRequest({{
+        method: 'POST',
+        url: `https://ml-sync.zeabur.app/admin/backfill-orders?seller_id=${{seller_id}}&month=${{month}}&max_detail_fetch=100&refresh_after=${{refreshAfter}}`,
+        headers: {{ Authorization: tok }},
+        json: true,
+        timeout: 120000,
+      }});
+    }} catch (error) {{
+      results.push({{seller_id, attempt, transient_error: String(error?.message || error).slice(0, 200)}});
+      if (attempt < 30) {{
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        continue;
+      }}
+      throw error;
+    }}
     if (!response || response.status !== 'backfilled') {{
       throw new Error(`ML month backfill failed seller=${{seller_id}} month=${{month}} response=${{JSON.stringify(response).slice(0,300)}}`);
     }}
