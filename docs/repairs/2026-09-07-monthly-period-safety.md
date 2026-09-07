@@ -37,15 +37,16 @@
 
 ## 生产结果（2026-09-07）
 
-- 最终部署关键 commit：`4ff8150`（财务字段/A-B 版本闸）、`d35e41c`（采购成本拒写）、`b777624`（健康标记）；n8n 重试 commit `b7dbf15`。
-- 月度 n8n：`9ZvARULB0wIp19yp`，active，8 节点，版本 `610a941e-e799-4448-aff3-7a045e3fde3c`。
+- 最终部署关键 commit：`4ff8150`（财务字段/A-B 版本闸）、`d35e41c`（采购成本拒写）、`3d47729`（非法数值、实时 A/B 哈希、月份范围替换最终收口）；n8n 重试 commit `b7dbf15`。
+- 月度 n8n：`9ZvARULB0wIp19yp`，active，8 节点，版本 `e5f40dc9-13b1-4b9a-8715-a13a81e91d8d`。
 - CBT n8n：`j5I4vcjwarGgols0`，active，3 节点，版本 `a8d9d9e6-efa8-4567-a78e-a991d4671c92`。
 - Base 旧版 65 行已迁到 `month_2026-08_original_20260907`；当前修正版 62 行，未静默覆盖旧证据。
 - CBT：官方导出 B 与修复计算 A 的件数、营收、佣金、物流、VAT、退款、广告、Full 仓储费均已对账通过。
 - 巴西：平台目标月 710/710 单详情强制刷新完成，生成 6 行汇总；本土3店：平台目标月 1,014/1,014 单详情强制刷新完成，生成 36 行汇总。
 - 生产审计回读：`state=退回重算`、`ready_for_finance=false`、`ab_verified=false`、`next_card=none`。缺少本土两店官方导出 B 时，系统不会自动放行。
 - 本土3店首次重写后审计发现 30 行采购成本缺失并导致毛利虚高；月结未放行。新增拒写保护后，预演确认领星产品 553 个、采购缺口 0，再次重写 36 行，最终采购缺口 0、全额毛利 RMB 43,892.39。
-- 完整测试：103 passed。财务证据包：`D:/Documents/财务与资产/outputs/mercadolibre-september-repair-20260907/美客多2026-08修复对账.xlsx`，SHA256=`207D0A71CA01556992FA53B08AFE0F5BA4E6AA5188B6E77903CA62CBBB5D61E8`。
+- 最终保护：汇率/采购单价必须为正有限数；HTTP 206 金额必须可解析、有限且非负；运营/财务确认与统一月报直提都实时核对 Base 哈希；n8n 必须确认月份订单范围已替换。
+- 完整测试：107 passed + 4 组子测试。财务证据包：`D:/Documents/财务与资产/outputs/mercadolibre-september-repair-20260907/美客多2026-08修复对账.xlsx`，SHA256=`C971D5EA8068CE58F4205716FF6F03C5F5C078A4DD4A7943B6DFC76F0C5AF794`。
 
 ## 尚未完成
 
