@@ -59,6 +59,7 @@ def health():
         "ml_month_numeric_normalized_20260907": True,
         "ml_month_cache_reconciled_20260907": True,
         "ml_month_scope_authoritative_20260907": True,
+        "ml_month_ab_gate_strict_20260907": True,
     }
 
 

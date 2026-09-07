@@ -144,6 +144,10 @@ class MonthBackfillTests(unittest.IsolatedAsyncioTestCase):
             ("退回重算", "none"),
         )
         self.assertEqual(
+            ml_close._close_state(True, True, "退回重算", ""),
+            ("退回重算", "none"),
+        )
+        self.assertEqual(
             ml_close._close_state(True, False, "退回重算", "", ab_verified=True),
             ("待运营确认", "ops_final"),
         )

@@ -226,10 +226,10 @@ def _close_state(
         return "异常", "error"
     if not has_rows:
         return "待数据同步", "instruction"
-    if has_cost_gaps:
-        return "成本缺失待补", "cost_gap"
     if prior_state == "退回重算" and not ab_verified:
         return "退回重算", "none"
+    if has_cost_gaps:
+        return "成本缺失待补", "cost_gap"
     if prior_state in ("运营已确认", "财务已确认终稿"):
         return prior_state, "none"
     return "待运营确认", "ops_final"
