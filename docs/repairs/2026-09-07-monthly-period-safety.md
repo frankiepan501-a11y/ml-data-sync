@@ -18,7 +18,7 @@
 
 - `app/cbt_ingest.py`：三类官方工作簿内容期间校验；订单从真实首行读取，并以通过期间校验后的整份官方导出作为 B 口径（保留官方文件内的时区边界行）；修正版逐 SKU、逐原币/RMB 字段回读；旧版改到独立历史周期标签保留，不删除。
 - `app/ml_close.py`：处于“退回重算”的月份，定时成本审计不能自动推进；只有 A/B 对账完成后的显式 `ab_verified=true` 才能解除。
-- `app/main.py`：CBT 校验失败返回非 2xx；本土与 CBT 分别使用正确的日期参数；巴西/墨西哥按当地月界；正式同步无缓存时返回 422。
+- `app/main.py`：CBT 校验失败返回非 2xx；本土与 CBT 分别使用正确的日期参数；巴西/墨西哥按当地月界；正式同步无缓存时返回 422。目标月订单详情按单次固定 cutoff 强制刷新，服务端拒绝未来 cutoff；HTTP 206 的有效订单载荷按 2xx 接受，非 2xx 返回失败订单号与状态。
 - `ops/repair_ml_monthly_workflows.py`：对两条生产 n8n 工作流执行完整 GET、定点修改、完整 PUT 和回读 hash 核验。
 - `ops/update_ml_close_workflows.py`：同步修改重建器，防止以后重建工作流时把 CBT 显式月份修复覆盖掉。
 
@@ -36,14 +36,14 @@
 
 ## 生产结果（2026-09-07）
 
-- 最终部署 commit：`c02abdd9f7f3eb422fe62934fe5ce08af1cb8f9d`；`/health` 标记 `ml_month_ab_gate_strict_20260907=true`。
-- 月度 n8n：`9ZvARULB0wIp19yp`，active，8 节点，版本 `e1d97580-cf71-47e8-8c18-f88bd92c40c7`。
+- 最终部署 commit：`36a64f6`；`/health` 的 A/B 锁、详情强制刷新、时钟偏差保护和 HTTP 206 兼容标记均为 true。
+- 月度 n8n：`9ZvARULB0wIp19yp`，active，8 节点，版本 `c6cec72f-5365-47e9-9323-09c51959e217`。
 - CBT n8n：`j5I4vcjwarGgols0`，active，3 节点，版本 `a8d9d9e6-efa8-4567-a78e-a991d4671c92`。
 - Base 旧版 65 行已迁到 `month_2026-08_original_20260907`；当前修正版 62 行，未静默覆盖旧证据。
 - CBT：官方导出 B 与修复计算 A 的件数、营收、佣金、物流、VAT、退款、广告、Full 仓储费均已对账通过。
-- 巴西：平台目标月 710 单详情，生成 6 行汇总；本土3店：平台目标月 1,014 单详情，生成 36 行汇总。
+- 巴西：平台目标月 710/710 单详情强制刷新完成，生成 6 行汇总；本土3店：平台目标月 1,014/1,014 单详情强制刷新完成，生成 36 行汇总。
 - 生产审计回读：`state=退回重算`、`ready_for_finance=false`、`ab_verified=false`、`next_card=none`。缺少本土两店官方导出 B 时，系统不会自动放行。
-- 完整测试：92 passed。财务证据包：`D:/Documents/财务与资产/outputs/mercadolibre-september-repair-20260907/美客多2026-08修复对账.xlsx`。
+- 完整测试：99 passed。财务证据包：`D:/Documents/财务与资产/outputs/mercadolibre-september-repair-20260907/美客多2026-08修复对账.xlsx`，SHA256=`90A76F1A20613995418F3AD8765B40BB00A3BCF515ACEFCA9520FB5330B33735`。
 
 ## 尚未完成
 
