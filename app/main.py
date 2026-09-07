@@ -2308,6 +2308,12 @@ async def admin_backfill_orders(seller_id: int, recent_n: int = 200, parent_user
                 "monthly backfill requires refresh_after=<stable unix timestamp> "
                 "so every mutable order detail is refreshed before reconciliation",
             )
+        if refresh_after > int(time.time()) + 30:
+            raise HTTPException(
+                400,
+                "refresh_after is ahead of the service clock; use a stable cutoff "
+                "at least 10 minutes before the caller clock to tolerate clock skew",
+            )
         yyyy, mm = (int(x) for x in month.split("-"))
         # Local stores must use the site's civil-month boundary. Mercado Libre's
         # bare /orders/search endpoint also requires the `order.` prefix below.

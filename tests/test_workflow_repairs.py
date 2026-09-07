@@ -41,6 +41,7 @@ class MonthlyWorkflowRepairTests(unittest.TestCase):
         backfill_code = nodes["Backfill 本土店 (own-token)"]["parameters"]["jsCode"]
         self.assertIn("month=${month}", backfill_code)
         self.assertIn("refresh_after=${refreshAfter}", backfill_code)
+        self.assertIn("Date.now() / 1000) - 600", backfill_code)
         self.assertIn("new_fetches === 0", backfill_code)
         self.assertIn("capped === false", backfill_code)
         self.assertIn("response.cached_month_unique === response.platform_total", backfill_code)

@@ -68,7 +68,9 @@ def _backfill_code(previous_code: str) -> str:
 const d = new Date(now.getFullYear(), now.getMonth() - 1, 1);
 const month = `${{d.getFullYear()}}-${{String(d.getMonth()+1).padStart(2,'0')}}`;
 const sellers = [2378517428, 3383185411];
-const refreshAfter = Math.floor(Date.now() / 1000);
+// Allow 10 minutes of cross-service clock skew. Details fetched within that
+// recent window are already fresh enough; all older scoped orders are refreshed.
+const refreshAfter = Math.floor(Date.now() / 1000) - 600;
 {token_line}
 const results = [];
 for (const seller_id of sellers) {{

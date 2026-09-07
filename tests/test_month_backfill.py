@@ -105,6 +105,17 @@ class MonthBackfillTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(HTTPException, "refresh_after"):
             await main.admin_backfill_orders(2378517428, month="2026-08")
 
+    async def test_month_backfill_rejects_a_cutoff_ahead_of_service_clock(self):
+        with (
+            patch.object(main.time, "time", return_value=1000),
+            self.assertRaisesRegex(HTTPException, "service clock"),
+        ):
+            await main.admin_backfill_orders(
+                2378517428,
+                month="2026-08",
+                refresh_after=1031,
+            )
+
     async def test_month_backfill_refreshes_stale_cached_order_details(self):
         search = SimpleNamespace(
             status_code=200,
