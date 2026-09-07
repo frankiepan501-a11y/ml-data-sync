@@ -225,7 +225,7 @@ class MonthlySyncSafetyTests(unittest.IsolatedAsyncioTestCase):
         feishu_token = AsyncMock(side_effect=AssertionError("Feishu write must not be reached"))
 
         with (
-            patch.object(db, "cache_list_orders_for_month", AsyncMock(return_value=[self._cached_order()])),
+            patch.object(db, "cache_list_orders_for_scope", AsyncMock(return_value=[self._cached_order()])),
             patch.object(lingxing, "fetch_all_products", AsyncMock(return_value={})),
             patch.object(lingxing, "fetch_fx_rate", AsyncMock(return_value={"MXN": 0.4})),
             patch.object(
@@ -249,7 +249,7 @@ class MonthlySyncSafetyTests(unittest.IsolatedAsyncioTestCase):
         failure_recorder = AsyncMock(return_value={"status": "ok"})
 
         with (
-            patch.object(db, "cache_list_orders_for_month", AsyncMock(return_value=[self._cached_order()])),
+            patch.object(db, "cache_list_orders_for_scope", AsyncMock(return_value=[self._cached_order()])),
             patch.object(lingxing, "fetch_all_products", AsyncMock(return_value={})),
             patch.object(lingxing, "fetch_fx_rate", AsyncMock(return_value={"MXN": 0.4})),
             patch.object(
@@ -285,7 +285,7 @@ class MonthlySyncSafetyTests(unittest.IsolatedAsyncioTestCase):
         }
 
         with (
-            patch.object(db, "cache_list_orders_for_month", AsyncMock(return_value=[self._cached_order()])),
+            patch.object(db, "cache_list_orders_for_scope", AsyncMock(return_value=[self._cached_order()])),
             patch.object(lingxing, "fetch_all_products", AsyncMock(return_value={})),
             patch.object(lingxing, "fetch_fx_rate", AsyncMock(return_value={"MXN": 0.4})),
             patch.object(advertising, "fetch_ad_items_for_month", AsyncMock(return_value=[_ad_row()])),
@@ -310,7 +310,7 @@ class MonthlySyncSafetyTests(unittest.IsolatedAsyncioTestCase):
         fake_client = _FakePostClient(responses)
         clear_recorder = AsyncMock(return_value={"status": "unchanged"})
         with (
-            patch.object(db, "cache_list_orders_for_month", AsyncMock(return_value=[self._cached_order()])),
+            patch.object(db, "cache_list_orders_for_scope", AsyncMock(return_value=[self._cached_order()])),
             patch.object(lingxing, "fetch_all_products", AsyncMock(return_value={})),
             patch.object(lingxing, "fetch_fx_rate", AsyncMock(return_value={"MXN": 0.4})),
             patch.object(advertising, "fetch_ad_items_for_month", AsyncMock(return_value=[_ad_row()])),
@@ -332,7 +332,7 @@ class MonthlySyncSafetyTests(unittest.IsolatedAsyncioTestCase):
         fake_client = _FakePostClient([({"code": 999}, 500)])
         metrics = copy.deepcopy(_ad_row()["metrics"])
         with (
-            patch.object(db, "cache_list_orders_for_month", AsyncMock(return_value=[self._cached_order()])),
+            patch.object(db, "cache_list_orders_for_scope", AsyncMock(return_value=[self._cached_order()])),
             patch.object(lingxing, "fetch_all_products", AsyncMock(return_value={})),
             patch.object(lingxing, "fetch_fx_rate", AsyncMock(return_value={"MXN": 0.4})),
             patch.object(advertising, "fetch_ad_items_for_month", AsyncMock(return_value=[_ad_row()])),
@@ -369,7 +369,7 @@ class MonthlySyncSafetyTests(unittest.IsolatedAsyncioTestCase):
         ])
         metrics = copy.deepcopy(_ad_row()["metrics"])
         with (
-            patch.object(db, "cache_list_orders_for_month", AsyncMock(return_value=[self._cached_order()])),
+            patch.object(db, "cache_list_orders_for_scope", AsyncMock(return_value=[self._cached_order()])),
             patch.object(lingxing, "fetch_all_products", AsyncMock(return_value={})),
             patch.object(lingxing, "fetch_fx_rate", AsyncMock(return_value={"MXN": 0.4})),
             patch.object(advertising, "fetch_ad_items_for_month", AsyncMock(return_value=[_ad_row()])),
@@ -396,7 +396,7 @@ class MonthlySyncSafetyTests(unittest.IsolatedAsyncioTestCase):
         ])
         metrics = copy.deepcopy(_ad_row()["metrics"])
         with (
-            patch.object(db, "cache_list_orders_for_month", AsyncMock(return_value=[self._cached_order()])),
+            patch.object(db, "cache_list_orders_for_scope", AsyncMock(return_value=[self._cached_order()])),
             patch.object(lingxing, "fetch_all_products", AsyncMock(return_value={})),
             patch.object(lingxing, "fetch_fx_rate", AsyncMock(return_value={"MXN": 0.4})),
             patch.object(advertising, "fetch_ad_items_for_month", AsyncMock(return_value=[_ad_row()])),

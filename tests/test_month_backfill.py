@@ -12,7 +12,7 @@ class MonthBackfillTests(unittest.IsolatedAsyncioTestCase):
         response = SimpleNamespace(status_code=200, json=lambda: {"results": [], "paging": {"total": 0}})
         with (
             patch.object(main.db, "get_token", AsyncMock(return_value={"access_token": "x", "app_key": "local_br"})),
-            patch.object(main.db, "cache_list_orders_for_month", AsyncMock(return_value=[])),
+            patch.object(main.db, "cache_list_orders_for_scope", AsyncMock(return_value=[])),
             patch.object(main, "_ml_get", AsyncMock(return_value=response)) as request,
         ):
             await main._report_sku_recent_impl(
@@ -32,7 +32,7 @@ class MonthBackfillTests(unittest.IsolatedAsyncioTestCase):
         response = SimpleNamespace(status_code=200, json=lambda: {"results": [], "paging": {"total": 0}})
         with (
             patch.object(main.db, "get_token", AsyncMock(return_value={"access_token": "x", "app_key": "cbt"})),
-            patch.object(main.db, "cache_list_orders_for_month", AsyncMock(return_value=[])),
+            patch.object(main.db, "cache_list_orders_for_scope", AsyncMock(return_value=[])),
             patch.object(main, "_ml_get", AsyncMock(return_value=response)) as request,
         ):
             await main._report_sku_recent_impl(
@@ -61,7 +61,8 @@ class MonthBackfillTests(unittest.IsolatedAsyncioTestCase):
         }
         with (
             patch.object(main, "_report_sku_recent_impl", AsyncMock(return_value=result)) as impl,
-            patch.object(main.db, "cache_list_orders_for_month", AsyncMock(return_value=[])),
+            patch.object(main.db, "cache_replace_month_scope", AsyncMock(return_value=0)),
+            patch.object(main.db, "cache_list_orders_for_scope", AsyncMock(return_value=[])),
         ):
             await main.admin_backfill_orders(2378517428, month="2026-08")
         self.assertEqual(impl.await_args.kwargs["date_from"], "2026-08-01T00:00:00.000-03:00")
@@ -69,13 +70,14 @@ class MonthBackfillTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(main, "_report_sku_recent_impl", AsyncMock(return_value=result)) as impl,
-            patch.object(main.db, "cache_list_orders_for_month", AsyncMock(return_value=[])),
+            patch.object(main.db, "cache_replace_month_scope", AsyncMock(return_value=0)),
+            patch.object(main.db, "cache_list_orders_for_scope", AsyncMock(return_value=[])),
         ):
             await main.admin_backfill_orders(3383185411, month="2026-08")
         self.assertEqual(impl.await_args.kwargs["date_from"], "2026-08-01T00:00:00.000-06:00")
         self.assertEqual(impl.await_args.kwargs["date_to"], "2026-09-01T00:00:00.000-06:00")
 
-    async def test_complete_backfill_prunes_only_cache_ids_outside_platform_window(self):
+    async def test_complete_backfill_replaces_authoritative_platform_month_scope(self):
         result = {
             "packs_returned": 2,
             "platform_total": 2,
@@ -87,17 +89,17 @@ class MonthBackfillTests(unittest.IsolatedAsyncioTestCase):
             "capped": False,
             "_platform_order_ids": [101, 102],
         }
-        cached = [{"order_id": 101}, {"order_id": 102}, {"order_id": 999}]
+        cached = [{"order_id": 101}, {"order_id": 102}]
         with (
             patch.object(main, "_report_sku_recent_impl", AsyncMock(return_value=result)),
-            patch.object(main.db, "cache_list_orders_for_month", AsyncMock(return_value=cached)),
-            patch.object(main.db, "cache_delete_orders", AsyncMock(return_value=1)) as delete,
+            patch.object(main.db, "cache_replace_month_scope", AsyncMock(return_value=2)) as replace,
+            patch.object(main.db, "cache_list_orders_for_scope", AsyncMock(return_value=cached)),
         ):
             response = await main.admin_backfill_orders(2378517428, month="2026-08")
 
-        delete.assert_awaited_once_with(2378517428, [999])
+        replace.assert_awaited_once_with(2378517428, "2026-08", [101, 102])
         self.assertEqual(response["cached_month_unique"], 2)
-        self.assertEqual(response["cache_extras_pruned"], 1)
+        self.assertTrue(response["month_scope_replaced"])
 
     async def test_monthly_search_rejects_missing_platform_total(self):
         response = SimpleNamespace(status_code=200, json=lambda: {"results": []})

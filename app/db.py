@@ -67,6 +67,17 @@ CREATE TABLE IF NOT EXISTS ml_order_cache (
 CREATE INDEX IF NOT EXISTS idx_ml_order_cache_seller ON ml_order_cache(seller_id);
 CREATE INDEX IF NOT EXISTS idx_ml_order_cache_date ON ml_order_cache(date_created);
 
+-- Authoritative seller/month membership captured from a complete ML date-window.
+-- date_created text alone cannot represent site-local civil-month boundaries.
+CREATE TABLE IF NOT EXISTS ml_month_order_scope (
+    seller_id  INTEGER NOT NULL,
+    month      TEXT NOT NULL,
+    order_id   INTEGER NOT NULL,
+    PRIMARY KEY (seller_id, month, order_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ml_month_order_scope_month
+ON ml_month_order_scope(seller_id, month);
+
 CREATE TABLE IF NOT EXISTS ml_shipping_cache (
     shipment_id     INTEGER PRIMARY KEY,
     seller_id       INTEGER,
@@ -1091,6 +1102,47 @@ async def cache_delete_orders(seller_id: int, order_ids: list[int]) -> int:
         )
         await db.commit()
         return int(cur.rowcount or 0)
+
+
+async def cache_replace_month_scope(seller_id: int, month: str, order_ids: list[int]) -> int:
+    """Atomically replace the authoritative platform order set for a seller/month."""
+    unique_ids = sorted({int(order_id) for order_id in order_ids})
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM ml_month_order_scope WHERE seller_id = ? AND month = ?",
+            (seller_id, month),
+        )
+        if unique_ids:
+            await db.executemany(
+                "INSERT INTO ml_month_order_scope (seller_id, month, order_id) VALUES (?, ?, ?)",
+                [(seller_id, month, order_id) for order_id in unique_ids],
+            )
+        await db.commit()
+    return len(unique_ids)
+
+
+async def cache_list_orders_for_scope(seller_id: int, month: str) -> list[dict[str, Any]]:
+    """Return cached details joined to the authoritative seller/month order set."""
+    import json as _j
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """
+            SELECT c.*
+            FROM ml_month_order_scope AS s
+            JOIN ml_order_cache AS c
+              ON c.order_id = s.order_id AND c.seller_id = s.seller_id
+            WHERE s.seller_id = ? AND s.month = ?
+            """,
+            (seller_id, month),
+        )
+        rows = [dict(r) for r in await cur.fetchall()]
+    for d in rows:
+        try:
+            d["_payload"] = _j.loads(d.pop("payload"))
+        except Exception:
+            d["_payload"] = None
+    return rows
 
 
 async def cache_list_orders_since(seller_id: int, since_iso: str) -> list[dict[str, Any]]:

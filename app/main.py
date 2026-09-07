@@ -58,6 +58,7 @@ def health():
         "ml_month_period_safe_20260907": True,
         "ml_month_numeric_normalized_20260907": True,
         "ml_month_cache_reconciled_20260907": True,
+        "ml_month_scope_authoritative_20260907": True,
     }
 
 
@@ -974,7 +975,7 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
     })
     cached_month_unique = None
     if windowed:
-        cached_month_rows = await db.cache_list_orders_for_month(seller_id, date_from[:7])
+        cached_month_rows = await db.cache_list_orders_for_scope(seller_id, date_from[:7])
         cached_month_unique = len({int(item["order_id"]) for item in cached_month_rows})
     return {
         "seller_id": seller_id,
@@ -1676,7 +1677,7 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
     period = period_label or f"month_{month}"
     sync_started_at = time.time_ns()
 
-    cached_rows = await db.cache_list_orders_for_month(seller_id, month)
+    cached_rows = await db.cache_list_orders_for_scope(seller_id, month)
     if not cached_rows:
         return {"status": "no_cache", "seller_id": seller_id, "month": month,
                 "hint": "Run /admin/backfill-orders to fill cache, or wait for webhook to populate."}
@@ -2302,6 +2303,7 @@ async def admin_backfill_orders(seller_id: int, recent_n: int = 200, parent_user
         max_detail_fetch=(max_detail_fetch if month else None),
     )
     cache_extras_pruned = 0
+    month_scope_replaced = False
     if month:
         platform_ids = {int(order_id) for order_id in (agg.get("_platform_order_ids") or [])}
         platform_total = agg.get("platform_total")
@@ -2314,17 +2316,16 @@ async def admin_backfill_orders(seller_id: int, recent_n: int = 200, parent_user
             and agg.get("orders_with_detail") == platform_total
         )
         if complete_detail_pass:
-            cached_rows = await db.cache_list_orders_for_month(seller_id, month)
-            cached_ids = {int(item["order_id"]) for item in cached_rows}
-            extras = sorted(cached_ids - platform_ids)
-            if extras:
-                cache_extras_pruned = await db.cache_delete_orders(seller_id, extras)
-                if cache_extras_pruned != len(extras):
-                    raise HTTPException(
-                        502,
-                        f"stale cache reconciliation failed expected={len(extras)} deleted={cache_extras_pruned}",
-                    )
-            agg["cached_month_unique"] = len(cached_ids - set(extras))
+            scope_count = await db.cache_replace_month_scope(seller_id, month, sorted(platform_ids))
+            scoped_rows = await db.cache_list_orders_for_scope(seller_id, month)
+            if scope_count != platform_total or len(scoped_rows) != platform_total:
+                raise HTTPException(
+                    502,
+                    f"month scope reconciliation failed platform={platform_total} "
+                    f"scope={scope_count} cached={len(scoped_rows)}",
+                )
+            agg["cached_month_unique"] = len(scoped_rows)
+            month_scope_replaced = True
     # Discard aggregation; the side-effect of cache_put_order is what we want.
     return {"status": "backfilled", "seller_id": seller_id, "parent_user_id": parent,
             "mode": ("month:" + month) if month else f"recent_{recent_n}",
@@ -2333,6 +2334,7 @@ async def admin_backfill_orders(seller_id: int, recent_n: int = 200, parent_user
             "orders_with_detail": agg.get("orders_with_detail"),
             "cached_month_unique": agg.get("cached_month_unique"),
             "cache_extras_pruned": cache_extras_pruned,
+            "month_scope_replaced": month_scope_replaced,
             "cache_hits": agg.get("cache_hits"),
             "new_fetches": agg.get("new_fetches"),
             "skipped_429": agg.get("skipped_429"),
