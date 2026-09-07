@@ -5,6 +5,7 @@ M2: tokens persisted to SQLite; admin endpoints for seed/list/refresh.
 
 import os
 import json
+import math
 import secrets
 import time
 import httpx
@@ -69,6 +70,9 @@ def health():
         "ml_month_ab_report_hash_20260907": True,
         "ml_unified_ab_gate_20260907": True,
         "ml_month_purchase_cost_fail_closed_20260907": True,
+        "ml_month_financial_numeric_fail_closed_20260907": True,
+        "ml_month_live_ab_hash_guard_20260907": True,
+        "ml_month_scope_replace_guard_20260907": True,
     }
 
 
@@ -848,6 +852,15 @@ def _monthly_detail_financial_issues(detail: dict, response) -> list[str]:
     }
     issues.extend(f"header:{name}" for name in sorted(missing_header & required_header_fields))
 
+    def _valid_amount(value, *, positive: bool = False) -> bool:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(number):
+            return False
+        return number > 0 if positive else number >= 0
+
     for name in ("id", "date_created", "status"):
         if detail.get(name) in (None, ""):
             issues.append(name)
@@ -868,13 +881,21 @@ def _monthly_detail_financial_issues(detail: dict, response) -> list[str]:
                 quantity = 0
             if not isinstance(item, dict) or "quantity" not in item or quantity <= 0:
                 issues.append(f"order_items[{index}].quantity")
-            if not isinstance(item, dict) or "sale_fee" not in item:
+            if (
+                not isinstance(item, dict)
+                or "sale_fee" not in item
+                or not _valid_amount(item.get("sale_fee"))
+            ):
                 issues.append(f"order_items[{index}].sale_fee")
             global_price = (item_data or {}).get("global_price") or {}
             if global_price:
-                if "amount" not in global_price or not global_price.get("currency"):
+                if not _valid_amount(global_price.get("amount")) or not global_price.get("currency"):
                     issues.append(f"order_items[{index}].global_price")
-            elif not isinstance(item, dict) or "unit_price" not in item or not (item.get("currency_id") or detail.get("currency_id")):
+            elif (
+                not isinstance(item, dict)
+                or not _valid_amount(item.get("unit_price"))
+                or not (item.get("currency_id") or detail.get("currency_id"))
+            ):
                 issues.append(f"order_items[{index}].unit_price_currency")
 
     if not isinstance(detail.get("payments"), list):
@@ -883,7 +904,7 @@ def _monthly_detail_financial_issues(detail: dict, response) -> list[str]:
     if not isinstance(shipping, dict) or not shipping.get("id"):
         issues.append("shipping.id")
     for name in ("paid_amount", "total_amount"):
-        if name not in detail:
+        if name not in detail or not _valid_amount(detail.get(name)):
             issues.append(name)
     return sorted(set(issues))
 
@@ -1317,11 +1338,16 @@ async def ml_unified_monthly(month: str | None = None, period: str | None = None
 
     normalized_period, _ = ml_close.normalize_period(month, period)
     if commit:
-        close_status = await ml_close.status_endpoint(period=normalized_period)
+        # Recompute the report hash from the live Base.  The status row alone
+        # may still describe an older, approved version after a manual edit.
+        close_status = await ml_close.audit(
+            period=normalized_period,
+            commit=False,
+            run_cost_preview=False,
+        )
         if (
             close_status.get("state") != "财务已确认终稿"
             or close_status.get("ab_verified") is not True
-            or close_status.get("ready_for_finance") is not True
         ):
             raise HTTPException(
                 409,
@@ -2026,6 +2052,15 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
     pulled_at_ms = int(_t.time() * 1000)
     records: list[dict] = []
     skus_missing_cost: list[str] = []
+    currencies_missing_fx: list[str] = []
+
+    def _positive_finite(value) -> float | None:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) and number > 0 else None
+
     for r in rows:
         rev = r["revenue_total"]; cnt = r["orders_count"]
         currency = r.get("currency") or "?"
@@ -2078,8 +2113,26 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
             "商品标题": r.get("sample_title") or "",
             "数据拉取时间": pulled_at_ms,
         }
-        fx = fx_map.get(currency)
-        if fx:
+        # Purchase cost is RMB-denominated and does not depend on the sales FX
+        # lookup.  Validate it even when the FX source is unavailable, otherwise
+        # an empty FX response could bypass the cost guard and replace good rows
+        # with incomplete RMB financials.
+        erp_sku = lingxing.resolve_erp_sku(r["sku"])
+        prod = products.get(erp_sku)
+        purchase_cost_rmb: float | None = None
+        if prod and prod.get("cg_price") is not None:
+            try:
+                cgp = _positive_finite(prod["cg_price"])
+                if cgp is None:
+                    raise ValueError("invalid cg_price")
+                purchase_cost_rmb = round(cgp * r["units"], 2)
+                fields["采购成本(RMB)"] = purchase_cost_rmb
+            except (TypeError, ValueError):
+                skus_missing_cost.append(r["sku"])
+        else:
+            skus_missing_cost.append(r["sku"])
+        fx = _positive_finite(fx_map.get(currency))
+        if fx is not None:
             fields["我的汇率"] = round(fx, 4)
             rev_rmb = rev * fx
             commission_rmb = commission_local * fx
@@ -2103,24 +2156,15 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
             fields["TACOS"] = round(tacos, 4)
             fields["自然销售(RMB)"] = round(natural_rmb, 2)
             fields["自然销售占比"] = round(natural_ratio, 4)
-            # cg_price from Lingxing. Resolve ML→ERP alias if any (e.g. CBT custom SKU).
-            erp_sku = lingxing.resolve_erp_sku(r["sku"])
-            prod = products.get(erp_sku)
-            if prod and prod.get("cg_price") is not None:
-                try:
-                    cgp = float(prod["cg_price"])
-                    cost_rmb = cgp * r["units"]
-                    fields["采购成本(RMB)"] = round(cost_rmb, 2)
-                    fields["简易毛利(RMB)"] = round(rev_rmb - cost_rmb, 2)
-                    # 🚨 全额毛利(RMB) 2026-06-17 task4 改为飞书**公式字段**(不再代码写):
-                    #   = 营收 - SUM(采购,佣金,广告,VAT,物流,退款,Full仓储,头程,海外仓)
-                    #   各写入方(主sync/CBT导出解析/美通)只写自己的成本列, 公式自动重算 → 无排序/幂等问题.
-                    #   折扣绝不进公式(已是折后K净额); 退款/头程/海外仓/Full仓储统一由公式扣.
-                    #   故此处不再 fields["全额毛利(RMB)"]=... (写公式字段会报错).
-                except (TypeError, ValueError):
-                    skus_missing_cost.append(r["sku"])
-            else:
-                skus_missing_cost.append(r["sku"])
+            if purchase_cost_rmb is not None:
+                fields["简易毛利(RMB)"] = round(rev_rmb - purchase_cost_rmb, 2)
+                # 🚨 全额毛利(RMB) 2026-06-17 task4 改为飞书**公式字段**(不再代码写):
+                #   = 营收 - SUM(采购,佣金,广告,VAT,物流,退款,Full仓储,头程,海外仓)
+                #   各写入方(主sync/CBT导出解析/美通)只写自己的成本列, 公式自动重算 → 无排序/幂等问题.
+                #   折扣绝不进公式(已是折后K净额); 退款/头程/海外仓/Full仓储统一由公式扣.
+                #   故此处不再 fields["全额毛利(RMB)"]=... (写公式字段会报错).
+        else:
+            currencies_missing_fx.append(currency)
         fs = _to_ms(r.get("first_seen")); ls = _to_ms(r.get("last_seen"))
         if fs: fields["首次销售日"] = fs
         if ls: fields["最后销售日"] = ls
@@ -2136,7 +2180,9 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
         prints_ = int(m.get("prints", 0))
         direct_local = m.get("direct_amount", 0.0)
         total_local = m.get("total_amount", 0.0)
-        fx_ad = fx_map.get(ad_currency) or 0
+        fx_ad = _positive_finite(fx_map.get(ad_currency)) or 0
+        if cost_local > 0 and not fx_ad:
+            currencies_missing_fx.append(ad_currency)
         cost_rmb = cost_local * fx_ad if fx_ad else 0
         prod = products.get(lingxing.resolve_erp_sku(sku)) or {}
         title = prod.get("product_name") or "(advertised but no sale)"
@@ -2166,7 +2212,9 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
 
     # If unallocated ad spend > 0 (item_id missing from cache + ML lookup failed), emit synthetic row
     if ad_unallocated_cost > 0:
-        unalloc_fx = fx_map.get(ad_currency) or 0
+        unalloc_fx = _positive_finite(fx_map.get(ad_currency)) or 0
+        if not unalloc_fx:
+            currencies_missing_fx.append(ad_currency)
         unalloc_rmb = ad_unallocated_cost * unalloc_fx if unalloc_fx else 0
         records.append({"fields": {
             "SKU": "_unallocated_ads",
@@ -2213,6 +2261,7 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
             "lingxing_product_count": len(products),
             "lingxing_error": lingxing_error,
             "missing_purchase_cost_skus": sorted(set(skus_missing_cost)),
+            "missing_fx_currencies": sorted(set(currencies_missing_fx)),
             "ad_rows": [
                 {
                     "sku": fields.get("SKU"),
@@ -2227,6 +2276,14 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
     # Fail closed before touching the production Base.  A temporary Lingxing
     # empty response used to replace otherwise valid monthly rows with blank
     # purchase costs, which made gross profit look materially too high.
+    if currencies_missing_fx:
+        missing_fx = sorted(set(currencies_missing_fx))
+        raise HTTPException(
+            422,
+            "汇率未完整取得；本次未写入，原报表数据保持不变。"
+            f" missing_currencies={missing_fx}"
+            + (f" lingxing_error={lingxing_error}" if lingxing_error else ""),
+        )
     if skus_missing_cost:
         missing = sorted(set(skus_missing_cost))
         raise HTTPException(

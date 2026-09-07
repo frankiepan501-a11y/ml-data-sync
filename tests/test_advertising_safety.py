@@ -345,6 +345,30 @@ class MonthlySyncSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.invalidate_ab.assert_not_awaited()
         feishu_token.assert_not_awaited()
 
+    async def test_missing_fx_blocks_commit_before_feishu_write(self):
+        feishu_token = AsyncMock(side_effect=AssertionError("Feishu write must not be reached"))
+        metrics = copy.deepcopy(_ad_row()["metrics"])
+        with (
+            patch.object(db, "cache_list_orders_for_scope", AsyncMock(return_value=[self._cached_order()])),
+            patch.object(lingxing, "fetch_all_products", AsyncMock(return_value=self._products())),
+            patch.object(lingxing, "fetch_fx_rate", AsyncMock(return_value={})),
+            patch.object(advertising, "fetch_ad_items_for_month", AsyncMock(return_value=[_ad_row()])),
+            patch.object(
+                advertising,
+                "attribute_ad_metrics_by_item_id",
+                AsyncMock(return_value=({"SKU1": metrics}, {}, [])),
+            ),
+            patch.object(advertising, "fetch_shop_visits_for_month", AsyncMock(return_value=0)),
+            patch.object(main, "_feishu_tenant_token", feishu_token),
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                await main._sync_feishu_monthly_impl(3383185411, "2026-07", commit=True)
+
+        self.assertEqual(422, ctx.exception.status_code)
+        self.assertIn("汇率未完整取得", str(ctx.exception.detail))
+        self.invalidate_ab.assert_not_awaited()
+        feishu_token.assert_not_awaited()
+
     async def _run_commit_with_feishu_responses(self, responses):
         metrics = copy.deepcopy(_ad_row()["metrics"])
         fake_client = _FakePostClient(responses)

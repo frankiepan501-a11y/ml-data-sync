@@ -1699,6 +1699,13 @@ async def _confirm_action_impl(
     if action in confirmation_actions and summary.get("next_card") == "error":
         reason = _text(summary.get("last_error")) or "月结存在未解决异常，确认已拦截。"
         return await _blocked_confirmation(reason)
+    approved_report_hash = _text(summary.get("report_hash"))
+    if action in confirmation_actions and (
+        summary.get("ab_verified") is not True or not approved_report_hash
+    ):
+        return await _blocked_confirmation(
+            "当前报表版本尚未完成 A/B 对账，本次确认已拦截。"
+        )
 
     if action in ("ml_profit_ops_confirm", "ml_profit_ops_waive_gap"):
         state = "运营已确认"
@@ -1738,7 +1745,18 @@ async def _confirm_action_impl(
                         guard_fields = guard_status.get("fields") or {}
                         if _text(guard_fields.get("状态")) == "财务已确认终稿":
                             block_reason = "本月已由财务确认终稿，旧运营卡片不能覆盖终稿状态。"
-                        else:
+                        if not block_reason:
+                            live_summary = await audit(
+                                period=period,
+                                commit=False,
+                                run_cost_preview=False,
+                            )
+                            if (
+                                live_summary.get("ab_verified") is not True
+                                or _text(live_summary.get("report_hash")) != approved_report_hash
+                            ):
+                                block_reason = "确认期间报表内容已变化，当前版本需重新完成 A/B 对账。"
+                        if not block_reason:
                             await _upsert_status(period, status_update, tok)
                             status = await _get_status(period, tok) or {}
                             finance_card = build_card("finance_final", summary, status.get("fields") or {})
@@ -1844,6 +1862,17 @@ async def _confirm_action_impl(
                 block_reason = f"当前月结状态为“{latest_state or '未知'}”，请先完成运营确认。"
             if not block_reason and _ACTION_EPOCHS.get(period) != action_epoch:
                 block_reason = "生成前收到新的月结操作，本次财务确认已拦截。"
+            if not block_reason:
+                live_before = await audit(
+                    period=period,
+                    commit=False,
+                    run_cost_preview=False,
+                )
+                if (
+                    live_before.get("ab_verified") is not True
+                    or _text(live_before.get("report_hash")) != approved_report_hash
+                ):
+                    block_reason = "生成前报表内容已变化，当前版本需重新完成 A/B 对账。"
 
             # 同一个月份从状态门禁、生成、回读到写终态都在同一把锁内，避免
             # “财务确认”和“退回重算”交叉覆盖。生成器自身另有跨进程持久占位。
@@ -1860,6 +1889,16 @@ async def _confirm_action_impl(
             if not block_reason:
                 # 外部接口失败标记不依赖本进程锁，所以生成后再读一次，确保
                 # 生成期间没有新出现的广告抓取失败。
+                live_after = await audit(
+                    period=period,
+                    commit=False,
+                    run_cost_preview=False,
+                )
+                if (
+                    live_after.get("ab_verified") is not True
+                    or _text(live_after.get("report_hash")) != approved_report_hash
+                ):
+                    block_reason = "生成期间报表内容已变化，终稿写入已拦截；请重新完成 A/B 对账。"
                 latest = await _get_status(period, tok) or {}
                 latest_fields = latest.get("fields") or {}
                 try:

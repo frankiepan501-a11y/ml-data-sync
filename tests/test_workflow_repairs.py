@@ -47,6 +47,7 @@ class MonthlyWorkflowRepairTests(unittest.TestCase):
         self.assertIn("capped === false", backfill_code)
         self.assertIn("response.cached_month_unique === response.platform_total", backfill_code)
         self.assertIn("response.window_orders === response.platform_total", backfill_code)
+        self.assertIn("response.month_scope_replaced === true", backfill_code)
         self.assertIn("return sellers.map(seller_id", backfill_code)
         self.assertIn("seller_id,", backfill_code)
         self.assertIn("const sellers = [2378517428, 3383185411]", backfill_code)

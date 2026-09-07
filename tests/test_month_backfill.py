@@ -1,3 +1,4 @@
+import copy
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -199,6 +200,37 @@ class MonthBackfillTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["skipped_other"], 0)
         self.assertEqual(result["partial_details"], [{"order_id": 101, "content_missing": "buyer,feedback"}])
 
+    def test_partial_detail_rejects_null_or_nonfinite_financial_amounts(self):
+        base = {
+            "id": 101,
+            "status": "paid",
+            "date_created": "2026-08-10T10:00:00.000-03:00",
+            "currency_id": "BRL",
+            "paid_amount": 100,
+            "total_amount": 100,
+            "payments": [],
+            "shipping": {"id": 501},
+            "order_items": [{
+                "item": {"id": "MLB1", "seller_sku": "SKU1"},
+                "quantity": 1,
+                "unit_price": 100,
+                "currency_id": "BRL",
+                "sale_fee": 10,
+            }],
+        }
+        response = SimpleNamespace(headers={"x-content-missing": "buyer"})
+        cases = [
+            ("sale_fee", lambda d: d["order_items"][0].__setitem__("sale_fee", None), "order_items[0].sale_fee"),
+            ("unit_price", lambda d: d["order_items"][0].__setitem__("unit_price", float("nan")), "order_items[0].unit_price_currency"),
+            ("paid_amount", lambda d: d.__setitem__("paid_amount", float("inf")), "paid_amount"),
+            ("total_amount", lambda d: d.__setitem__("total_amount", -1), "total_amount"),
+        ]
+        for label, mutate, expected in cases:
+            with self.subTest(label=label):
+                detail = copy.deepcopy(base)
+                mutate(detail)
+                self.assertIn(expected, main._monthly_detail_financial_issues(detail, response))
+
     async def test_month_backfill_rejects_partial_detail_missing_financial_fields(self):
         search = SimpleNamespace(
             status_code=200,
@@ -289,11 +321,11 @@ class MonthBackfillTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(
                 ml_close,
-                "status_endpoint",
+                "audit",
                 AsyncMock(return_value={
                     "state": "财务已确认终稿",
                     "ab_verified": False,
-                    "ready_for_finance": False,
+                    "report_hash": "changed-live-version",
                 }),
             ),
             patch("app.unified_report.generate", AsyncMock()) as generate,

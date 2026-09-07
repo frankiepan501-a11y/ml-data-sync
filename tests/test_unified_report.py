@@ -754,6 +754,7 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
             "next_card": "finance_final",
             "last_error": "",
             "ab_verified": True,
+            "report_hash": "v1",
         }
         self.current = {
             "record_id": "status-1",
@@ -833,6 +834,65 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
         final_writes = [c.args[1] for c in writer.await_args_list]
         self.assertFalse(any(f.get("状态") == "财务已确认终稿" for f in final_writes))
         self.assertTrue(any(f.get("状态") == "异常" for f in final_writes))
+
+    async def test_ops_confirmation_blocks_when_live_report_hash_changed(self):
+        changed = {**self.clean_summary, "ab_verified": False, "report_hash": "v2"}
+        writer = AsyncMock(return_value={"record_id": "status-1"})
+        with (
+            patch.object(ml_close, "_tenant_token", AsyncMock(return_value="token")),
+            patch.object(ml_close, "_get_status", AsyncMock(return_value=self.current)),
+            patch.object(ml_close, "_upsert_status", writer),
+            patch.object(ml_close, "_open_ad_failures", AsyncMock(return_value=[])),
+            patch.object(
+                ml_close,
+                "audit",
+                AsyncMock(side_effect=[self.clean_summary, changed]),
+            ),
+            patch.object(ml_close, "patch_or_fallback", AsyncMock(return_value={})),
+            patch.object(ml_close, "send_card", AsyncMock()),
+        ):
+            result = await ml_close.confirm_action({
+                "action": "ml_profit_ops_confirm",
+                "period": "month_2026-08",
+                "message_id": "om-ops-live-hash",
+                "operator_name": "运营",
+            })
+
+        self.assertEqual("blocked", result["status"])
+        self.assertIn("报表内容已变化", result["reason"])
+        self.assertFalse(any(call.args[1].get("状态") == "运营已确认" for call in writer.await_args_list))
+
+    async def test_finance_confirmation_blocks_when_report_changes_during_generation(self):
+        changed = {**self.clean_summary, "ab_verified": False, "report_hash": "v2"}
+        writer = AsyncMock(return_value={"record_id": "status-1"})
+        generated = {
+            "status": "ok",
+            "url": "https://u1wpma3xuhr.feishu.cn/wiki/wiki-new",
+            "content_hash": "hash-new",
+        }
+        with (
+            patch.object(ml_close, "_tenant_token", AsyncMock(return_value="token")),
+            patch.object(ml_close, "_get_status", AsyncMock(return_value=self.current)),
+            patch.object(ml_close, "_upsert_status", writer),
+            patch.object(ml_close, "_open_ad_failures", AsyncMock(return_value=[])),
+            patch.object(
+                ml_close,
+                "audit",
+                AsyncMock(side_effect=[self.clean_summary, self.clean_summary, changed]),
+            ),
+            patch.object(ml_close, "patch_or_fallback", AsyncMock(return_value={})),
+            patch.object(unified_report, "generate", AsyncMock(return_value=generated)),
+        ):
+            result = await ml_close.confirm_action({
+                "action": "ml_profit_finance_confirm",
+                "period": "month_2026-08",
+                "message_id": "om-finance-live-hash",
+                "operator_name": "财务",
+            })
+
+        self.assertEqual("blocked", result["status"])
+        self.assertIn("生成期间报表内容已变化", result["reason"])
+        self.assertFalse(any(call.args[1].get("状态") == "财务已确认终稿" for call in writer.await_args_list))
 
     async def test_finance_state_is_written_only_after_report_succeeds(self):
         writes = []
@@ -1294,6 +1354,8 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
                 "state": "待运营确认",
                 "next_card": "ops_final",
                 "last_error": "",
+                "ab_verified": True,
+                "report_hash": "v1",
             }
 
         sender = AsyncMock(return_value={"data": {"message_id": "om-finance-new"}})
