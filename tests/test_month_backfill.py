@@ -159,9 +159,24 @@ class MonthBackfillTests(unittest.IsolatedAsyncioTestCase):
             "id": 101,
             "status": "paid",
             "date_created": "2026-08-10T10:00:00.000-03:00",
-            "order_items": [],
+            "currency_id": "BRL",
+            "paid_amount": 100,
+            "total_amount": 100,
+            "payments": [],
+            "shipping": {"id": 501},
+            "order_items": [{
+                "item": {"id": "MLB1", "seller_sku": "SKU1"},
+                "quantity": 1,
+                "unit_price": 100,
+                "currency_id": "BRL",
+                "sale_fee": 10,
+            }],
         }
-        detail = SimpleNamespace(status_code=206, json=lambda: detail_payload)
+        detail = SimpleNamespace(
+            status_code=206,
+            headers={"x-content-missing": "buyer,feedback"},
+            json=lambda: detail_payload,
+        )
         with (
             patch.object(main.db, "get_token", AsyncMock(return_value={"access_token": "x", "app_key": "local_br"})),
             patch.object(main.db, "cache_get_order", AsyncMock(return_value=None)),
@@ -182,6 +197,55 @@ class MonthBackfillTests(unittest.IsolatedAsyncioTestCase):
         cache_put.assert_awaited_once_with(101, 2378517428, detail_payload)
         self.assertEqual(result["orders_with_detail"], 1)
         self.assertEqual(result["skipped_other"], 0)
+        self.assertEqual(result["partial_details"], [{"order_id": 101, "content_missing": "buyer,feedback"}])
+
+    async def test_month_backfill_rejects_partial_detail_missing_financial_fields(self):
+        search = SimpleNamespace(
+            status_code=200,
+            json=lambda: {"results": [{"id": 101}], "paging": {"total": 1}},
+        )
+        detail_payload = {
+            "id": 101,
+            "status": "paid",
+            "date_created": "2026-08-10T10:00:00.000-03:00",
+            "currency_id": "BRL",
+            "paid_amount": 100,
+            "total_amount": 100,
+            "payments": [],
+            "order_items": [{
+                "item": {"id": "MLB1", "seller_sku": "SKU1"},
+                "quantity": 1,
+                "unit_price": 100,
+                "currency_id": "BRL",
+                "sale_fee": 10,
+            }],
+        }
+        detail = SimpleNamespace(
+            status_code=206,
+            headers={"x-content-missing": "shipping"},
+            json=lambda: detail_payload,
+        )
+        with (
+            patch.object(main.db, "get_token", AsyncMock(return_value={"access_token": "x", "app_key": "local_br"})),
+            patch.object(main.db, "cache_get_order", AsyncMock(return_value=None)),
+            patch.object(main.db, "cache_put_order", AsyncMock()) as cache_put,
+            patch.object(main.db, "cache_list_orders_for_scope", AsyncMock(return_value=[])),
+            patch.object(main, "_ml_get", AsyncMock(side_effect=[search, detail])),
+        ):
+            result = await main._report_sku_recent_impl(
+                2378517428,
+                200,
+                2378517428,
+                date_from="2026-08-01T00:00:00.000-03:00",
+                date_to="2026-09-01T00:00:00.000-03:00",
+                max_detail_fetch=100,
+                refresh_after=1000,
+            )
+
+        cache_put.assert_not_awaited()
+        self.assertEqual(result["orders_with_detail"], 0)
+        self.assertEqual(result["skipped_other"], 1)
+        self.assertIn("header:shipping", result["detail_failures"][0]["issues"])
 
     async def test_monthly_search_rejects_missing_platform_total(self):
         response = SimpleNamespace(status_code=200, json=lambda: {"results": []})
@@ -217,8 +281,28 @@ class MonthBackfillTests(unittest.IsolatedAsyncioTestCase):
     async def test_meitong_business_error_is_non_2xx(self):
         with patch("app.meitong_cost.run", return_value={"status": "error", "msg": "upstream failed"}):
             with self.assertRaises(HTTPException) as raised:
-                main.sync_meitong_cost("month_2026-08", commit=True)
+                with patch.object(ml_close, "invalidate_ab_verification", AsyncMock()):
+                    await main.sync_meitong_cost("month_2026-08", commit=True)
         self.assertEqual(raised.exception.status_code, 502)
+
+    async def test_unified_commit_requires_current_ab_verification(self):
+        with (
+            patch.object(
+                ml_close,
+                "status_endpoint",
+                AsyncMock(return_value={
+                    "state": "财务已确认终稿",
+                    "ab_verified": False,
+                    "ready_for_finance": False,
+                }),
+            ),
+            patch("app.unified_report.generate", AsyncMock()) as generate,
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await main.ml_unified_monthly(period="month_2026-08", commit=True)
+
+        self.assertEqual(raised.exception.status_code, 409)
+        generate.assert_not_awaited()
 
     def test_rejected_month_stays_blocked_until_ab_is_explicitly_verified(self):
         self.assertEqual(
@@ -243,10 +327,12 @@ class MonthBackfillTests(unittest.IsolatedAsyncioTestCase):
         )
 
     def test_ab_verification_is_persisted_unless_explicitly_revoked(self):
-        prior = {"最后结果JSON": '{"ab_verified": true}'}
-        self.assertTrue(ml_close._resolve_ab_verified(prior, None))
-        self.assertFalse(ml_close._resolve_ab_verified(prior, False))
-        self.assertTrue(ml_close._resolve_ab_verified({}, True))
+        prior = {"最后结果JSON": '{"ab_verified": true, "report_hash": "v1", "ab_report_hash": "v1"}'}
+        self.assertTrue(ml_close._resolve_ab_verified(prior, None, "v1"))
+        self.assertFalse(ml_close._resolve_ab_verified(prior, None, "v2"))
+        self.assertFalse(ml_close._resolve_ab_verified(prior, False, "v1"))
+        self.assertTrue(ml_close._resolve_ab_verified({}, True, "v1"))
+        self.assertFalse(ml_close._resolve_ab_verified({}, True, ""))
 
 
 if __name__ == "__main__":

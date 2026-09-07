@@ -65,6 +65,9 @@ def health():
         "ml_month_refresh_clock_skew_20260907": True,
         "ml_month_detail_failure_visible_20260907": True,
         "ml_month_partial_detail_accepted_20260907": True,
+        "ml_month_partial_financial_fields_guarded_20260907": True,
+        "ml_month_ab_report_hash_20260907": True,
+        "ml_unified_ab_gate_20260907": True,
     }
 
 
@@ -686,6 +689,9 @@ async def cbt_ingest(month: str, commit: bool = False, fx: float = 6.8628,
     import traceback
     from app import cbt_ingest as _ci
     try:
+        if commit:
+            from app import ml_close
+            await ml_close.invalidate_ab_verification(f"month_{month}", "cbt_ingest")
         result = await _ci.run(
             month,
             commit=commit,
@@ -825,6 +831,62 @@ async def report_sku_recent(
         return {"status": "error", "exc": type(e).__name__, "msg": str(e), "traceback": traceback.format_exc()}
 
 
+def _monthly_detail_financial_issues(detail: dict, response) -> list[str]:
+    """Return missing fields that make an order unsafe for monthly finance."""
+    issues: list[str] = []
+    headers = getattr(response, "headers", {}) or {}
+    raw_missing = headers.get("x-content-missing") or headers.get("X-Content-Missing") or ""
+    missing_header = {
+        part.strip().lower()
+        for part in str(raw_missing).replace(";", ",").split(",")
+        if part.strip()
+    }
+    required_header_fields = {
+        "order_items", "payments", "shipping", "date_created", "currency_id",
+        "status", "paid_amount", "total_amount",
+    }
+    issues.extend(f"header:{name}" for name in sorted(missing_header & required_header_fields))
+
+    for name in ("id", "date_created", "status"):
+        if detail.get(name) in (None, ""):
+            issues.append(name)
+    if detail.get("status") == "cancelled":
+        return sorted(set(issues))
+
+    order_items = detail.get("order_items")
+    if not isinstance(order_items, list) or not order_items:
+        issues.append("order_items")
+    else:
+        for index, item in enumerate(order_items):
+            item_data = item.get("item") if isinstance(item, dict) else None
+            if not isinstance(item_data, dict) or not item_data.get("id"):
+                issues.append(f"order_items[{index}].item.id")
+            try:
+                quantity = int(item.get("quantity") or 0) if isinstance(item, dict) else 0
+            except (TypeError, ValueError):
+                quantity = 0
+            if not isinstance(item, dict) or "quantity" not in item or quantity <= 0:
+                issues.append(f"order_items[{index}].quantity")
+            if not isinstance(item, dict) or "sale_fee" not in item:
+                issues.append(f"order_items[{index}].sale_fee")
+            global_price = (item_data or {}).get("global_price") or {}
+            if global_price:
+                if "amount" not in global_price or not global_price.get("currency"):
+                    issues.append(f"order_items[{index}].global_price")
+            elif not isinstance(item, dict) or "unit_price" not in item or not (item.get("currency_id") or detail.get("currency_id")):
+                issues.append(f"order_items[{index}].unit_price_currency")
+
+    if not isinstance(detail.get("payments"), list):
+        issues.append("payments")
+    shipping = detail.get("shipping")
+    if not isinstance(shipping, dict) or not shipping.get("id"):
+        issues.append("shipping.id")
+    for name in ("paid_amount", "total_amount"):
+        if name not in detail:
+            issues.append(name)
+    return sorted(set(issues))
+
+
 async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id: int,
                                   date_from: str | None = None, date_to: str | None = None,
                                   max_detail_fetch: int | None = None,
@@ -909,6 +971,7 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
         new_fetches = 0
         capped = False
         detail_failures: list[dict] = []
+        partial_details: list[dict] = []
         for pack in packs:
             if capped:
                 break
@@ -941,13 +1004,29 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
                     break
                 rd = await _ml_get(client, f"{orders_detail_prefix}/{order_id}", headers)
                 new_fetches += 1
-                # Mercado Libre can return HTTP 206 (Partial Content) for a
-                # readable order whose private fields are partially masked.
-                # The order payload is still valid for monthly aggregation.
                 if 200 <= rd.status_code < 300:
                     detail = rd.json()
-                    order_details.append(detail)
-                    await db.cache_put_order(int(order_id), seller_id, detail)
+                    issues = _monthly_detail_financial_issues(detail, rd) if windowed else []
+                    if issues:
+                        skipped_other += 1
+                        detail_failures.append(
+                            {"order_id": int(order_id), "status": rd.status_code, "issues": issues}
+                        )
+                    else:
+                        order_details.append(detail)
+                        await db.cache_put_order(int(order_id), seller_id, detail)
+                        if rd.status_code == 206:
+                            headers = getattr(rd, "headers", {}) or {}
+                            partial_details.append(
+                                {
+                                    "order_id": int(order_id),
+                                    "content_missing": (
+                                        headers.get("x-content-missing")
+                                        or headers.get("X-Content-Missing")
+                                        or ""
+                                    ),
+                                }
+                            )
                 elif rd.status_code == 429:
                     skipped_429 += 1
                     detail_failures.append({"order_id": int(order_id), "status": 429})
@@ -1013,6 +1092,7 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
         "skipped_429": skipped_429,
         "skipped_other": skipped_other,
         "detail_failures": detail_failures,
+        "partial_details": partial_details,
         "unique_skus": len(rows),
         "rows": rows,
         "_platform_order_ids": platform_order_ids,
@@ -1108,15 +1188,17 @@ async def procurement_ml_stock(skus: str):
 
 
 @app.post("/report/sync-meitong-cost", dependencies=[Depends(require_service_token)])
-def sync_meitong_cost(period: str, months: int = 12, commit: bool = False):
+async def sync_meitong_cost(period: str, months: int = 12, commit: bool = False):
     """美通中转 头程/海外仓成本 → ML报表两列(方案A: 只灌经美通中转SKU, 其余留空)。
     源: 美通订单API(头程=收费重×费率快照) + 指令明细(海外仓=换标箱数×单箱费快照), 不碰美通账单。
     period 如 month_2026-04; months=单价滚动窗口(默认12); commit=False 只预览不写。
     月度 cron 应在 sync-feishu-monthly 之后调(当月行先生成)。sync 同步(urllib), FastAPI 自动 threadpool。"""
     import traceback
-    from app import meitong_cost
+    from app import meitong_cost, ml_close
     try:
-        result = meitong_cost.run(period, months, commit)
+        if commit:
+            await ml_close.invalidate_ab_verification(period, "meitong_cost_sync")
+        result = await run_in_threadpool(meitong_cost.run, period, months, commit)
         if result.get("status") == "error":
             raise HTTPException(status_code=502, detail=result)
         return result
@@ -1235,10 +1317,14 @@ async def ml_unified_monthly(month: str | None = None, period: str | None = None
     normalized_period, _ = ml_close.normalize_period(month, period)
     if commit:
         close_status = await ml_close.status_endpoint(period=normalized_period)
-        if close_status.get("state") != "财务已确认终稿":
+        if (
+            close_status.get("state") != "财务已确认终稿"
+            or close_status.get("ab_verified") is not True
+            or close_status.get("ready_for_finance") is not True
+        ):
             raise HTTPException(
                 409,
-                f"{normalized_period} 尚未财务确认终稿；只允许 commit=false 预览。",
+                f"{normalized_period} 尚未完成当前报表版本的 A/B 与财务终稿确认；只允许 commit=false 预览。",
             )
     try:
         return await unified_report.generate(normalized_period, commit=commit)
@@ -1632,6 +1718,10 @@ async def report_sync_feishu(
         if ls:
             record["fields"]["最后销售日"] = ls
         records.append(record)
+
+    if period.startswith("month_"):
+        from app import ml_close
+        await ml_close.invalidate_ab_verification(period, "recent_sync_to_month_period")
 
     # batch insert
     async with httpx.AsyncClient(timeout=30) as client:
@@ -2130,6 +2220,9 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
             ],
         }
 
+    from app import ml_close
+    await ml_close.invalidate_ab_verification(period, "local_monthly_sync")
+
     # Safe replace: create the fresh seller/month set first, then delete the old set.
     # If old-row deletion fails, remove the newly created rows to preserve the old snapshot.
     shop_label = SHOP_LABEL[seller_id]
@@ -2379,6 +2472,7 @@ async def admin_backfill_orders(seller_id: int, recent_n: int = 200, parent_user
             "skipped_429": agg.get("skipped_429"),
             "skipped_other": agg.get("skipped_other"),
             "detail_failures": agg.get("detail_failures"),
+            "partial_details": agg.get("partial_details"),
             "capped": agg.get("capped"),
             "note": "Repeat until new_fetches=0 & capped=false, then /report/sync-feishu-monthly."}
 

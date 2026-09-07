@@ -197,6 +197,17 @@ class AdvertisingFetchSafetyTests(unittest.IsolatedAsyncioTestCase):
 
 
 class MonthlySyncSafetyTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.invalidate_patcher = patch.object(
+            ml_close,
+            "invalidate_ab_verification",
+            AsyncMock(return_value={"status": "invalidated"}),
+        )
+        self.invalidate_ab = self.invalidate_patcher.start()
+
+    def tearDown(self):
+        self.invalidate_patcher.stop()
+
     @staticmethod
     def _cached_order():
         return {
@@ -327,6 +338,28 @@ class MonthlySyncSafetyTests(unittest.IsolatedAsyncioTestCase):
             result = await main._sync_feishu_monthly_impl(3383185411, "2026-07", commit=True)
         self.clear_recorder = clear_recorder
         return result, fake_client
+
+    async def test_monthly_commit_revokes_ab_before_base_write(self):
+        fake_client = _FakePostClient([({"code": 999}, 500)])
+        metrics = copy.deepcopy(_ad_row()["metrics"])
+        with (
+            patch.object(db, "cache_list_orders_for_scope", AsyncMock(return_value=[self._cached_order()])),
+            patch.object(lingxing, "fetch_all_products", AsyncMock(return_value={})),
+            patch.object(lingxing, "fetch_fx_rate", AsyncMock(return_value={"MXN": 0.4})),
+            patch.object(advertising, "fetch_ad_items_for_month", AsyncMock(return_value=[_ad_row()])),
+            patch.object(
+                advertising,
+                "attribute_ad_metrics_by_item_id",
+                AsyncMock(return_value=({"SKU1": metrics}, {}, [])),
+            ),
+            patch.object(advertising, "fetch_shop_visits_for_month", AsyncMock(return_value=0)),
+            patch.object(main, "_feishu_tenant_token", AsyncMock(return_value="test")),
+            patch.object(main.httpx, "AsyncClient", return_value=fake_client),
+            self.assertRaises(HTTPException),
+        ):
+            await main._sync_feishu_monthly_impl(3383185411, "2026-07", commit=True)
+
+        self.invalidate_ab.assert_awaited_with("month_2026-07", "local_monthly_sync")
 
     async def test_feishu_lookup_failure_stops_before_delete_or_create(self):
         fake_client = _FakePostClient([({"code": 999}, 500)])
@@ -777,7 +810,7 @@ class MonthlyCloseAdvertisingFailureTests(unittest.IsolatedAsyncioTestCase):
         self.db_list_failures.side_effect = [[], [{"shop": "ML 本土3店"}]]
         current = {
             "record_id": "rec-status",
-            "fields": {"状态": "待运营确认", "最后结果JSON": '{"ab_verified": true}'},
+            "fields": {"状态": "待运营确认", "最后结果JSON": '{"ab_verified": true, "report_hash": "v1", "ab_report_hash": "v1"}'},
         }
         clean_summary = {
             "status": "ok",

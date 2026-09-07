@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as _dt
+import hashlib
 import json
 import os
 import time
@@ -189,6 +190,26 @@ def _last_result(fields: dict[str, Any]) -> dict[str, Any]:
         return {}
 
 
+def _report_content_hash(rows: list[dict[str, Any]]) -> str:
+    """Bind an A/B approval to the exact Base record version it reviewed."""
+    normalized = [
+        {
+            "record_id": _text(row.get("record_id")),
+            "fields": row.get("fields") or {},
+        }
+        for row in rows
+    ]
+    normalized.sort(key=lambda row: row["record_id"])
+    encoded = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest() if normalized else ""
+
+
 def _failed_ad_shops(fields: dict[str, Any]) -> list[str]:
     result = _last_result(fields)
     shops = result.get("failed_ad_shops") or []
@@ -238,11 +259,41 @@ def _close_state(
 def _resolve_ab_verified(
     prior_fields: dict[str, Any],
     requested: bool | None,
+    current_report_hash: str | None = None,
 ) -> bool:
-    """Persist an explicit A/B decision; omission inherits the last audit result."""
+    """Resolve A/B only when approval is bound to the current report version."""
     if requested is not None:
-        return bool(requested)
-    return bool(_last_result(prior_fields).get("ab_verified"))
+        return bool(requested and current_report_hash)
+    result = _last_result(prior_fields)
+    approved_hash = _text(result.get("ab_report_hash"))
+    candidate_hash = current_report_hash if current_report_hash is not None else _text(result.get("report_hash"))
+    return bool(result.get("ab_verified") and approved_hash and candidate_hash and approved_hash == candidate_hash)
+
+
+async def invalidate_ab_verification(period: str, reason: str) -> dict[str, Any]:
+    """Revoke A/B before any production writer can mutate the monthly report."""
+    async with _status_mutation_lock(period):
+        tok = await _tenant_token()
+        status = await _get_status(period, tok)
+        fields = status.get("fields", {}) if status else {}
+        result = _last_result(fields)
+        result.update(
+            {
+                "period": period,
+                "ab_verified": False,
+                "ab_report_hash": "",
+                "ab_invalidated_reason": reason,
+                "ab_invalidated_at": int(time.time() * 1000),
+            }
+        )
+        return await _upsert_status(
+            period,
+            {
+                "状态": "退回重算",
+                "最后结果JSON": json.dumps(result, ensure_ascii=False),
+            },
+            tok,
+        )
 
 
 async def _open_ad_failures(period: str, status_fields: dict[str, Any] | None = None) -> list[str]:
@@ -482,6 +533,10 @@ async def _commit_audit_snapshot(
         "cbt_state": _text(result.get("cbt_state")),
         "last_error": last_error[:500],
         "ab_verified": bool(result.get("ab_verified")),
+        "report_hash": _text(result.get("report_hash")),
+        "ab_report_hash": (
+            _text(result.get("report_hash")) if result.get("ab_verified") else ""
+        ),
     }
     fields = {
         "月份": month,
@@ -519,8 +574,6 @@ async def audit(
     prior = await _get_status(period, tok)
     prior_fields = prior.get("fields", {}) if prior else {}
     prior_state = _text(prior_fields.get("状态"))
-    prior_result = _last_result(prior_fields)
-    effective_ab_verified = _resolve_ab_verified(prior_fields, ab_verified)
     marker_error = ""
     try:
         prior_failed_ad_shops = await _open_ad_failures(period, prior_fields)
@@ -529,6 +582,8 @@ async def audit(
         marker_error = f"广告失败状态读取失败：{type(e).__name__}"
     records = await _list_records(tok, REPORT_TABLE_ID)
     rows = [r for r in records if _text(r.get("fields", {}).get("周期")) == period]
+    report_hash = _report_content_hash(rows)
+    effective_ab_verified = _resolve_ab_verified(prior_fields, ab_verified, report_hash)
 
     cost_error = ""
     if cost_summary is None and run_cost_preview:
@@ -637,6 +692,7 @@ async def audit(
         "last_error": last_error,
         "failed_ad_shops": prior_failed_ad_shops,
         "ab_verified": effective_ab_verified,
+        "report_hash": report_hash,
     }
 
     if commit:
@@ -1206,7 +1262,9 @@ async def status_endpoint(month: str | None = None, period: str | None = None) -
         failed_ad_shops = _failed_ad_shops(fields)
         marker_error = f"广告失败状态读取失败：{type(e).__name__}"
     state = "异常" if failed_ad_shops or marker_error else (_text(fields.get("状态")) if fields else "待数据同步")
-    ab_verified = _resolve_ab_verified(fields, None)
+    result = _last_result(fields)
+    report_hash = _text(result.get("report_hash"))
+    ab_verified = _resolve_ab_verified(fields, None, report_hash)
     return {
         "status": "ok",
         "period": period,
@@ -1214,6 +1272,7 @@ async def status_endpoint(month: str | None = None, period: str | None = None) -
         "state": state,
         "ready_for_finance": ab_verified and state in ("运营已确认", "财务已确认终稿"),
         "ab_verified": ab_verified,
+        "report_hash": report_hash,
         "failed_ad_shops": failed_ad_shops,
         "marker_error": marker_error,
         "record": status,
@@ -1228,6 +1287,8 @@ async def recalc_cost(
     ab_verified: bool | None = None,
 ) -> dict[str, Any]:
     period, month = normalize_period(month, period)
+    if commit:
+        await invalidate_ab_verification(period, "cost_recalc")
     cost = await anyio.to_thread.run_sync(meitong_cost.run, period, 12, commit)
     summary = await audit(
         period=period,
