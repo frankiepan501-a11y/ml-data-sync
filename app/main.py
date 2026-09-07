@@ -64,6 +64,7 @@ def health():
         "ml_month_ab_gate_persisted_20260907": True,
         "ml_month_refresh_clock_skew_20260907": True,
         "ml_month_detail_failure_visible_20260907": True,
+        "ml_month_partial_detail_accepted_20260907": True,
     }
 
 
@@ -940,7 +941,10 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
                     break
                 rd = await _ml_get(client, f"{orders_detail_prefix}/{order_id}", headers)
                 new_fetches += 1
-                if rd.status_code == 200:
+                # Mercado Libre can return HTTP 206 (Partial Content) for a
+                # readable order whose private fields are partially masked.
+                # The order payload is still valid for monthly aggregation.
+                if 200 <= rd.status_code < 300:
                     detail = rd.json()
                     order_details.append(detail)
                     await db.cache_put_order(int(order_id), seller_id, detail)

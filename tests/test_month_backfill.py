@@ -150,6 +150,39 @@ class MonthBackfillTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["new_fetches"], 1)
         self.assertEqual(result["orders_with_detail"], 1)
 
+    async def test_month_backfill_accepts_partial_content_order_detail(self):
+        search = SimpleNamespace(
+            status_code=200,
+            json=lambda: {"results": [{"id": 101}], "paging": {"total": 1}},
+        )
+        detail_payload = {
+            "id": 101,
+            "status": "paid",
+            "date_created": "2026-08-10T10:00:00.000-03:00",
+            "order_items": [],
+        }
+        detail = SimpleNamespace(status_code=206, json=lambda: detail_payload)
+        with (
+            patch.object(main.db, "get_token", AsyncMock(return_value={"access_token": "x", "app_key": "local_br"})),
+            patch.object(main.db, "cache_get_order", AsyncMock(return_value=None)),
+            patch.object(main.db, "cache_put_order", AsyncMock()) as cache_put,
+            patch.object(main.db, "cache_list_orders_for_scope", AsyncMock(return_value=[])),
+            patch.object(main, "_ml_get", AsyncMock(side_effect=[search, detail])),
+        ):
+            result = await main._report_sku_recent_impl(
+                2378517428,
+                200,
+                2378517428,
+                date_from="2026-08-01T00:00:00.000-03:00",
+                date_to="2026-09-01T00:00:00.000-03:00",
+                max_detail_fetch=100,
+                refresh_after=1000,
+            )
+
+        cache_put.assert_awaited_once_with(101, 2378517428, detail_payload)
+        self.assertEqual(result["orders_with_detail"], 1)
+        self.assertEqual(result["skipped_other"], 0)
+
     async def test_monthly_search_rejects_missing_platform_total(self):
         response = SimpleNamespace(status_code=200, json=lambda: {"results": []})
         with (
