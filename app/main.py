@@ -83,6 +83,7 @@ def health():
         "ml_month_billing_adjustments_20260908": True,
         "ml_billing_first_page_cursor_20260908": True,
         "ml_billing_remaining_total_20260908": True,
+        "ml_billing_failure_cause_visible_20260908": True,
         "ml_month_manual_logistics_preserve_20260908": True,
     }
 
@@ -2116,6 +2117,7 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
             detail=(
                 f"账单费用抓取失败：{SHOP_LABEL[seller_id]} / {month}。"
                 "本次未写入，原报表数据保持不变；禁止将抓取失败自动记为 0。"
+                f" cause={type(e).__name__}:{str(e)[:300]}"
             ),
         ) from e
     billing_currency = str(billing_adjustments.get("currency") or rows[0].get("currency") or "?")
@@ -2492,7 +2494,7 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
         2,
     )
     vat_local_total_value = round(
-        sum(float((record.get("fields") or {}).get("VAT/税费(原币)") or 0) for record in records),
+        sum(float((record.get("fields") or {}).get("VAT估算(原币)") or 0) for record in records),
         2,
     )
     if not commit:
