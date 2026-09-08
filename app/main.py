@@ -80,6 +80,7 @@ def health():
         "ml_month_date_closed_scope_20260908": True,
         "ml_month_shipping_complete_20260908": True,
         "ml_month_billing_adjustments_20260908": True,
+        "ml_billing_first_page_cursor_20260908": True,
         "ml_month_manual_logistics_preserve_20260908": True,
     }
 
