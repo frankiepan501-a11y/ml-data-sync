@@ -41,6 +41,15 @@ def require_service_token(authorization: str | None = Header(default=None)) -> N
         raise HTTPException(401, "invalid service token")
 
 
+def _feishu_cell_text(value) -> str:
+    """Normalize Feishu text/formula cells to a stable comparison string."""
+    if isinstance(value, list):
+        return ",".join(part for part in (_feishu_cell_text(item) for item in value) if part)
+    if isinstance(value, dict):
+        return str(value.get("text") or value.get("name") or value.get("value") or "")
+    return "" if value is None else str(value)
+
+
 # ---------- public ----------
 
 @app.get("/")
@@ -90,6 +99,7 @@ def health():
         "lingxing_product_empty_retry_20260908": True,
         "ml_month_logistics_archive_restore_20260908": True,
         "ml_shipping_package_dedupe_20260908": True,
+        "ml_month_logistics_sku_cell_normalized_20260908": True,
         "ml_month_manual_logistics_preserve_20260908": True,
     }
 
@@ -2679,7 +2689,7 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
         existing_costs_by_sku: dict[str, dict] = {}
         for item in cost_source_items:
             old_fields = item.get("fields") or {}
-            sku = str(old_fields.get("SKU") or "").strip()
+            sku = _feishu_cell_text(old_fields.get("SKU")).strip()
             if not sku:
                 continue
             preserved = {
@@ -2691,10 +2701,10 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
                 existing_costs_by_sku[sku] = preserved
         if logistics_source_period:
             missing_source_skus = sorted({
-                str((record.get("fields") or {}).get("SKU") or "").strip()
+                _feishu_cell_text((record.get("fields") or {}).get("SKU")).strip()
                 for record in records
                 if float((record.get("fields") or {}).get("件数") or 0) > 0
-                and str((record.get("fields") or {}).get("SKU") or "").strip()
+                and _feishu_cell_text((record.get("fields") or {}).get("SKU")).strip()
                 not in existing_costs_by_sku
             })
             if missing_source_skus:
@@ -2705,7 +2715,7 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
                 )
         for record in records:
             new_fields = record.get("fields") or {}
-            preserved = existing_costs_by_sku.get(str(new_fields.get("SKU") or "").strip())
+            preserved = existing_costs_by_sku.get(_feishu_cell_text(new_fields.get("SKU")).strip())
             if preserved:
                 new_fields.update(preserved)
         if len(existing_ids) > 500 or len(records) > 500:

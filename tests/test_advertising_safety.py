@@ -758,7 +758,7 @@ class MonthlySyncSafetyTests(unittest.IsolatedAsyncioTestCase):
         result, fake_client = await self._run_commit_with_feishu_responses([
             ({"code": 0, "data": {
                 "items": [{"record_id": "rec-old", "fields": {
-                    "SKU": "SKU1",
+                    "SKU": [{"type": "text", "text": "SKU1"}],
                     "头程成本(RMB)": 12.34,
                     "海外仓成本(RMB)": 0,
                 }}],
