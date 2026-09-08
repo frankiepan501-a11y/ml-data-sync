@@ -122,6 +122,8 @@ class BillingAdjustmentTests(unittest.TestCase):
             row(37, "Tarifa por devolução", "CDFR", 4),
             row(38, "Estorno da tarifa por devolução", "BDFR", 1, "BONUS"),
             row(39, "Tarifa pelo serviço de armazenamento Full", "CFWA", 5),
+            row(40, "Tarifa por envio interno ao município", "CFFI", 6),
+            row(41, "Custo do serviço de coleta Full", "CFCBI", 7),
         ]
 
         result = billing.summarize_month_details(details, "2026-08")
@@ -129,7 +131,7 @@ class BillingAdjustmentTests(unittest.TestCase):
         self.assertEqual(0, result["unclassified_count"])
         self.assertEqual(14.7, result["other_platform_fees"])
         self.assertEqual(3.0, result["return_fees"])
-        self.assertEqual(5.0, result["full_fees"])
+        self.assertEqual(12.0, result["full_fees"])
 
 
 class BillingFetchTests(unittest.IsolatedAsyncioTestCase):

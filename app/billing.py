@@ -54,6 +54,7 @@ def summarize_month_details(
     known_order_derived_subtypes = {
         "CV", "BV", "CFF", "BFF",  # Mexico sale/shipping
         "CVVML", "BVVML", "CFFE", "BFFE",  # Brazil sale/shipping
+        "CFFI",  # Brazil municipal shipping (already covered per order)
     }
 
     for detail in details:
@@ -99,7 +100,7 @@ def summarize_month_details(
             bucket = "product_ads_ignored"
         elif subtype in {"CDLIT", "BDLIT"} or "display ads" in label:
             bucket = "display_ads"
-        elif subtype in {"CFWA", "CFPB"} or (
+        elif subtype in {"CFWA", "CFPB", "CFCBI"} or (
             "full" in label and ("almacenamiento" in label or "incumplimiento" in label)
         ):
             bucket = "full_fees"
