@@ -88,6 +88,7 @@ def health():
         "ml_billing_brazil_fee_map_20260908": True,
         "ml_billing_brazil_remaining_fee_map_20260908": True,
         "lingxing_product_empty_retry_20260908": True,
+        "ml_month_logistics_archive_restore_20260908": True,
         "ml_month_manual_logistics_preserve_20260908": True,
     }
 
@@ -1880,7 +1881,8 @@ async def report_sync_feishu(
 async def report_sync_feishu_monthly(seller_id: int, month: str, background_tasks: BackgroundTasks,
                                      period_label: str = "", nowait: bool = False,
                                      commit: bool = True,
-                                     preserve_existing_as: str = ""):
+                                     preserve_existing_as: str = "",
+                                     logistics_source_period: str = ""):
     """Dispatcher. nowait=true → schedule aggregation in background, return 202 immediately
     (avoids Zeabur gateway ~150s connection reset on heavy sellers like CBT-FULL 1502236229,
     which made the monthly cron 9ZvARULB0wIp19yp false-alarm even though data lands fine).
@@ -1895,12 +1897,14 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, background_task
             period_label,
             commit,
             preserve_existing_as,
+            logistics_source_period,
         )
         return {"status": "accepted", "mode": "background", "seller_id": seller_id, "month": month,
                 "commit": commit,
                 "note": "Aggregation runs in background; verify via Feishu 数据拉取时间 in ~3-5min."}
     result = await _sync_feishu_monthly_impl(
-        seller_id, month, period_label, commit, preserve_existing_as
+        seller_id, month, period_label, commit, preserve_existing_as,
+        logistics_source_period,
     )
     if commit and result.get("status") != "synced":
         raise HTTPException(
@@ -1912,7 +1916,8 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, background_task
 
 async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: str = "",
                                     commit: bool = True,
-                                    preserve_existing_as: str = ""):
+                                    preserve_existing_as: str = "",
+                                    logistics_source_period: str = ""):
     """Aggregate seller_id's `month` orders FROM SQLite CACHE + Lingxing cost/FX → Feishu.
 
     Reads ml_order_cache, enriches with Lingxing cg_price (RMB cost) and monthly FX rate
@@ -1939,6 +1944,14 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
         raise HTTPException(
             400,
             "preserve_existing_as 格式不安全，示例：month_2026-08_original_20260908",
+        )
+    if logistics_source_period and (
+        logistics_source_period == period
+        or not re.fullmatch(r"month_\d{4}-\d{2}_[A-Za-z0-9_-]+", logistics_source_period)
+    ):
+        raise HTTPException(
+            400,
+            "logistics_source_period 格式不安全，示例：month_2026-08_original_20260908",
         )
     sync_started_at = time.time_ns()
 
@@ -2641,11 +2654,21 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
                     409,
                     f"旧版证据周期已存在：{preserve_existing_as}；未修改任何数据",
                 )
+        cost_source_items = existing_items
+        if logistics_source_period:
+            cost_source_items = await _search_scope(
+                "logistics-source", logistics_source_period
+            )
+            if not cost_source_items:
+                raise HTTPException(
+                    409,
+                    f"物流成本来源周期不存在：{logistics_source_period}；未修改任何数据",
+                )
         # Preserve operator-supplied logistics costs across a monthly rebuild.
         # Missing and explicit zero are different: zero is a confirmed value and
         # must survive just like any positive amount.
         existing_costs_by_sku: dict[str, dict] = {}
-        for item in existing_items:
+        for item in cost_source_items:
             old_fields = item.get("fields") or {}
             sku = str(old_fields.get("SKU") or "").strip()
             if not sku:
@@ -2657,6 +2680,20 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
             }
             if preserved:
                 existing_costs_by_sku[sku] = preserved
+        if logistics_source_period:
+            missing_source_skus = sorted({
+                str((record.get("fields") or {}).get("SKU") or "").strip()
+                for record in records
+                if float((record.get("fields") or {}).get("件数") or 0) > 0
+                and str((record.get("fields") or {}).get("SKU") or "").strip()
+                not in existing_costs_by_sku
+            })
+            if missing_source_skus:
+                raise HTTPException(
+                    409,
+                    "物流成本来源周期仍有缺口；未修改任何数据。"
+                    f" missing_skus={missing_source_skus[:30]}",
+                )
         for record in records:
             new_fields = record.get("fields") or {}
             preserved = existing_costs_by_sku.get(str(new_fields.get("SKU") or "").strip())
@@ -2835,6 +2872,7 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
             "rows_replaced": len(existing_ids),
             "rows_archived": len(existing_ids) if archived_existing else 0,
             "old_version_period": preserve_existing_as if archived_existing else None,
+            "logistics_source_period": logistics_source_period or period,
             "rows_verified": len(verified_items),
             "cached_orders_total": len(cached_rows), "unique_skus": len(rows),
             "units_total": units_total_value,

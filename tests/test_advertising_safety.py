@@ -543,7 +543,7 @@ class MonthlySyncSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("物流费未完整取得", str(ctx.exception.detail))
         feishu_token.assert_not_awaited()
 
-    async def _run_commit_with_feishu_responses(self, responses):
+    async def _run_commit_with_feishu_responses(self, responses, **sync_kwargs):
         metrics = copy.deepcopy(_ad_row()["metrics"])
         fake_client = _FakePostClient(responses)
         clear_recorder = AsyncMock(return_value={"status": "unchanged"})
@@ -567,6 +567,7 @@ class MonthlySyncSafetyTests(unittest.IsolatedAsyncioTestCase):
                 "2026-07",
                 commit=True,
                 preserve_existing_as="month_2026-07_original_test",
+                **sync_kwargs,
             )
         self.clear_recorder = clear_recorder
         return result, fake_client
@@ -765,6 +766,58 @@ class MonthlySyncSafetyTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("synced", result["status"])
         create_payload = fake_client.calls[2][1]["json"]
+        created_fields = create_payload["records"][0]["fields"]
+        self.assertEqual(12.34, created_fields["头程成本(RMB)"])
+        self.assertEqual(0, created_fields["海外仓成本(RMB)"])
+
+    async def test_commit_can_restore_logistics_costs_from_archived_period(self):
+        result, fake_client = await self._run_commit_with_feishu_responses([
+            ({"code": 0, "data": {
+                "items": [{"record_id": "rec-current", "fields": {"SKU": "SKU1"}}],
+                "has_more": False,
+            }}, 200),
+            ({"code": 0, "data": {"items": [], "has_more": False}}, 200),
+            ({"code": 0, "data": {
+                "items": [{"record_id": "rec-source", "fields": {
+                    "SKU": "SKU1",
+                    "头程成本(RMB)": 12.34,
+                    "海外仓成本(RMB)": 0,
+                }}],
+                "has_more": False,
+            }}, 200),
+            ({"code": 0, "data": {"records": [{"record_id": "rec-new"}]}}, 200),
+            ({"code": 0, "data": {
+                "items": [
+                    {"record_id": "rec-current", "fields": {}},
+                    {"record_id": "rec-new", "fields": {
+                        "广告费(原币)": 10.0,
+                        "广告费(RMB)": 4.0,
+                        "头程成本(RMB)": 12.34,
+                        "海外仓成本(RMB)": 0,
+                    }},
+                ],
+                "has_more": False,
+            }}, 200),
+            ({"code": 0}, 200),
+            ({"code": 0, "data": {
+                "items": [{"record_id": "rec-new", "fields": {
+                    "广告费(原币)": 10.0,
+                    "广告费(RMB)": 4.0,
+                    "头程成本(RMB)": 12.34,
+                    "海外仓成本(RMB)": 0,
+                }}],
+                "has_more": False,
+            }}, 200),
+            ({"code": 0, "data": {
+                "items": [{"record_id": "rec-current", "fields": {
+                    "周期": "month_2026-07_original_test",
+                }}],
+                "has_more": False,
+            }}, 200),
+        ], logistics_source_period="month_2026-07_source_test")
+
+        self.assertEqual("month_2026-07_source_test", result["logistics_source_period"])
+        create_payload = fake_client.calls[3][1]["json"]
         created_fields = create_payload["records"][0]["fields"]
         self.assertEqual(12.34, created_fields["头程成本(RMB)"])
         self.assertEqual(0, created_fields["海外仓成本(RMB)"])
