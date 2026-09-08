@@ -45,17 +45,29 @@ SHIPPING_TOKEN_USER: dict[int, int] = {
 # CBT parent token user_ids — these need /marketplace/ + api-version:2
 _CBT_TOKEN_USERS: set[int] = {1502520822}
 
+# The local-store costs endpoint omits currency_id in production.  These two
+# accounts have a fixed marketplace currency; unknown accounts remain blocked.
+_LOCAL_SELLER_CURRENCY = {
+    2378517428: "BRL",
+    3383185411: "MXN",
+}
+
 _429_BACKOFFS = (2.0, 5.0, 12.0)
 
 
-def _validated_cost_payload(payload: dict | None) -> dict | None:
+def _validated_cost_payload(
+    payload: dict | None, default_currency: str = ""
+) -> dict | None:
     """Return complete shipping facts; keep legitimate zero distinct from missing."""
     if not isinstance(payload, dict):
         return None
     senders = payload.get("senders")
     if not isinstance(senders, list) or not senders or not isinstance(senders[0], dict):
         return None
-    if "cost" not in senders[0] or not payload.get("currency_id"):
+    if "cost" not in senders[0]:
+        return None
+    currency = str(payload.get("currency_id") or default_currency or "").strip()
+    if not currency:
         return None
     try:
         sender_cost = float(senders[0]["cost"])
@@ -69,14 +81,18 @@ def _validated_cost_payload(payload: dict | None) -> dict | None:
     return {
         "sender_cost": sender_cost,
         "gross_amount": gross_amount,
-        "currency": str(payload["currency_id"]),
+        "currency": currency,
     }
 
 
 def _validated_cached_cost(cached: dict | None) -> dict | None:
     if not cached:
         return None
-    parsed = _validated_cost_payload(cached.get("_payload"))
+    seller_id = int(cached.get("seller_id") or 0)
+    parsed = _validated_cost_payload(
+        cached.get("_payload"),
+        default_currency=_LOCAL_SELLER_CURRENCY.get(seller_id, ""),
+    )
     if not parsed:
         return None
     parsed["from_cache"] = True
@@ -123,7 +139,10 @@ async def fetch_shipping_cost(
                 return None
             if r.status_code == 200:
                 payload = r.json()
-                parsed = _validated_cost_payload(payload)
+                parsed = _validated_cost_payload(
+                    payload,
+                    default_currency=_LOCAL_SELLER_CURRENCY.get(seller_id, ""),
+                )
                 if not parsed:
                     return None
                 sender_cost = parsed["sender_cost"]

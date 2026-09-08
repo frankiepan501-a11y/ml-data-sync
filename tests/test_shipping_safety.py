@@ -26,6 +26,18 @@ class ShippingPayloadSafetyTests(unittest.TestCase):
             "currency_id": "",
         }))
 
+    def test_known_local_seller_currency_can_fill_api_payload_omission(self):
+        result = shipping._validated_cost_payload(
+            {
+                "senders": [{"cost": 59.6}],
+                "gross_amount": 215.13,
+            },
+            default_currency="MXN",
+        )
+
+        self.assertEqual(59.6, result["sender_cost"])
+        self.assertEqual("MXN", result["currency"])
+
     def test_negative_or_nonfinite_sender_cost_is_rejected(self):
         for value in (-1, float("nan"), float("inf")):
             with self.subTest(value=value):
