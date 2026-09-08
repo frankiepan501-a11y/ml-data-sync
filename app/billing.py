@@ -51,7 +51,10 @@ def summarize_month_details(
     relevant_count = 0
     seen_detail_ids: set[int] = set()
     unclassified: list[dict] = []
-    known_order_derived_subtypes = {"CV", "BV", "CFF", "BFF"}
+    known_order_derived_subtypes = {
+        "CV", "BV", "CFF", "BFF",  # Mexico sale/shipping
+        "CVVML", "BVVML", "CFFE", "BFFE",  # Brazil sale/shipping
+    }
 
     for detail in details:
         charge = detail.get("charge_info") or {}
@@ -82,6 +85,16 @@ def summarize_month_details(
         subtype = str(charge.get("detail_sub_type") or "").upper()
 
         bucket = None
+        if subtype in known_order_derived_subtypes or any(
+            phrase in label
+            for phrase in (
+                "custo por vender no mercado livre",
+                "tarifa de envio extra ou intermunicipal",
+                "cargo por venta",
+                "cargo por envios de mercado libre",
+            )
+        ):
+            continue
         if subtype == "PADS" or "product ads" in label:
             bucket = "product_ads_ignored"
         elif subtype in {"CDLIT", "BDLIT"} or "display ads" in label:
@@ -90,12 +103,19 @@ def summarize_month_details(
             "full" in label and ("almacenamiento" in label or "incumplimiento" in label)
         ):
             bucket = "full_fees"
-        elif subtype == "CDSD" or "cargo por devolucion" in label:
+        elif subtype == "CDSD" or "devolucao" in label or "devolucion" in label:
             bucket = "return_fees"
-        elif subtype in {"CESM", "BESM"} or "mantenimiento de eshop" in label:
+        elif subtype in {"CESM", "BESM"} or any(
+            phrase in label
+            for phrase in (
+                "mantenimiento de eshop",
+                "manutencao da sua loja virtual",
+                "custo por cobrar no mercado pago",
+                "taxa de recebimento",
+                "taxa de parcelamento",
+            )
+        ):
             bucket = "other_platform_fees"
-        elif subtype in known_order_derived_subtypes:
-            continue
         else:
             unclassified.append({
                 "detail_id": detail_id,

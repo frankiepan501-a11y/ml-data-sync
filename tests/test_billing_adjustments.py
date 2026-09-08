@@ -97,6 +97,40 @@ class BillingAdjustmentTests(unittest.TestCase):
         self.assertEqual(12.5, result["unclassified_amount"])
         self.assertEqual("NEWFEE", result["unclassified"][0]["subtype"])
 
+    def test_brazilian_billing_labels_separate_order_costs_from_extra_fees(self):
+        def row(detail_id, label, subtype, amount, detail_type="CHARGE"):
+            return {
+                "charge_info": {
+                    "detail_id": detail_id,
+                    "creation_date_time": "2026-08-12T10:00:00",
+                    "transaction_detail": label,
+                    "detail_sub_type": subtype,
+                    "detail_type": detail_type,
+                    "detail_amount": amount,
+                },
+                "currency_info": {"currency_id": "BRL"},
+            }
+
+        details = [
+            row(30, "Custo por vender no Mercado Livre", "CVVML", 10),
+            row(31, "Tarifa de envio extra ou intermunicipal", "CFFE", 20),
+            row(32, "Custo por cobrar no Mercado Pago", "CVVPRC", 2),
+            row(33, "Estorno do custo por cobrar no Mercado Pago", "BVVPRC", 0.5, "BONUS"),
+            row(34, "Taxa de recebimento", "CVVFNU", 0.2),
+            row(35, "Taxa de parcelamento", "CVVPARC", 3),
+            row(36, "Tarifa de manutenção da sua loja virtual", "CESM", 10),
+            row(37, "Tarifa por devolução", "CDFR", 4),
+            row(38, "Estorno da tarifa por devolução", "BDFR", 1, "BONUS"),
+            row(39, "Tarifa pelo serviço de armazenamento Full", "CFWA", 5),
+        ]
+
+        result = billing.summarize_month_details(details, "2026-08")
+
+        self.assertEqual(0, result["unclassified_count"])
+        self.assertEqual(14.7, result["other_platform_fees"])
+        self.assertEqual(3.0, result["return_fees"])
+        self.assertEqual(5.0, result["full_fees"])
+
 
 class BillingFetchTests(unittest.IsolatedAsyncioTestCase):
     async def test_get_json_retries_rate_limit_before_returning_complete_page(self):
