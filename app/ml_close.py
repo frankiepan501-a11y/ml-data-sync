@@ -50,6 +50,8 @@ STATUSES = [
     "成本缺失待补",
     "待运营确认",
     "运营已确认",
+    "财务已确认暂结",
+    "待最终核销",
     "财务已确认终稿",
     "退回重算",
     "异常",
@@ -69,6 +71,11 @@ STATUS_FIELDS: list[dict[str, Any]] = [
     {"field_name": "运营确认时间", "type": 5},
     {"field_name": "财务确认人", "type": 1},
     {"field_name": "财务确认时间", "type": 5},
+    {"field_name": "经营暂结确认人", "type": 1},
+    {"field_name": "经营暂结确认时间", "type": 5},
+    {"field_name": "经营暂结报表链接", "type": 1},
+    {"field_name": "最终核销状态", "type": 1},
+    {"field_name": "最终核销截止日", "type": 5},
     {"field_name": "报表链接", "type": 1},
     {"field_name": "缺口视图链接", "type": 1},
     {"field_name": "最后卡片 message_id", "type": 1},
@@ -242,18 +249,33 @@ def _close_state(
     prior_state: str,
     last_error: str,
     ab_verified: bool = False,
+    operating_close_confirmed: bool = False,
 ) -> tuple[str, str]:
     if last_error:
         return "异常", "error"
     if not has_rows:
         return "待数据同步", "instruction"
-    if not ab_verified:
-        return "退回重算", "none"
     if has_cost_gaps:
         return "成本缺失待补", "cost_gap"
-    if prior_state in ("运营已确认", "财务已确认终稿"):
+    if prior_state == "财务已确认终稿":
         return prior_state, "none"
-    return "待运营确认", "ops_final"
+    if operating_close_confirmed or prior_state == "财务已确认暂结":
+        if ab_verified:
+            return "待最终核销", "ops_final"
+        return "财务已确认暂结", "none"
+    if prior_state == "运营已确认":
+        return prior_state, "finance_final" if ab_verified else "finance_operating"
+    return "待运营确认", "ops_final" if ab_verified else "ops_operating"
+
+
+def _final_reconciliation_due(month: str) -> tuple[str, int]:
+    year, month_number = (int(part) for part in month.split("-"))
+    if month_number == 12:
+        due = _dt.date(year + 1, 1, 18)
+    else:
+        due = _dt.date(year, month_number + 1, 18)
+    due_ms = int(_dt.datetime.combine(due, _dt.time.min, tzinfo=_dt.timezone(_dt.timedelta(hours=8))).timestamp() * 1000)
+    return due.isoformat(), due_ms
 
 
 def _resolve_ab_verified(
@@ -497,6 +519,7 @@ async def _commit_audit_snapshot(
         latest_state,
         last_error,
         bool(result.get("ab_verified")),
+        bool(latest_result.get("operating_close_confirmed")),
     )
     result.update(
         {
@@ -538,6 +561,30 @@ async def _commit_audit_snapshot(
             _text(result.get("report_hash")) if result.get("ab_verified") else ""
         ),
     }
+    for key in (
+        "operating_close_confirmed",
+        "operating_report_hash",
+        "operating_content_hash",
+        "operating_report_url",
+        "operating_report_sheet_url",
+        "operating_closed_at",
+        "operating_closed_by",
+        "final_reconciliation_due_on",
+        "final_reconciliation_status",
+        "provisional_items",
+    ):
+        if key in latest_result:
+            status_result[key] = latest_result[key]
+    status_result["final_reconciliation_due_on"] = (
+        _text(status_result.get("final_reconciliation_due_on"))
+        or _text(result.get("final_reconciliation_due_on"))
+        or _final_reconciliation_due(month)[0]
+    )
+    status_result["final_reconciliation_status"] = (
+        _text(result.get("final_reconciliation_status"))
+        or _text(status_result.get("final_reconciliation_status"))
+        or "待官方账单核销"
+    )
     fields = {
         "月份": month,
         "状态": state,
@@ -555,6 +602,8 @@ async def _commit_audit_snapshot(
         "最后错误": last_error[:1800],
         "最后结果JSON": json.dumps(status_result, ensure_ascii=False),
         "重算次数": int(_num(latest_fields.get("重算次数"))) + 1,
+        "最终核销状态": status_result.get("final_reconciliation_status") or "待官方账单核销",
+        "最终核销截止日": _final_reconciliation_due(month)[1],
     }
     if extra_fields:
         fields.update(extra_fields)
@@ -574,6 +623,7 @@ async def audit(
     prior = await _get_status(period, tok)
     prior_fields = prior.get("fields", {}) if prior else {}
     prior_state = _text(prior_fields.get("状态"))
+    prior_result = _last_result(prior_fields)
     marker_error = ""
     try:
         prior_failed_ad_shops = await _open_ad_failures(period, prior_fields)
@@ -601,6 +651,8 @@ async def audit(
     order_count = 0
     unit_count = 0.0
     ad_total_rmb = 0.0
+    commission_max_abs_delta = 0.0
+    profit_max_abs_delta = 0.0
     store_details: dict[str, dict[str, Any]] = {}
     purchase_gaps: list[dict[str, Any]] = []
     freight_gaps: list[dict[str, Any]] = []
@@ -631,6 +683,29 @@ async def audit(
         order_count += orders
         unit_count += units
         ad_total_rmb += ad_fee
+        commission_max_abs_delta = max(
+            commission_max_abs_delta,
+            abs(
+                _num(f.get("ML佣金(RMB)"))
+                - _num(f.get("ML佣金(原币)")) * _num(f.get("我的汇率"))
+            ),
+        )
+        calculated_profit = (
+            rev
+            - cg
+            - _num(f.get("ML佣金(RMB)"))
+            - ad_fee
+            - _num(f.get("VAT估算(RMB)"))
+            - _num(f.get("物流费(RMB)"))
+            - _num(f.get("退款金额(RMB)"))
+            - _num(f.get("Full仓储费(RMB)"))
+            - head
+            - ovs
+        )
+        profit_max_abs_delta = max(
+            profit_max_abs_delta,
+            abs(_num(f.get("全额毛利(RMB)")) - calculated_profit),
+        )
         active_row = rev > 0.0001 or units > 0.0001 or orders > 0
         if active_row and units > 0 and (cg <= 0.0001 or _blank_cost(f.get("采购成本(RMB)"))):
             purchase_gaps.append({"record_id": r["record_id"], "store": store, "sku": sku, "orders": orders, "units": units, "revenue": rev})
@@ -643,13 +718,30 @@ async def audit(
     cbt_rows = [r for r in rows if "CBT" in _text(r.get("fields", {}).get("店铺"))]
     cbt_state = "已解析" if cbt_rows else "未发现CBT行"
 
-    base_error = marker_error or cost_error
+    formula_errors: list[str] = []
+    if commission_max_abs_delta > 0.05:
+        formula_errors.append(
+            f"佣金换算最大差额 {commission_max_abs_delta:.4f} RMB，超过 0.05 RMB"
+        )
+    if profit_max_abs_delta > 0.02:
+        formula_errors.append(
+            f"毛利公式最大差额 {profit_max_abs_delta:.4f} RMB，超过 0.02 RMB"
+        )
+    formula_error = "；".join(formula_errors)
+    base_error = "；".join(
+        part for part in (marker_error, cost_error, formula_error) if part
+    )
     if cost_summary and cost_summary.get("status") == "error":
         cost_failure = _text(cost_summary.get("msg")) or json.dumps(cost_summary, ensure_ascii=False)[:500]
         base_error = f"{base_error}；{cost_failure}" if base_error else cost_failure
     last_error = _with_ad_failure(base_error, prior_failed_ad_shops)
     state, next_card = _close_state(
-        bool(rows), bool(purchase_gaps or freight_gaps), prior_state, last_error, effective_ab_verified
+        bool(rows),
+        bool(purchase_gaps or freight_gaps),
+        prior_state,
+        last_error,
+        effective_ab_verified,
+        bool(prior_result.get("operating_close_confirmed")),
     )
 
     result = {
@@ -667,6 +759,10 @@ async def audit(
         "revenue_rmb": round(revenue, 2),
         "gross_profit_rmb": round(profit, 2),
         "ad_total_rmb": round(ad_total_rmb, 2),
+        "commission_max_abs_delta": round(commission_max_abs_delta, 6),
+        "commission_check": "通过" if commission_max_abs_delta <= 0.05 else "需复核",
+        "profit_max_abs_delta": round(profit_max_abs_delta, 6),
+        "profit_check": "通过" if profit_max_abs_delta <= 0.02 else "需复核",
         "store_details": [
             {
                 "store": v["store"],
@@ -693,6 +789,17 @@ async def audit(
         "failed_ad_shops": prior_failed_ad_shops,
         "ab_verified": effective_ab_verified,
         "report_hash": report_hash,
+        "operating_ready": bool(rows) and not bool(purchase_gaps or freight_gaps) and not bool(last_error),
+        "operating_close_confirmed": bool(prior_result.get("operating_close_confirmed")),
+        "operating_report_hash": _text(prior_result.get("operating_report_hash")),
+        "operating_report_url": _text(prior_result.get("operating_report_url")),
+        "final_reconciliation_due_on": (
+            _text(prior_result.get("final_reconciliation_due_on"))
+            or _final_reconciliation_due(month)[0]
+        ),
+        "final_reconciliation_status": (
+            "已完成" if effective_ab_verified and prior_state == "财务已确认终稿" else "待官方账单核销"
+        ),
     }
 
     if commit:
@@ -731,8 +838,12 @@ def _title_for(kind: str, month: str) -> tuple[str, str]:
         return "yellow", f"🟡 [FIN·P2] 美客多毛利本月操作指引 · {month}"
     if kind == "cost_gap":
         return "orange", f"🟠 [FIN·P1] 美客多成本缺口待处理 · {month}"
+    if kind == "ops_operating":
+        return "green", f"🟠 [FIN·P1] 美客多经营暂结待运营确认 · {month}"
     if kind == "ops_final":
-        return "green", f"🟢 [FIN·P2] 美客多毛利待运营确认 · {month}"
+        return "green", f"🟡 [FIN·P2] 美客多最终核销待运营确认 · {month}"
+    if kind == "finance_operating":
+        return "blue", f"🟠 [FIN·P1] 美客多经营暂结待财务放行 · {month}"
     if kind == "finance_final":
         return "blue", f"🟡 [FIN·P2] 美客多毛利待财务确认 · {month}"
     if kind == "processed":
@@ -812,7 +923,7 @@ def build_card(kind: str, summary: dict[str, Any], status_fields: dict[str, Any]
         ]})
         return card
 
-    if kind == "ops_final":
+    if kind in ("ops_operating", "ops_final"):
         last_recalc = _fmt_ms(status_fields.get("最近重算时间")) or "-"
         delta = _num(status_fields.get("全额毛利差异"))
         data_state = _text(status_fields.get("状态")) or "待运营确认"
@@ -835,12 +946,58 @@ def build_card(kind: str, summary: dict[str, Any], status_fields: dict[str, Any]
         if store_section:
             els.append(store_section)
             els.append({"tag": "hr"})
+        if kind == "ops_operating":
+            explanation = (
+                "系统审计未发现订单、广告、采购成本或头程/海外仓成本硬缺口。"
+                "本次只确认**经营暂结数据**，用于运营提成和公司管理毛利；官方账单尚未最终核销。"
+                "确认时会再次核对报表版本，内容变化会自动拦截。"
+            )
+            confirm_label = "确认经营暂结数据"
+        else:
+            explanation = (
+                "系统审计未发现成本缺口，且当前版本已完成官方账单 A/B。"
+                "请确认最终核销数据；确认时会再次核对报表版本。"
+            )
+            confirm_label = "确认最终核销数据"
+        els.append({"tag": "div", "text": _md(explanation)})
+        els.append({"tag": "action", "actions": [
+            _button(confirm_label, action="ml_profit_ops_confirm", period=period, btn_type="primary"),
+            _button("发现问题，退回重算", action="ml_profit_ops_reject", period=period, btn_type="danger"),
+        ]})
+        return card
+
+    if kind == "finance_operating":
+        ops_name = _text(status_fields.get("运营确认人")) or "-"
+        ops_time = _fmt_ms(status_fields.get("运营确认时间"))
+        status_result = _last_result(status_fields)
+        due_on = (
+            _text(summary.get("final_reconciliation_due_on"))
+            or _text(status_result.get("final_reconciliation_due_on"))
+            or _final_reconciliation_due(month)[0]
+        )
+        els.append({"tag": "div", "fields": [
+            _field("运营确认人", ops_name),
+            _field("运营确认时间", ops_time),
+            _field("报表性质", "经营暂结（非最终账单）"),
+            _field("最终核销预计", due_on),
+            _field("报表行数", str(summary.get("report_rows", 0))),
+            _field("营收", _money(float(summary.get("revenue_rmb") or 0))),
+            _field("全额毛利", _money(float(summary.get("gross_profit_rmb") or 0))),
+            _field("官方账单 A/B", "待最终核销"),
+        ]})
+        els.append(_top_link_actions(report_url))
+        els.append({"tag": "hr"})
+        store_section = _store_details_section(summary)
+        if store_section:
+            els.append(store_section)
+            els.append({"tag": "hr"})
         els.append({"tag": "div", "text": _md(
-            "系统审计未发现采购成本或头程/海外仓成本缺口。上方金额是**本次实时重算快照**；运营确认前，如果广告费、采购成本、头程/海外仓成本或报表公式回填，毛利可能变化。确认后系统会锁定月结状态，不再重复发待确认卡。"
+            "放行后系统会生成一份独立的**经营暂结报表**并冻结当前数据版本，可用于运营提成和公司毛利汇总。"
+            "后续官方账单差异只进入最终核销，不会覆盖本次暂结报表。"
         )})
         els.append({"tag": "action", "actions": [
-            _button("确认运营终稿", action="ml_profit_ops_confirm", period=period, btn_type="primary"),
-            _button("发现问题，退回重算", action="ml_profit_ops_reject", period=period, btn_type="danger"),
+            _button("放行经营暂结", action="ml_profit_finance_operating_confirm", period=period, btn_type="primary"),
+            _button("退回运营复核", action="ml_profit_finance_reject", period=period, btn_type="danger"),
         ]})
         return card
 
@@ -861,7 +1018,11 @@ def build_card(kind: str, summary: dict[str, Any], status_fields: dict[str, Any]
         if store_section:
             els.append(store_section)
             els.append({"tag": "hr"})
-        els.append({"tag": "div", "text": _md("此版本已经运营确认。财务确认后，月结状态会进入 **财务已确认终稿**。")})
+        operating_url = _text(_last_result(status_fields).get("operating_report_url"))
+        note = "此版本已完成官方账单 A/B。财务确认后，月结状态会进入 **财务已确认终稿**。"
+        if operating_url:
+            note += f"\n\n此前经营暂结报表保持不变：[打开经营暂结报表]({operating_url})。"
+        els.append({"tag": "div", "text": _md(note)})
         els.append({"tag": "action", "actions": [
             _button("财务确认终稿", action="ml_profit_finance_confirm", period=period, btn_type="primary"),
             _button("退回运营复核", action="ml_profit_finance_reject", period=period, btn_type="danger"),
@@ -1195,7 +1356,7 @@ async def card_endpoint(
 
     requested_kind = kind
     kind = "error" if summary.get("next_card") == "error" else (kind or summary.get("next_card") or "instruction")
-    if kind in ("ops_final", "finance_final") and not summary.get("ab_verified"):
+    if kind == "finance_final" and not summary.get("ab_verified"):
         return {
             "status": "skipped",
             "reason": "ab_not_verified",
@@ -1226,7 +1387,8 @@ async def card_endpoint(
         if (
             requested_kind is None
             and summary.get("next_card") != "error"
-            and current_state in ("运营已确认", "财务已确认终稿")
+            and current_state in ("运营已确认", "财务已确认暂结", "财务已确认终稿")
+            and summary.get("next_card") in ("none", "skip", None)
         ):
             return {
                 "status": "skipped",
@@ -1238,7 +1400,11 @@ async def card_endpoint(
         card = build_card(kind, summary, status_fields)
         out = {"status": "ok", "kind": kind, "period": summary["period"], "summary": summary, "card": card}
         if send:
-            target = receive_id or (FINANCE_GROUP_ID if kind == "finance_final" else ML_GROUP_ID)
+            target = receive_id or (
+                FINANCE_GROUP_ID
+                if kind in ("finance_operating", "finance_final")
+                else ML_GROUP_ID
+            )
             sent = await send_card(card, target, receive_id_type)
             msg_id = (
                 sent.get("data", {}).get("message_id")
@@ -1265,13 +1431,38 @@ async def status_endpoint(month: str | None = None, period: str | None = None) -
     result = _last_result(fields)
     report_hash = _text(result.get("report_hash"))
     ab_verified = _resolve_ab_verified(fields, None, report_hash)
+    operating_close_confirmed = bool(result.get("operating_close_confirmed"))
+    operating_report_hash = _text(result.get("operating_report_hash"))
+    operating_snapshot_current = bool(
+        operating_report_hash and report_hash and operating_report_hash == report_hash
+    )
+    operating_ready = (
+        operating_close_confirmed
+        and operating_snapshot_current
+        and not failed_ad_shops
+        and not marker_error
+    )
     return {
         "status": "ok",
         "period": period,
         "month": month,
         "state": state,
-        "ready_for_finance": ab_verified and state in ("运营已确认", "财务已确认终稿"),
+        "ready_for_finance": operating_ready or state == "财务已确认终稿",
+        "ready_for_management": operating_ready or state == "财务已确认终稿",
+        "ready_for_commission": operating_ready or state == "财务已确认终稿",
+        "ready_for_final_reconciliation": ab_verified and state in (
+            "运营已确认", "财务已确认暂结", "待最终核销", "财务已确认终稿"
+        ),
         "ab_verified": ab_verified,
+        "operating_close_confirmed": operating_close_confirmed,
+        "operating_snapshot_current": operating_snapshot_current,
+        "operating_report_hash": operating_report_hash,
+        "operating_report_url": _text(result.get("operating_report_url")),
+        "operating_report_sheet_url": _text(result.get("operating_report_sheet_url")),
+        "final_reconciliation_due_on": (
+            _text(result.get("final_reconciliation_due_on"))
+            or _final_reconciliation_due(month)[0]
+        ),
         "report_hash": report_hash,
         "failed_ad_shops": failed_ad_shops,
         "marker_error": marker_error,
@@ -1343,11 +1534,17 @@ async def _confirm_action_impl(
         "ml_profit_ops_confirm",
         "ml_profit_ops_waive_gap",
         "ml_profit_ops_reject",
+        "ml_profit_finance_operating_confirm",
         "ml_profit_finance_confirm",
         "ml_profit_finance_reject",
     }
     confirmation_actions = {
         "ml_profit_ops_confirm",
+        "ml_profit_ops_waive_gap",
+        "ml_profit_finance_operating_confirm",
+        "ml_profit_finance_confirm",
+    }
+    final_ab_actions = {
         "ml_profit_ops_waive_gap",
         "ml_profit_finance_confirm",
     }
@@ -1417,6 +1614,31 @@ async def _confirm_action_impl(
                 "该卡片已不是当前月份的最新操作卡，本次动作已拦截。"
             )
         pre_state = _text(pre_fields.get("状态"))
+        pre_result = _last_result(pre_fields)
+        if (
+            action == "ml_profit_finance_operating_confirm"
+            and pre_result.get("operating_close_confirmed")
+        ):
+            report_url = _text(pre_result.get("operating_report_url"))
+            sheet_url = _text(pre_result.get("operating_report_sheet_url"))
+            processed = build_processed_card(
+                month,
+                "财务已确认暂结",
+                actor,
+                "经营暂结报表已经冻结；重复操作不会覆盖原快照。",
+                report_url=report_url,
+            )
+            feedback = await patch_or_fallback(message_id, processed, chat_id) if patch else {}
+            return {
+                "status": "ok",
+                "action": action,
+                "period": period,
+                "state": "财务已确认暂结",
+                "deduped": True,
+                "report": {"url": report_url, "sheet_url": sheet_url},
+                "processed_card": processed,
+                "feedback": feedback,
+            }
         if (
             pre_state == "财务已确认终稿"
             and action != "ml_profit_finance_confirm"
@@ -1440,11 +1662,19 @@ async def _confirm_action_impl(
                     ("月报生成失败：", "月报终态保护失败：")
                 )
             )
-            if pre_state not in ("运营已确认", "财务已确认终稿") and not retrying_generator_error:
+            if pre_state not in (
+                "运营已确认", "财务已确认终稿"
+            ) and not retrying_generator_error:
                 return await _blocked_confirmation(
                     f"当前月结状态为“{pre_state or '未知'}”，请先完成运营确认。"
                 )
-        if action in confirmation_actions and not _resolve_ab_verified(pre_fields, None):
+        if action == "ml_profit_finance_operating_confirm" and pre_state not in (
+            "运营已确认", "财务已确认暂结"
+        ):
+            return await _blocked_confirmation(
+                f"当前月结状态为“{pre_state or '未知'}”，请先完成运营确认。"
+            )
+        if action in final_ab_actions and not _resolve_ab_verified(pre_fields, None):
             return await _blocked_confirmation(
                 "A/B 对账尚未完成，本次确认已拦截。"
             )
@@ -1536,6 +1766,9 @@ async def _confirm_action_impl(
             await db.cancel_unified_report_generation(
                 period, f"close action requested: {action}"
             )
+            await db.cancel_unified_report_generation(
+                f"{period}::operating", f"close action requested: {action}"
+            )
         except Exception as exc:
             return await _blocked_confirmation(
                 f"月报生成取消失败：{type(exc).__name__}"
@@ -1549,7 +1782,7 @@ async def _confirm_action_impl(
         current = await _get_status(period, tok) or {}
         current_fields = current.get("fields") or {}
         if action in confirmation_actions:
-            if not _resolve_ab_verified(current_fields, None):
+            if action in final_ab_actions and not _resolve_ab_verified(current_fields, None):
                 block_reason = "A/B 对账尚未完成，本次确认已拦截。"
             try:
                 current_failed = await _open_ad_failures(period, current_fields)
@@ -1566,7 +1799,14 @@ async def _confirm_action_impl(
                     ("月报生成失败：", "月报终态保护失败：")
                 )
             )
-            if current_state not in ("运营已确认", "财务已确认终稿") and not retrying_generator_error:
+            if current_state not in (
+                "运营已确认", "财务已确认终稿"
+            ) and not retrying_generator_error:
+                block_reason = f"当前月结状态为“{current_state or '未知'}”，请先完成运营确认。"
+                discard_claim = True
+        if not block_reason and action == "ml_profit_finance_operating_confirm":
+            current_state = _text(current_fields.get("状态"))
+            if current_state not in ("运营已确认", "财务已确认暂结"):
                 block_reason = f"当前月结状态为“{current_state or '未知'}”，请先完成运营确认。"
                 discard_claim = True
         current_message_id = _text(current_fields.get("最后卡片 message_id"))
@@ -1700,7 +1940,7 @@ async def _confirm_action_impl(
         reason = _text(summary.get("last_error")) or "月结存在未解决异常，确认已拦截。"
         return await _blocked_confirmation(reason)
     approved_report_hash = _text(summary.get("report_hash"))
-    if action in confirmation_actions and (
+    if action in final_ab_actions and (
         summary.get("ab_verified") is not True or not approved_report_hash
     ):
         return await _blocked_confirmation(
@@ -1709,7 +1949,11 @@ async def _confirm_action_impl(
 
     if action in ("ml_profit_ops_confirm", "ml_profit_ops_waive_gap"):
         state = "运营已确认"
-        detail = "运营确认终稿" if action == "ml_profit_ops_confirm" else "运营确认本月缺口不影响终稿"
+        detail = (
+            "运营确认最终核销数据"
+            if summary.get("ab_verified")
+            else "运营确认经营暂结数据"
+        ) if action == "ml_profit_ops_confirm" else "运营确认本月缺口不影响终稿"
         status_update = {
             "状态": state,
             "运营确认人": actor,
@@ -1751,15 +1995,25 @@ async def _confirm_action_impl(
                                 commit=False,
                                 run_cost_preview=False,
                             )
-                            if (
-                                live_summary.get("ab_verified") is not True
-                                or _text(live_summary.get("report_hash")) != approved_report_hash
+                            if _text(live_summary.get("report_hash")) != approved_report_hash:
+                                block_reason = "确认期间报表内容已变化，当前版本需重新确认。"
+                            elif (
+                                action == "ml_profit_ops_confirm"
+                                and live_summary.get("ab_verified") is not True
+                                and not live_summary.get("operating_ready")
                             ):
-                                block_reason = "确认期间报表内容已变化，当前版本需重新完成 A/B 对账。"
+                                block_reason = "当前报表仍有订单、广告或成本硬缺口，经营暂结确认已拦截。"
+                            elif action == "ml_profit_ops_waive_gap" and live_summary.get("ab_verified") is not True:
+                                block_reason = "缺口豁免只适用于最终核销，经营暂结不能带成本缺口放行。"
                         if not block_reason:
                             await _upsert_status(period, status_update, tok)
                             status = await _get_status(period, tok) or {}
-                            finance_card = build_card("finance_final", summary, status.get("fields") or {})
+                            finance_kind = (
+                                "finance_final"
+                                if live_summary.get("ab_verified")
+                                else "finance_operating"
+                            )
+                            finance_card = build_card(finance_kind, live_summary, status.get("fields") or {})
                             sent = await send_card(finance_card, FINANCE_GROUP_ID)
                             sent_id = _message_id(sent)
                             if sent_id:
@@ -1768,7 +2022,7 @@ async def _confirm_action_impl(
             return await _blocked_confirmation(block_reason)
         processed = build_processed_card(month, state, actor, detail)
         feedback = await patch_or_fallback(message_id, processed, chat_id) if patch else {}
-        return {"status": "ok", "action": action, "period": period, "state": state, "processed_card": processed, "feedback": feedback, "next_card": finance_card, "next_kind": "finance_final", "send_result": sent}
+        return {"status": "ok", "action": action, "period": period, "state": state, "processed_card": processed, "feedback": feedback, "next_card": finance_card, "next_kind": finance_kind, "send_result": sent}
 
     if action == "ml_profit_ops_reject":
         async with _status_mutation_lock(period):
@@ -1805,6 +2059,135 @@ async def _confirm_action_impl(
         processed = build_processed_card(month, "退回重算", actor, "运营发现问题，需补数后重新核算", ok=False)
         feedback = await patch_or_fallback(message_id, processed, chat_id) if patch else {}
         return {"status": "ok", "action": action, "period": period, "state": "退回重算", "processed_card": processed, "feedback": feedback}
+
+    if action == "ml_profit_finance_operating_confirm":
+        from app import unified_report
+
+        block_reason = ""
+        report: dict[str, Any] = {}
+        async with _status_mutation_lock(period):
+            latest = await _get_status(period, tok) or {}
+            latest_fields = latest.get("fields") or {}
+            try:
+                latest_failed = await _open_ad_failures(period, latest_fields)
+            except Exception as exc:
+                latest_failed = []
+                block_reason = f"广告失败状态读取失败：{type(exc).__name__}"
+            if latest_failed:
+                block_reason = _ad_failure_message(latest_failed)
+            latest_state = _text(latest_fields.get("状态"))
+            if not block_reason and latest_state not in ("运营已确认", "财务已确认暂结"):
+                block_reason = f"当前月结状态为“{latest_state or '未知'}”，请先完成运营确认。"
+            if not block_reason and _ACTION_EPOCHS.get(period) != action_epoch:
+                block_reason = "生成前收到新的月结操作，本次经营暂结已拦截。"
+            if not block_reason:
+                live_before = await audit(
+                    period=period, commit=False, run_cost_preview=False
+                )
+                if not live_before.get("operating_ready"):
+                    block_reason = "当前报表仍有订单、广告或成本硬缺口，经营暂结已拦截。"
+                elif _text(live_before.get("report_hash")) != approved_report_hash:
+                    block_reason = "生成前报表内容已变化，当前经营暂结版本需重新确认。"
+
+            if not block_reason:
+                try:
+                    report = await unified_report.generate(
+                        period,
+                        commit=True,
+                        expected_source_hash=approved_report_hash,
+                        close_mode="operating",
+                    )
+                except Exception as exc:
+                    block_reason = f"经营暂结报表生成失败：{exc}"
+
+            if not block_reason:
+                live_after = await audit(
+                    period=period, commit=False, run_cost_preview=False
+                )
+                if not live_after.get("operating_ready"):
+                    block_reason = "生成期间出现订单、广告或成本硬缺口，经营暂结写入已拦截。"
+                elif _text(live_after.get("report_hash")) != approved_report_hash:
+                    block_reason = "生成期间报表内容已变化，经营暂结写入已拦截。"
+                latest = await _get_status(period, tok) or {}
+                latest_fields = latest.get("fields") or {}
+                if _text(latest_fields.get("状态")) not in ("运营已确认", "财务已确认暂结"):
+                    block_reason = "生成期间月结状态已变化，经营暂结写入已拦截。"
+                if not block_reason and _ACTION_EPOCHS.get(period) != action_epoch:
+                    block_reason = "生成期间收到新的月结操作，经营暂结写入已拦截。"
+
+            if not block_reason:
+                try:
+                    async with db.ml_close_action_finalization_guard(
+                        period,
+                        action_key,
+                        action_owner,
+                        _text(report.get("content_hash")),
+                    ) as generation_ready:
+                        if not generation_ready:
+                            block_reason = "经营暂结报表生成被新的退回或重算操作中断。"
+                        else:
+                            latest = await _get_status(period, tok) or {}
+                            latest_fields = latest.get("fields") or {}
+                            latest_result = _last_result(latest_fields)
+                            due_on, due_ms = _final_reconciliation_due(month)
+                            spreadsheet_token = _text(report.get("spreadsheet_token"))
+                            sheet_url = (
+                                f"https://u1wpma3xuhr.feishu.cn/sheets/{spreadsheet_token}"
+                                if spreadsheet_token
+                                else ""
+                            )
+                            latest_result.update({
+                                "period": period,
+                                "month": month,
+                                "report_hash": approved_report_hash,
+                                "operating_close_confirmed": True,
+                                "operating_report_hash": approved_report_hash,
+                                "operating_content_hash": _text(report.get("content_hash")),
+                                "operating_report_url": _text(report.get("url")),
+                                "operating_report_sheet_url": sheet_url,
+                                "operating_closed_at": now_ms,
+                                "operating_closed_by": actor,
+                                "final_reconciliation_due_on": due_on,
+                                "final_reconciliation_status": "待官方账单核销",
+                            })
+                            await _upsert_status(
+                                period,
+                                {
+                                    "状态": "财务已确认暂结",
+                                    "经营暂结确认人": actor,
+                                    "经营暂结确认时间": now_ms,
+                                    "经营暂结报表链接": report.get("url") or "",
+                                    "报表链接": report.get("url") or "",
+                                    "最终核销状态": "待官方账单核销",
+                                    "最终核销截止日": due_ms,
+                                    "最后错误": "",
+                                    "最后按钮动作Key": action_key,
+                                    "最后按钮动作时间": now_ms,
+                                    "最后结果JSON": json.dumps(latest_result, ensure_ascii=False),
+                                },
+                                tok,
+                            )
+                except Exception as exc:
+                    block_reason = f"经营暂结终态保护失败：{type(exc).__name__}"
+        if block_reason:
+            return await _blocked_confirmation(block_reason)
+        processed = build_processed_card(
+            month,
+            "财务已确认暂结",
+            actor,
+            "经营暂结报表已冻结，可用于运营提成和公司管理毛利；官方账单仍待最终核销。",
+            report_url=report.get("url") or "",
+        )
+        feedback = await patch_or_fallback(message_id, processed, chat_id) if patch else {}
+        return {
+            "status": "ok",
+            "action": action,
+            "period": period,
+            "state": "财务已确认暂结",
+            "report": report,
+            "processed_card": processed,
+            "feedback": feedback,
+        }
 
     if action == "ml_profit_finance_confirm":
         from app import unified_report
@@ -1856,7 +2239,9 @@ async def _confirm_action_impl(
             )
             if (
                 not block_reason
-                and latest_state not in ("运营已确认", "财务已确认终稿")
+                and latest_state not in (
+                    "运营已确认", "财务已确认终稿"
+                )
                 and not retrying_generator_error
             ):
                 block_reason = f"当前月结状态为“{latest_state or '未知'}”，请先完成运营确认。"
@@ -1921,7 +2306,9 @@ async def _confirm_action_impl(
                 )
                 if (
                     not block_reason
-                    and latest_state not in ("运营已确认", "财务已确认终稿")
+                    and latest_state not in (
+                        "运营已确认", "财务已确认终稿"
+                    )
                     and not retrying_generator_error
                 ):
                     block_reason = f"生成期间月结状态变为“{latest_state or '未知'}”，终稿写入已拦截。"
@@ -1942,6 +2329,19 @@ async def _confirm_action_impl(
                                 # write. Reject/recalc/ad-failure must publish cancellation
                                 # through the same DB first, so their state write is ordered
                                 # after this one instead of being overwritten by it.
+                                final_result = _last_result(latest_fields)
+                                final_result.update({
+                                    "period": period,
+                                    "month": month,
+                                    "report_hash": approved_report_hash,
+                                    "ab_verified": True,
+                                    "ab_report_hash": approved_report_hash,
+                                    "final_reconciliation_status": "已完成",
+                                    "final_report_url": _text(report.get("url")),
+                                    "final_content_hash": _text(report.get("content_hash")),
+                                    "final_closed_at": now_ms,
+                                    "final_closed_by": actor,
+                                })
                                 await _upsert_status(
                                     period,
                                     {
@@ -1949,9 +2349,11 @@ async def _confirm_action_impl(
                                         "财务确认人": actor,
                                         "财务确认时间": now_ms,
                                         "报表链接": report.get("url") or "",
+                                        "最终核销状态": "已完成",
                                         "最后错误": "",
                                         "最后按钮动作Key": action_key,
                                         "最后按钮动作时间": now_ms,
+                                        "最后结果JSON": json.dumps(final_result, ensure_ascii=False),
                                     },
                                     tok,
                                 )

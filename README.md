@@ -82,9 +82,11 @@ uvicorn app.main:app --reload --port 8000
 
 - `POST /report/ml-close/audit`：审计指定月份报表行，输出店铺覆盖、缺口 SKU、采购成本缺口、头程/海外仓缺口，并可写入「美客多毛利月结状态台」。
 - `POST /report/ml-close/recalc-cost`：重跑美通/墨客多/三沐成本同步后再审计。
-- `GET|POST /report/ml-close/card`：生成或发送飞书交互卡，卡片类型包括操作指引、成本缺口、运营终稿确认、财务终稿确认。
-- `GET|POST /report/ml-close/status`：给全渠道汇总器做 gate，只有 `运营已确认` 或 `财务已确认终稿` 才允许放行财务终稿。
+- `GET|POST /report/ml-close/card`：生成或发送飞书交互卡，卡片类型包括操作指引、成本缺口、运营经营暂结确认、财务经营暂结确认、运营最终核销确认、财务最终核销确认。
+- `GET|POST /report/ml-close/status`：给全渠道汇总器做 gate；`ready_for_management=true` 代表经营暂结已冻结，可供运营提成和公司管理毛利使用；`ready_for_final_reconciliation=true` 仅代表官方账单 A/B 已完成，可进入最终核销。
 - `POST /report/ml-close/confirm`：处理飞书按钮回调，并把原卡 PATCH 成结果态。
+
+从 2026-08 月报开始使用“双阶段关账”：第一阶段不等待平台完整账单，订单、广告、采购成本、头程和海外仓成本无缺口后，由运营和财务确认并冻结一份独立的「经营暂结」报表；第二阶段在平台账单周期结束后做官方账单 A/B 对账，生成独立的「最终核销」报表。后续账单差异只进入最终核销，不覆盖已用于提成和公司管理汇总的经营暂结快照。
 
 CBT-FULL 仍以官方导出 3 文件为准；本土店和巴西店走 ML API/cache，不要求运营上传。`/report/cbt-ingest?month=YYYY-MM&commit=false` 必须显式传月份，定时任务只校验三份文件的业务期间，不自动覆盖数据。人工完成 A/B 对账后，才可用 `commit=true&preserve_existing_as=month_YYYY-MM_<历史标签>` 生成修正版；旧行会改到历史标签保留，不会删除。只有显式 `finalize=true` 才会继续成本与月结审计。
 

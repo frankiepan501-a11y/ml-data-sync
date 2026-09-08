@@ -61,6 +61,7 @@ STORE_ORDER = [
 ]
 
 MARKER_PREFIX = "ML_UNIFIED_REPORT_V1"
+VALID_CLOSE_MODES = {"final", "operating"}
 COMMISSION_TOLERANCE_RMB = 0.05
 PROFIT_TOLERANCE_RMB = 0.02
 
@@ -297,13 +298,30 @@ def _period_parts(period: str) -> tuple[str, str]:
     return f"month_{month}", month
 
 
+def _report_identity(period: str, close_mode: str) -> str:
+    if close_mode not in VALID_CLOSE_MODES:
+        raise ValueError(f"invalid close_mode: {close_mode}")
+    return period if close_mode == "final" else f"{period}::operating"
+
+
+def _report_title(month: str, close_mode: str) -> str:
+    return (
+        f"美客多毛利报表-{month}"
+        if close_mode == "final"
+        else f"美客多毛利报表-{month}-经营暂结"
+    )
+
+
 def prepare_report(
     period: str,
     report_records: list[dict[str, Any]],
     maintenance_records: list[dict[str, Any]],
     cost_records: list[dict[str, Any]],
+    close_mode: str = "final",
 ) -> dict[str, Any]:
     period, month = _period_parts(period)
+    report_identity = _report_identity(period, close_mode)
+    report_title = _report_title(month, close_mode)
     rows = [
         record for record in report_records
         if _text(_record_fields(record).get("周期")) == period
@@ -418,6 +436,9 @@ def prepare_report(
     summary = {
         "period": period,
         "month": month,
+        "close_mode": close_mode,
+        "report_identity": report_identity,
+        "report_title": report_title,
         "report_rows": len(rows),
         "unique_skus": len({normalize_sku(sku) for sku in skus}),
         "store_count": len({_text(_record_fields(row).get("店铺")) for row in rows}),
@@ -437,6 +458,17 @@ def prepare_report(
     check_values = [
         ["检查项目", "结果", "判断标准 / 说明", "", "生成器标记"],
         ["数据期间", month, f"生产表周期 {period}", "", ""],
+        [
+            "报表性质",
+            "经营暂结" if close_mode == "operating" else "最终核销",
+            (
+                "可用于提成和公司管理毛利；官方账单仍待最终核销"
+                if close_mode == "operating"
+                else "官方账单 A/B 已完成，作为最终核销版本"
+            ),
+            "",
+            "",
+        ],
         ["记录数", len(rows), "SKU×店铺明细", "", ""],
         ["ERP映射", "通过", f"{summary['unique_skus']} 个唯一 SKU，未命中/冲突/空值均为 0", "", ""],
         ["店铺数", summary["store_count"], "生产表汇总", "", ""],
@@ -465,6 +497,7 @@ def prepare_report(
 def report_content_hash(prepared: dict[str, Any]) -> str:
     """Hash business inputs and ERP display mapping, excluding generation time."""
     payload = {
+        "close_mode": prepared.get("summary", {}).get("close_mode", "final"),
         "main_values": prepared["main_values"],
         "source_values": prepared["source_values"],
     }
@@ -668,10 +701,11 @@ async def _wiki_children(token: str, space_id: str) -> list[dict[str, Any]]:
 
 
 async def _find_existing_report(
-    token: str, period: str, month: str
+    token: str, period: str, month: str, close_mode: str = "final"
 ) -> dict[str, Any] | None:
+    identity = _report_identity(period, close_mode)
     space_id = await _wiki_space_id(token)
-    title = f"美客多毛利报表-{month}"
+    title = _report_title(month, close_mode)
     matches = [node for node in await _wiki_children(token, space_id) if node.get("title") == title]
     if len(matches) > 1:
         raise ReportGenerationError(f"知识库中存在多个同名报表：{title}")
@@ -692,21 +726,24 @@ async def _find_existing_report(
             "url": f"https://u1wpma3xuhr.feishu.cn/wiki/{node.get('node_token')}",
             "sheets": sheets,
         }
-        if marker.startswith(f"{MARKER_PREFIX}|COMPLETE|{period}|"):
+        if marker.startswith(f"{MARKER_PREFIX}|COMPLETE|{identity}|"):
             return {**base, "complete": True, "content_hash": marker.rsplit("|", 1)[-1]}
-        if marker == f"{MARKER_PREFIX}|IN_PROGRESS|{period}":
+        if marker == f"{MARKER_PREFIX}|IN_PROGRESS|{identity}":
             return {**base, "complete": False}
         raise ReportGenerationError(f"同名报表已存在但不是本生成器产物，未覆盖：{title}")
     return None
 
 
-async def _copy_or_resume_report(token: str, period: str, month: str) -> dict[str, Any]:
-    existing = await _find_existing_report(token, period, month)
+async def _copy_or_resume_report(
+    token: str, period: str, month: str, close_mode: str = "final"
+) -> dict[str, Any]:
+    identity = _report_identity(period, close_mode)
+    existing = await _find_existing_report(token, period, month, close_mode)
     if existing:
         return existing
 
     space_id = await _wiki_space_id(token)
-    title = f"美客多毛利报表-{month}"
+    title = _report_title(month, close_mode)
 
     body = await _api_json(
         "POST",
@@ -726,7 +763,7 @@ async def _copy_or_resume_report(token: str, period: str, month: str) -> dict[st
         token,
         spreadsheet_token,
         f"{check_sheet['sheetId']}!E1:E1",
-        [[f"{MARKER_PREFIX}|IN_PROGRESS|{period}"]],
+        [[f"{MARKER_PREFIX}|IN_PROGRESS|{identity}"]],
     )
     return {
         "complete": False,
@@ -811,7 +848,8 @@ async def _write_report(
     main = _main_sheet(sheets)
     source = _sheet_by_title(sheets, "数据源")
     checks = _sheet_by_title(sheets, "检查")
-    target_title = f"美客多毛利报表-{prepared['summary']['month']}"
+    target_title = prepared["summary"].get("report_title") or f"美客多毛利报表-{prepared['summary']['month']}"
+    report_identity = prepared["summary"].get("report_identity") or prepared["summary"]["period"]
     if main.get("title") != target_title:
         await _api_json(
             "POST",
@@ -826,7 +864,7 @@ async def _write_report(
     check_rows = await _ensure_rows(token, spreadsheet_token, checks, needed)
 
     check_values = [list(row) for row in prepared["check_values"]]
-    check_values[0][4] = f"{MARKER_PREFIX}|IN_PROGRESS|{prepared['summary']['period']}"
+    check_values[0][4] = f"{MARKER_PREFIX}|IN_PROGRESS|{report_identity}"
     await _write_range(
         token, spreadsheet_token, f"{source['sheetId']}!A1:AW{source_rows}",
         _pad_matrix(prepared["source_values"], source_rows, 49),
@@ -866,7 +904,7 @@ async def _write_report(
     )
 
     content_hash = report_content_hash(prepared)
-    marker = f"{MARKER_PREFIX}|COMPLETE|{prepared['summary']['period']}|{content_hash}"
+    marker = f"{MARKER_PREFIX}|COMPLETE|{report_identity}|{content_hash}"
     await _write_range(token, spreadsheet_token, f"{checks['sheetId']}!E1:E1", [[marker]])
     marker_read = await _read_range(
         token, spreadsheet_token, f"{checks['sheetId']}!E1:E1", "FormattedValue"
@@ -946,24 +984,30 @@ async def generate(
     period: str,
     commit: bool = False,
     expected_source_hash: str | None = None,
+    close_mode: str = "final",
 ) -> dict[str, Any]:
     """Preview or create one monthly report. Mapping validation always precedes writes."""
     period, month = _period_parts(period)
+    generation_key = _report_identity(period, close_mode)
     if not commit:
         report_records, maintenance_records, cost_records = await _load_sources()
-        prepared = prepare_report(period, report_records, maintenance_records, cost_records)
+        prepared = prepare_report(
+            period, report_records, maintenance_records, cost_records, close_mode=close_mode
+        )
         return {"status": "ok", "mode": "preview", **prepared["summary"]}
 
-    async with _generation_lock(period):
+    async with _generation_lock(generation_key):
         token = await _report_token()
-        existing = await _find_existing_report(token, period, month)
+        existing = await _find_existing_report(token, period, month, close_mode)
         report_records, maintenance_records, cost_records = await _load_sources()
         loaded_source_hash = source_report_hash(report_records, period)
         if expected_source_hash and loaded_source_hash != expected_source_hash:
             raise ReportGenerationError(
-                "统一毛利报表源数据已变化，当前版本需重新完成 A/B 对账"
+                "统一毛利报表源数据已变化，当前版本需重新确认"
             )
-        prepared = prepare_report(period, report_records, maintenance_records, cost_records)
+        prepared = prepare_report(
+            period, report_records, maintenance_records, cost_records, close_mode=close_mode
+        )
         base = {
             "status": "ok",
             "mode": "commit",
@@ -972,7 +1016,7 @@ async def generate(
         }
         expected_hash = report_content_hash(prepared)
         owner = f"{os.getpid()}:{uuid.uuid4().hex}"
-        claim = await db.claim_unified_report_generation(period, owner, expected_hash)
+        claim = await db.claim_unified_report_generation(generation_key, owner, expected_hash)
         if not claim.get("claimed"):
             if claim.get("status") == "complete":
                 target = existing or claim
@@ -995,16 +1039,18 @@ async def generate(
             raise ReportGenerationInProgressError(f"{month} 统一毛利月报正在生成，请稍后重试")
 
         try:
-            target = existing or await _copy_or_resume_report(token, period, month)
+            target = existing or await _copy_or_resume_report(
+                token, period, month, close_mode
+            )
             await db.set_unified_report_target(
-                period,
+                generation_key,
                 owner,
                 target["wiki_token"],
                 target["spreadsheet_token"],
                 target["url"],
             )
             if target.get("complete") and target.get("content_hash") == expected_hash:
-                await db.complete_unified_report_generation(period, owner, expected_hash)
+                await db.complete_unified_report_generation(generation_key, owner, expected_hash)
                 return {
                     **base,
                     "deduped": True,
@@ -1014,7 +1060,9 @@ async def generate(
                     "url": target["url"],
                 }
             verification = await _write_report(token, target, prepared)
-            await db.complete_unified_report_generation(period, owner, verification["content_hash"])
+            await db.complete_unified_report_generation(
+                generation_key, owner, verification["content_hash"]
+            )
             return {
                 **base,
                 "deduped": False,
@@ -1025,7 +1073,7 @@ async def generate(
             }
         except Exception as exc:
             try:
-                await db.fail_unified_report_generation(period, owner, str(exc))
+                await db.fail_unified_report_generation(generation_key, owner, str(exc))
             except Exception:
                 pass
             raise

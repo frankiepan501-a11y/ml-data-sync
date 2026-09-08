@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import tempfile
 import unittest
@@ -218,6 +219,27 @@ class WorkbookBuildTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({"type": "formula", "text": "=ROUND(L2*Y2,2)"}, row[25])
         self.assertEqual({"type": "formula", "text": "=IFERROR(AL2/Z2,0)"}, row[45])
         self.assertEqual(49, len(prepared["source_values"][0]))
+
+    def test_operating_close_report_is_clearly_labelled(self):
+        prepared = unified_report.prepare_report(
+            "month_2026-08",
+            [_source_row()],
+            [_record(**{
+                "ERP SKU": "FF01A-01",
+                "ERP品名": "YS11 Pro 手柄-涂鸦",
+                "产品类型": "游戏手柄",
+            })],
+            [],
+            close_mode="operating",
+        )
+
+        self.assertEqual("operating", prepared["summary"]["close_mode"])
+        self.assertEqual("month_2026-08::operating", prepared["summary"]["report_identity"])
+        self.assertEqual("美客多毛利报表-2026-08-经营暂结", prepared["summary"]["report_title"])
+        self.assertIn(
+            ["报表性质", "经营暂结", "可用于提成和公司管理毛利；官方账单仍待最终核销", "", ""],
+            prepared["check_values"],
+        )
         self.assertEqual(1, prepared["summary"]["report_rows"])
         self.assertEqual(1, prepared["summary"]["unique_skus"])
 
@@ -321,6 +343,41 @@ class WorkbookBuildTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], complete_writes)
 
 class ReportGenerationAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_operating_and_final_reports_use_separate_generation_keys(self):
+        sources = (
+            [_source_row()],
+            [_record(**{
+                "ERP SKU": "FF01A-01",
+                "ERP品名": "YS11 Pro 手柄-涂鸦",
+                "产品类型": "游戏手柄",
+            })],
+            [],
+        )
+        target = {
+            "complete": False,
+            "wiki_token": "wiki-operating",
+            "spreadsheet_token": "sheet-operating",
+            "url": "https://u1wpma3xuhr.feishu.cn/wiki/wiki-operating",
+        }
+        claim = AsyncMock(return_value={"claimed": True, "status": "generating"})
+        with (
+            patch.object(unified_report, "_report_token", AsyncMock(return_value="token")),
+            patch.object(unified_report, "_find_existing_report", AsyncMock(return_value=None)),
+            patch.object(unified_report, "_load_sources", AsyncMock(return_value=sources)),
+            patch.object(db, "claim_unified_report_generation", claim),
+            patch.object(db, "set_unified_report_target", AsyncMock()),
+            patch.object(db, "complete_unified_report_generation", AsyncMock()),
+            patch.object(db, "fail_unified_report_generation", AsyncMock()),
+            patch.object(unified_report, "_copy_or_resume_report", AsyncMock(return_value=target)),
+            patch.object(unified_report, "_write_report", AsyncMock(return_value={"content_hash": "h", "marker": "m"})),
+        ):
+            result = await unified_report.generate(
+                "month_2026-08", commit=True, close_mode="operating"
+            )
+
+        self.assertEqual("operating", result["close_mode"])
+        self.assertEqual("month_2026-08::operating", claim.await_args.args[0])
+
     async def test_expected_source_hash_mismatch_stops_before_report_write(self):
         sources = (
             [_source_row()],
@@ -838,6 +895,169 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
         self.month_work_get_patcher.stop()
         self.month_work_claim_patcher.stop()
         self.month_work_finish_patcher.stop()
+
+    async def test_finance_can_freeze_operating_close_without_final_ab(self):
+        current = {
+            "record_id": "status-1",
+            "fields": {
+                "状态": "运营已确认",
+                "最后结果JSON": '{"ab_verified": false, "report_hash": "v1"}',
+            },
+        }
+        operating_summary = {
+            **self.clean_summary,
+            "state": "运营已确认",
+            "next_card": "finance_operating",
+            "ab_verified": False,
+            "operating_ready": True,
+        }
+        generated = {
+            "status": "ok",
+            "url": "https://u1wpma3xuhr.feishu.cn/wiki/wiki-operating",
+            "spreadsheet_token": "sheet-operating",
+            "content_hash": "operating-content",
+        }
+        writer = AsyncMock(return_value={"record_id": "status-1"})
+        generator = AsyncMock(return_value=generated)
+        with (
+            patch.object(ml_close, "_tenant_token", AsyncMock(return_value="token")),
+            patch.object(ml_close, "_get_status", AsyncMock(return_value=current)),
+            patch.object(ml_close, "_upsert_status", writer),
+            patch.object(ml_close, "_open_ad_failures", AsyncMock(return_value=[])),
+            patch.object(ml_close, "audit", AsyncMock(return_value=operating_summary)),
+            patch.object(ml_close, "patch_or_fallback", AsyncMock(return_value={})),
+            patch.object(unified_report, "generate", generator),
+        ):
+            result = await ml_close.confirm_action({
+                "action": "ml_profit_finance_operating_confirm",
+                "period": "month_2026-08",
+                "message_id": "om-finance-operating",
+                "operator_name": "财务",
+            })
+
+        self.assertEqual("财务已确认暂结", result["state"])
+        generator.assert_awaited_once_with(
+            "month_2026-08",
+            commit=True,
+            expected_source_hash="v1",
+            close_mode="operating",
+        )
+        final_write = next(
+            call.args[1]
+            for call in writer.await_args_list
+            if call.args[1].get("状态") == "财务已确认暂结"
+        )
+        stored = json.loads(final_write["最后结果JSON"])
+        self.assertTrue(stored["operating_close_confirmed"])
+        self.assertEqual("v1", stored["operating_report_hash"])
+        self.assertEqual(generated["url"], final_write["经营暂结报表链接"])
+        self.assertEqual(
+            "https://u1wpma3xuhr.feishu.cn/sheets/sheet-operating",
+            stored["operating_report_sheet_url"],
+        )
+
+    async def test_operating_close_snapshot_cannot_be_overwritten_by_new_action(self):
+        frozen = {
+            "record_id": "rec-status",
+            "fields": {
+                "状态": "财务已确认暂结",
+                "最后卡片 message_id": "om-current",
+                "最后结果JSON": json.dumps({
+                    "report_hash": "current-v2",
+                    "operating_close_confirmed": True,
+                    "operating_report_hash": "frozen-v1",
+                    "operating_report_url": "https://example.test/wiki/frozen",
+                    "operating_report_sheet_url": "https://example.test/sheets/frozen",
+                }, ensure_ascii=False),
+            },
+        }
+        generator = AsyncMock()
+        with (
+            patch.object(ml_close, "_tenant_token", AsyncMock(return_value="token")),
+            patch.object(ml_close, "_get_status", AsyncMock(return_value=frozen)),
+            patch.object(ml_close, "patch_or_fallback", AsyncMock(return_value={})),
+            patch("app.unified_report.generate", generator),
+        ):
+            result = await ml_close.confirm_action({
+                "action": "ml_profit_finance_operating_confirm",
+                "period": "month_2026-08",
+                "message_id": "om-current",
+                "operator_name": "财务",
+            })
+
+        self.assertEqual("ok", result["status"])
+        self.assertTrue(result["deduped"])
+        self.assertEqual("https://example.test/wiki/frozen", result["report"]["url"])
+        generator.assert_not_awaited()
+
+    async def test_final_finance_confirm_cannot_skip_final_ops_review(self):
+        waiting_for_ops = {
+            "record_id": "rec-status",
+            "fields": {
+                "状态": "待最终核销",
+                "最后卡片 message_id": "om-final-ops",
+                "最后结果JSON": json.dumps({
+                    "report_hash": "final-v1",
+                    "ab_verified": True,
+                    "ab_report_hash": "final-v1",
+                    "operating_close_confirmed": True,
+                    "operating_report_hash": "operating-v1",
+                }, ensure_ascii=False),
+            },
+        }
+        with (
+            patch.object(ml_close, "_tenant_token", AsyncMock(return_value="token")),
+            patch.object(ml_close, "_get_status", AsyncMock(return_value=waiting_for_ops)),
+            patch.object(ml_close, "_open_ad_failures", AsyncMock(return_value=[])),
+            patch.object(ml_close, "patch_or_fallback", AsyncMock(return_value={})),
+        ):
+            result = await ml_close.confirm_action({
+                "action": "ml_profit_finance_confirm",
+                "period": "month_2026-08",
+                "message_id": "om-final-ops",
+                "operator_name": "财务",
+            })
+
+        self.assertEqual("blocked", result["status"])
+        self.assertIn("运营确认", result["reason"])
+        self.action_claim.assert_not_awaited()
+
+    async def test_ops_confirmation_routes_unverified_month_to_operating_finance(self):
+        current = {
+            "record_id": "status-1",
+            "fields": {
+                "状态": "待运营确认",
+                "最后结果JSON": '{"ab_verified": false, "report_hash": "v1"}',
+            },
+        }
+        operating_summary = {
+            **self.clean_summary,
+            "state": "待运营确认",
+            "next_card": "ops_operating",
+            "ab_verified": False,
+            "operating_ready": True,
+        }
+        writer = AsyncMock(return_value={"record_id": "status-1"})
+        sender = AsyncMock(return_value={"data": {"message_id": "om-finance-operating"}})
+        with (
+            patch.object(ml_close, "_tenant_token", AsyncMock(return_value="token")),
+            patch.object(ml_close, "_get_status", AsyncMock(return_value=current)),
+            patch.object(ml_close, "_upsert_status", writer),
+            patch.object(ml_close, "_open_ad_failures", AsyncMock(return_value=[])),
+            patch.object(ml_close, "audit", AsyncMock(return_value=operating_summary)),
+            patch.object(ml_close, "patch_or_fallback", AsyncMock(return_value={})),
+            patch.object(ml_close, "send_card", sender),
+        ):
+            result = await ml_close.confirm_action({
+                "action": "ml_profit_ops_confirm",
+                "period": "month_2026-08",
+                "message_id": "om-ops-operating",
+                "operator_name": "运营",
+            })
+
+        self.assertEqual("运营已确认", result["state"])
+        self.assertEqual("finance_operating", result["next_kind"])
+        self.assertIn("经营暂结", json.dumps(sender.await_args.args[0], ensure_ascii=False))
 
     async def test_generator_failure_blocks_finance_final_state(self):
         writer = AsyncMock(return_value={"record_id": "status-1"})

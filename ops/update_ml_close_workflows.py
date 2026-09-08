@@ -210,36 +210,36 @@ return [{ json: { period, kind, url: `https://ml-sync.zeabur.app/report/ml-close
     put_wf(wf, nodes, connections)
 
 
-def update_gated(wid: str, target_url: str) -> None:
+def update_gated(wid: str) -> None:
+    """Switch the gate field without rebuilding or retargeting the workflow.
+
+    Production owns the schedule, target URL and auth expressions.  Replacing
+    the whole five-node graph here can silently roll those live settings back,
+    so this migration changes only the one status field it owns.
+    """
     wf = get_wf(wid)
-    sched = trigger(wf)
-    route_code = f"""const s = $input.first().json;
-if (s.ready_for_finance) {{
-  return [{{ json: {{ mode: 'run', url: '{target_url}' }} }}];
-}}
-return [{{ json: {{ mode: 'blocked', url: `https://ml-sync.zeabur.app/report/ml-close/card?period=${{encodeURIComponent(s.period)}}&send=true` }} }}];"""
-    nodes = [
-        sched,
-        code_node("build-period", "Build period", 460, 300, PERIOD_CODE),
-        http_node("ml-close-status", "Check ML close status", 700, 300, "=https://ml-sync.zeabur.app/report/ml-close/status?period={{$json.period}}", 90000),
-        code_node("route-by-status", "Route by ML status", 940, 300, route_code),
-        http_node("execute-route", "Execute gated route", 1180, 300, "={{$json.url}}", 180000),
-    ]
-    connections = {
-        sched["name"]: {"main": [[{"node": "Build period", "type": "main", "index": 0}]]},
-        "Build period": {"main": [[{"node": "Check ML close status", "type": "main", "index": 0}]]},
-        "Check ML close status": {"main": [[{"node": "Route by ML status", "type": "main", "index": 0}]]},
-        "Route by ML status": {"main": [[{"node": "Execute gated route", "type": "main", "index": 0}]]},
-    }
-    put_wf(wf, nodes, connections)
+    nodes = json.loads(json.dumps(wf["nodes"], ensure_ascii=False))
+    routes = [node for node in nodes if node.get("name") == "Route by ML status"]
+    if len(routes) != 1:
+        raise RuntimeError(f"workflow {wid} must contain exactly one Route by ML status node")
+    code = str(routes[0].get("parameters", {}).get("jsCode") or "")
+    if "s.ready_for_management" in code:
+        print(f"already updated {wid} {wf['name']}")
+        return
+    if "s.ready_for_finance" not in code:
+        raise RuntimeError(f"workflow {wid} does not contain the expected finance gate")
+    routes[0]["parameters"]["jsCode"] = code.replace(
+        "s.ready_for_finance", "s.ready_for_management", 1
+    )
+    put_wf(wf, nodes, wf.get("connections") or {})
 
 
 def main() -> None:
     update_instruction()
     update_cbt_ingest()
     update_cost_audit()
-    update_gated("OzSSlkVa2b2y2aNS", "https://finance-report-audit.zeabur.app/aggregate")
-    update_gated("aEzy1jZzG8lIEnss", "https://finance-report-audit.zeabur.app/report-monthly")
+    update_gated("OzSSlkVa2b2y2aNS")
+    update_gated("aEzy1jZzG8lIEnss")
     for wid in ["ucq2vYbWVWiY98Fw", "j5I4vcjwarGgols0", "CWnmOuOmrde5bIkG", "OzSSlkVa2b2y2aNS", "aEzy1jZzG8lIEnss"]:
         wf = get_wf(wid)
         print(json.dumps({"id": wid, "name": wf["name"], "active": wf["active"], "nodes": len(wf["nodes"])}, ensure_ascii=False))

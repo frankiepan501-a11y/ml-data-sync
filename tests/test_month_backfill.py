@@ -478,14 +478,65 @@ class MonthBackfillTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(2, audit.await_count)
 
-    def test_rejected_month_stays_blocked_until_ab_is_explicitly_verified(self):
+    async def test_operating_commit_requires_frozen_current_hash(self):
+        live = {
+            "state": "财务已确认暂结",
+            "ab_verified": False,
+            "report_hash": "live-v2",
+        }
+        gate = {
+            "operating_close_confirmed": True,
+            "operating_report_hash": "frozen-v1",
+        }
+        with (
+            patch.object(ml_close, "audit", AsyncMock(return_value=live)),
+            patch.object(ml_close, "status_endpoint", AsyncMock(return_value=gate)),
+            patch("app.unified_report.generate", AsyncMock()) as generate,
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await main.ml_unified_monthly(
+                    period="month_2026-08", commit=True, close_mode="operating"
+                )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        generate.assert_not_awaited()
+
+    async def test_operating_commit_uses_separate_frozen_report(self):
+        live = {
+            "state": "财务已确认暂结",
+            "ab_verified": False,
+            "report_hash": "frozen-v1",
+        }
+        gate = {
+            "operating_close_confirmed": True,
+            "operating_report_hash": "frozen-v1",
+        }
+        generator = AsyncMock(return_value={"status": "ok", "mode": "commit"})
+        with (
+            patch.object(ml_close, "audit", AsyncMock(side_effect=[live, live])),
+            patch.object(ml_close, "status_endpoint", AsyncMock(return_value=gate)),
+            patch("app.unified_report.generate", generator),
+        ):
+            result = await main.ml_unified_monthly(
+                period="month_2026-08", commit=True, close_mode="operating"
+            )
+
+        self.assertEqual("ok", result["status"])
+        generator.assert_awaited_once_with(
+            "month_2026-08",
+            commit=True,
+            expected_source_hash="frozen-v1",
+            close_mode="operating",
+        )
+
+    def test_clean_month_can_enter_operating_close_before_final_ab(self):
         self.assertEqual(
             ml_close._close_state(True, False, "退回重算", ""),
-            ("退回重算", "none"),
+            ("待运营确认", "ops_operating"),
         )
         self.assertEqual(
             ml_close._close_state(True, True, "退回重算", ""),
-            ("退回重算", "none"),
+            ("成本缺失待补", "cost_gap"),
         )
         self.assertEqual(
             ml_close._close_state(True, False, "退回重算", "", ab_verified=True),
@@ -493,11 +544,15 @@ class MonthBackfillTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             ml_close._close_state(True, False, "", "", ab_verified=False),
-            ("退回重算", "none"),
+            ("待运营确认", "ops_operating"),
         )
         self.assertEqual(
-            ml_close._close_state(True, False, "待数据同步", "", ab_verified=False),
-            ("退回重算", "none"),
+            ml_close._close_state(True, False, "财务已确认暂结", "", ab_verified=False),
+            ("财务已确认暂结", "none"),
+        )
+        self.assertEqual(
+            ml_close._close_state(True, False, "财务已确认暂结", "", ab_verified=True),
+            ("待最终核销", "ops_final"),
         )
 
     def test_ab_verification_is_persisted_unless_explicitly_revoked(self):

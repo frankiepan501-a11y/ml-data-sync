@@ -101,6 +101,7 @@ def health():
         "ml_shipping_package_dedupe_20260908": True,
         "ml_month_logistics_sku_cell_normalized_20260908": True,
         "ml_month_manual_logistics_preserve_20260908": True,
+        "ml_two_stage_close_20260908": True,
     }
 
 
@@ -1399,7 +1400,7 @@ async def ml_close_confirm(req: Request, action: str | None = None, month: str |
 
 @app.post("/report/ml-unified-monthly", dependencies=[Depends(require_service_token)])
 async def ml_unified_monthly(month: str | None = None, period: str | None = None,
-                             commit: bool = False):
+                             commit: bool = False, close_mode: str = "final"):
     """Preview or replay the finance-approved 47-column ML monthly report.
 
     Preview is read-only. Direct commit is allowed only for an already finance-confirmed
@@ -1408,6 +1409,8 @@ async def ml_unified_monthly(month: str | None = None, period: str | None = None
     from app import ml_close, unified_report
 
     normalized_period, _ = ml_close.normalize_period(month, period)
+    if close_mode not in ("final", "operating"):
+        raise HTTPException(400, "close_mode 只支持 final 或 operating")
     approved_report_hash = ""
     if commit:
         # Recompute the report hash from the live Base.  The status row alone
@@ -1417,34 +1420,48 @@ async def ml_unified_monthly(month: str | None = None, period: str | None = None
             commit=False,
             run_cost_preview=False,
         )
-        if (
-            close_status.get("state") != "财务已确认终稿"
-            or close_status.get("ab_verified") is not True
-        ):
-            raise HTTPException(
-                409,
-                f"{normalized_period} 尚未完成当前报表版本的 A/B 与财务终稿确认；只允许 commit=false 预览。",
-            )
+        if close_mode == "final":
+            if (
+                close_status.get("state") != "财务已确认终稿"
+                or close_status.get("ab_verified") is not True
+            ):
+                raise HTTPException(
+                    409,
+                    f"{normalized_period} 尚未完成当前报表版本的 A/B 与财务终稿确认；只允许 commit=false 预览。",
+                )
+        else:
+            gate = await ml_close.status_endpoint(period=normalized_period)
+            operating_hash = str(gate.get("operating_report_hash") or "")
+            if (
+                gate.get("operating_close_confirmed") is not True
+                or not operating_hash
+                or operating_hash != str(close_status.get("report_hash") or "")
+            ):
+                raise HTTPException(
+                    409,
+                    f"{normalized_period} 尚未冻结当前版本的经营暂结；只允许 commit=false 预览。",
+                )
         approved_report_hash = str(close_status.get("report_hash") or "")
     try:
-        report = await unified_report.generate(
-            normalized_period,
-            commit=commit,
-            expected_source_hash=approved_report_hash or None,
-        )
+        generate_kwargs = {
+            "commit": commit,
+            "expected_source_hash": approved_report_hash or None,
+        }
+        if close_mode != "final":
+            generate_kwargs["close_mode"] = close_mode
+        report = await unified_report.generate(normalized_period, **generate_kwargs)
         if commit:
             live_after = await ml_close.audit(
                 period=normalized_period,
                 commit=False,
                 run_cost_preview=False,
             )
-            if (
-                live_after.get("ab_verified") is not True
-                or str(live_after.get("report_hash") or "") != approved_report_hash
-            ):
+            version_changed = str(live_after.get("report_hash") or "") != approved_report_hash
+            final_invalid = close_mode == "final" and live_after.get("ab_verified") is not True
+            if version_changed or final_invalid:
                 raise HTTPException(
                     409,
-                    f"{normalized_period} 生成期间生产表已变化；当前版本需重新完成 A/B 对账。",
+                    f"{normalized_period} 生成期间生产表已变化；当前版本需重新确认。",
                 )
         return report
     except unified_report.ProductMappingError as exc:

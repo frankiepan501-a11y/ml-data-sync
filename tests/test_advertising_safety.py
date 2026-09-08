@@ -1215,6 +1215,52 @@ class MonthlyCloseAdvertisingFailureTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["ready_for_finance"])
         self.assertEqual(["ML 本土3店"], result["failed_ad_shops"])
 
+    async def test_operating_close_releases_management_but_not_final_reconciliation(self):
+        confirmed = {
+            "record_id": "rec-status",
+            "fields": {
+                "状态": "财务已确认暂结",
+                "最后结果JSON": json.dumps({
+                    "report_hash": "v1",
+                    "operating_close_confirmed": True,
+                    "operating_report_hash": "v1",
+                    "operating_report_url": "https://example.test/operating",
+                    "ab_verified": False,
+                }, ensure_ascii=False),
+            },
+        }
+
+        with patch.object(ml_close, "_get_status", AsyncMock(return_value=confirmed)):
+            result = await ml_close.status_endpoint(period="month_2026-08")
+
+        self.assertTrue(result["ready_for_finance"])
+        self.assertTrue(result["ready_for_management"])
+        self.assertTrue(result["ready_for_commission"])
+        self.assertFalse(result["ready_for_final_reconciliation"])
+        self.assertEqual("https://example.test/operating", result["operating_report_url"])
+
+    async def test_changed_source_hash_does_not_release_raw_management_aggregation(self):
+        confirmed = {
+            "record_id": "rec-status",
+            "fields": {
+                "状态": "财务已确认暂结",
+                "最后结果JSON": json.dumps({
+                    "report_hash": "current-v2",
+                    "operating_close_confirmed": True,
+                    "operating_report_hash": "frozen-v1",
+                    "operating_report_url": "https://example.test/operating",
+                    "ab_verified": False,
+                }, ensure_ascii=False),
+            },
+        }
+
+        with patch.object(ml_close, "_get_status", AsyncMock(return_value=confirmed)):
+            result = await ml_close.status_endpoint(period="month_2026-08")
+
+        self.assertFalse(result["operating_snapshot_current"])
+        self.assertFalse(result["ready_for_management"])
+        self.assertFalse(result["ready_for_commission"])
+
     async def test_failure_card_still_sends_when_status_ledger_write_fails(self):
         card_sender = AsyncMock(return_value={"data": {"message_id": "om-fallback"}})
 
@@ -1565,6 +1611,39 @@ class MonthlyCloseAdvertisingFailureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["ML 本土3店"], result["failed_ad_shops"])
         stored = json.loads(status_writer.await_args.args[1]["最后结果JSON"])
         self.assertEqual(["ML 本土3店"], stored["failed_ad_shops"])
+
+    async def test_audit_blocks_operating_close_when_profit_formula_is_wrong(self):
+        report_rows = [{
+            "record_id": "rec-report",
+            "fields": {
+                "周期": "month_2026-08",
+                "店铺": "ML 本土3店",
+                "SKU": "SKU1",
+                "营收(RMB)": 100.0,
+                "采购成本(RMB)": 20.0,
+                "头程成本(RMB)": 5.0,
+                "海外仓成本(RMB)": 0.0,
+                "全额毛利(RMB)": 80.0,
+                "订单数": 1,
+                "件数": 1,
+            },
+        }]
+
+        with (
+            patch.object(ml_close, "_tenant_token", AsyncMock(return_value="test")),
+            patch.object(ml_close, "_get_status", AsyncMock(return_value=None)),
+            patch.object(ml_close, "_list_records", AsyncMock(return_value=report_rows)),
+        ):
+            result = await ml_close.audit(
+                period="month_2026-08",
+                commit=False,
+                run_cost_preview=False,
+            )
+
+        self.assertEqual("需复核", result["profit_check"])
+        self.assertFalse(result["operating_ready"])
+        self.assertEqual("异常", result["state"])
+        self.assertIn("毛利公式最大差额", result["last_error"])
 
 
 class DurableAdFailureStoreTests(unittest.IsolatedAsyncioTestCase):
