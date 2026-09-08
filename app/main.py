@@ -84,6 +84,7 @@ def health():
         "ml_billing_first_page_cursor_20260908": True,
         "ml_billing_remaining_total_20260908": True,
         "ml_billing_failure_cause_visible_20260908": True,
+        "ml_billing_rate_limit_retry_20260908": True,
         "ml_month_manual_logistics_preserve_20260908": True,
     }
 

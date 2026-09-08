@@ -7,6 +7,7 @@ Fulfillment storage/violation charges, and return handling charges.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import date
 import math
 import unicodedata
@@ -130,13 +131,31 @@ def summarize_month_details(
 
 
 async def _get_json(client: httpx.AsyncClient, url: str, headers: dict, params: dict) -> dict:
-    response = await client.get(url, headers=headers, params=params)
-    if response.status_code != 200:
+    retry_delays = (2.0, 5.0, 12.0)
+    for attempt in range(len(retry_delays) + 1):
+        try:
+            response = await client.get(url, headers=headers, params=params)
+        except httpx.RequestError:
+            if attempt == len(retry_delays):
+                raise
+            await asyncio.sleep(retry_delays[attempt])
+            continue
+        if response.status_code == 200:
+            payload = response.json()
+            if payload.get("errors"):
+                raise RuntimeError(f"billing API returned errors url={url}")
+            return payload
+        retryable = response.status_code == 429 or 500 <= response.status_code < 600
+        if retryable and attempt < len(retry_delays):
+            raw_retry_after = response.headers.get("retry-after")
+            try:
+                retry_after = float(raw_retry_after) if raw_retry_after else retry_delays[attempt]
+            except ValueError:
+                retry_after = retry_delays[attempt]
+            await asyncio.sleep(max(retry_after, retry_delays[attempt] if not raw_retry_after else 0.0))
+            continue
         raise RuntimeError(f"billing API failed status={response.status_code} url={url}")
-    payload = response.json()
-    if payload.get("errors"):
-        raise RuntimeError(f"billing API returned errors url={url}")
-    return payload
+    raise RuntimeError(f"billing API retry loop exhausted url={url}")
 
 
 def _periods_cover_month(periods: list[dict], month: str) -> list[dict]:

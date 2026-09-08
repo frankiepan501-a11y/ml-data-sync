@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app import billing
 
@@ -99,6 +99,20 @@ class BillingAdjustmentTests(unittest.TestCase):
 
 
 class BillingFetchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_get_json_retries_rate_limit_before_returning_complete_page(self):
+        limited = MagicMock(status_code=429, headers={"retry-after": "1"})
+        ok = MagicMock(status_code=200, headers={})
+        ok.json.return_value = {"total": 0, "results": []}
+        client = MagicMock()
+        client.get = AsyncMock(side_effect=[limited, ok])
+
+        with patch.object(billing.asyncio, "sleep", AsyncMock()) as sleeper:
+            result = await billing._get_json(client, "https://example.test", {}, {})
+
+        self.assertEqual(0, result["total"])
+        self.assertEqual(2, client.get.await_count)
+        sleeper.assert_awaited_once_with(1.0)
+
     async def test_fetch_reads_general_and_full_endpoints(self):
         full_row = {
             "charge_info": {
