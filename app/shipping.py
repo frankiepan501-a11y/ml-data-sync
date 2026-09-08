@@ -25,6 +25,7 @@ Used in sync-feishu-monthly:
 from __future__ import annotations
 
 import asyncio
+import math
 from typing import Any
 
 import httpx
@@ -47,6 +48,41 @@ _CBT_TOKEN_USERS: set[int] = {1502520822}
 _429_BACKOFFS = (2.0, 5.0, 12.0)
 
 
+def _validated_cost_payload(payload: dict | None) -> dict | None:
+    """Return complete shipping facts; keep legitimate zero distinct from missing."""
+    if not isinstance(payload, dict):
+        return None
+    senders = payload.get("senders")
+    if not isinstance(senders, list) or not senders or not isinstance(senders[0], dict):
+        return None
+    if "cost" not in senders[0] or not payload.get("currency_id"):
+        return None
+    try:
+        sender_cost = float(senders[0]["cost"])
+        gross_amount = float(payload.get("gross_amount") or 0)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(sender_cost) or sender_cost < 0:
+        return None
+    if not math.isfinite(gross_amount) or gross_amount < 0:
+        return None
+    return {
+        "sender_cost": sender_cost,
+        "gross_amount": gross_amount,
+        "currency": str(payload["currency_id"]),
+    }
+
+
+def _validated_cached_cost(cached: dict | None) -> dict | None:
+    if not cached:
+        return None
+    parsed = _validated_cost_payload(cached.get("_payload"))
+    if not parsed:
+        return None
+    parsed["from_cache"] = True
+    return parsed
+
+
 async def fetch_shipping_cost(
     shipment_id: int,
     seller_id: int,
@@ -61,13 +97,9 @@ async def fetch_shipping_cost(
     Retries on 429 with exponential backoff; returns None on other non-200.
     """
     cached = await db.cache_get_shipping(shipment_id)
-    if cached and float(cached.get("sender_cost") or 0) > 0:
-        return {
-            "sender_cost": cached.get("sender_cost") or 0,
-            "gross_amount": cached.get("gross_amount") or 0,
-            "currency": cached.get("currency") or "",
-            "from_cache": True,
-        }
+    validated_cached = _validated_cached_cost(cached)
+    if validated_cached:
+        return validated_cached
 
     row = await db.get_token(token_user_id)
     if not row:
@@ -91,10 +123,12 @@ async def fetch_shipping_cost(
                 return None
             if r.status_code == 200:
                 payload = r.json()
-                senders = payload.get("senders") or [{}]
-                sender_cost = float(senders[0].get("cost") or 0)
-                gross_amount = float(payload.get("gross_amount") or 0)
-                currency = payload.get("currency_id") or ""
+                parsed = _validated_cost_payload(payload)
+                if not parsed:
+                    return None
+                sender_cost = parsed["sender_cost"]
+                gross_amount = parsed["gross_amount"]
+                currency = parsed["currency"]
                 await db.cache_put_shipping(
                     shipment_id, seller_id, order_id,
                     sender_cost, gross_amount, currency, payload,
@@ -140,13 +174,9 @@ async def fetch_many_shipping_costs(
     need_live: list[tuple[int, int, int]] = []
     for sid, seller_id, order_id in shipment_keys:
         cached = await db.cache_get_shipping(sid)
-        if cached and float(cached.get("sender_cost") or 0) > 0:
-            out[sid] = {
-                "sender_cost": cached.get("sender_cost") or 0,
-                "gross_amount": cached.get("gross_amount") or 0,
-                "currency": cached.get("currency") or "",
-                "from_cache": True,
-            }
+        validated_cached = _validated_cached_cost(cached)
+        if validated_cached:
+            out[sid] = validated_cached
         else:
             need_live.append((sid, seller_id, order_id))
     if not need_live:

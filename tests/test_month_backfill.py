@@ -9,6 +9,120 @@ from app import main, ml_close
 
 
 class MonthBackfillTests(unittest.IsolatedAsyncioTestCase):
+    def test_sales_date_uses_site_local_date_closed(self):
+        order = {"id": 101, "date_closed": "2026-08-31T23:31:40.000-04:00"}
+
+        self.assertEqual("2026-09-01", main._site_local_closed_date(2378517428, order))
+        self.assertEqual("2026-08-31", main._site_local_closed_date(3383185411, order))
+
+    async def test_local_month_scope_uses_site_date_closed_and_excludes_cancelled(self):
+        search = SimpleNamespace(
+            status_code=200,
+            json=lambda: {
+                "results": [{"id": 101}, {"id": 102}, {"id": 103}, {"id": 104}],
+                "paging": {"total": 4},
+            },
+        )
+
+        def detail(order_id, *, status="paid", date_closed=None):
+            payload = {
+                "id": order_id,
+                "status": status,
+                "date_created": "2026-08-31T23:30:00.000-04:00",
+                "date_closed": date_closed,
+                "currency_id": "MXN",
+                "paid_amount": 100,
+                "total_amount": 100,
+                "payments": [],
+                "shipping": {"id": order_id + 1000},
+                "order_items": [{
+                    "item": {"id": f"MLM{order_id}", "seller_sku": "SKU1"},
+                    "quantity": 1,
+                    "unit_price": 100,
+                    "currency_id": "MXN",
+                    "sale_fee": 16,
+                }],
+            }
+            return SimpleNamespace(status_code=200, headers={}, json=lambda: payload)
+
+        responses = [
+            search,
+            detail(101, date_closed="2026-08-31T23:30:00.000-06:00"),
+            detail(102, date_closed="2026-09-01T02:27:16.000-04:00"),
+            detail(103, status="cancelled", date_closed="2026-08-15T10:00:00.000-06:00"),
+            detail(104, status="payment_in_process", date_closed=None),
+        ]
+        with (
+            patch.object(main.db, "get_token", AsyncMock(return_value={"access_token": "x", "app_key": "local_mx"})),
+            patch.object(main.db, "cache_get_order", AsyncMock(return_value=None)),
+            patch.object(main.db, "cache_put_order", AsyncMock()),
+            patch.object(main.db, "cache_list_orders_for_scope", AsyncMock(return_value=[])),
+            patch.object(main, "_ml_get", AsyncMock(side_effect=responses)),
+        ):
+            result = await main._report_sku_recent_impl(
+                3383185411,
+                200,
+                3383185411,
+                date_from="2026-07-01T00:00:00.000-06:00",
+                date_to="2026-09-03T00:00:00.000-06:00",
+                max_detail_fetch=100,
+                refresh_after=1000,
+                scope_month="2026-08",
+                scope_timezone="America/Mexico_City",
+            )
+
+        self.assertEqual(result["platform_total"], 4)
+        self.assertEqual(result["_month_scope_order_ids"], [101])
+        self.assertEqual(result["month_scope_total"], 1)
+        self.assertEqual(result["month_scope_unclosed_excluded"], 1)
+
+    async def test_paid_order_without_date_closed_fails_month_scope(self):
+        search = SimpleNamespace(
+            status_code=200,
+            json=lambda: {"results": [{"id": 101}], "paging": {"total": 1}},
+        )
+        detail = SimpleNamespace(
+            status_code=200,
+            headers={},
+            json=lambda: {
+                "id": 101,
+                "status": "paid",
+                "date_created": "2026-08-31T23:30:00.000-06:00",
+                "date_closed": None,
+                "currency_id": "MXN",
+                "paid_amount": 100,
+                "total_amount": 100,
+                "payments": [],
+                "shipping": {"id": 1101},
+                "order_items": [{
+                    "item": {"id": "MLM101", "seller_sku": "SKU1"},
+                    "quantity": 1,
+                    "unit_price": 100,
+                    "currency_id": "MXN",
+                    "sale_fee": 16,
+                }],
+            },
+        )
+        with (
+            patch.object(main.db, "get_token", AsyncMock(return_value={"access_token": "x", "app_key": "local_mx"})),
+            patch.object(main.db, "cache_get_order", AsyncMock(return_value=None)),
+            patch.object(main.db, "cache_put_order", AsyncMock()),
+            patch.object(main.db, "cache_list_orders_for_scope", AsyncMock(return_value=[])),
+            patch.object(main, "_ml_get", AsyncMock(side_effect=[search, detail])),
+        ):
+            with self.assertRaisesRegex(HTTPException, "monthly paid order missing date_closed"):
+                await main._report_sku_recent_impl(
+                    3383185411,
+                    200,
+                    3383185411,
+                    date_from="2026-07-01T00:00:00.000-06:00",
+                    date_to="2026-09-03T00:00:00.000-06:00",
+                    max_detail_fetch=100,
+                    refresh_after=1000,
+                    scope_month="2026-08",
+                    scope_timezone="America/Mexico_City",
+                )
+
     async def test_local_search_uses_order_prefixed_date_filter(self):
         response = SimpleNamespace(status_code=200, json=lambda: {"results": [], "paging": {"total": 0}})
         with (
@@ -49,7 +163,7 @@ class MonthBackfillTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("date_created.from", params)
         self.assertNotIn("order.date_created.from", params)
 
-    async def test_backfill_uses_site_local_month_boundaries(self):
+    async def test_backfill_uses_wide_search_and_site_local_closed_month_scope(self):
         result = {
             "packs_returned": 0,
             "orders_with_detail": 0,
@@ -66,8 +180,10 @@ class MonthBackfillTests(unittest.IsolatedAsyncioTestCase):
             patch.object(main.db, "cache_list_orders_for_scope", AsyncMock(return_value=[])),
         ):
             await main.admin_backfill_orders(2378517428, month="2026-08", refresh_after=1000)
-        self.assertEqual(impl.await_args.kwargs["date_from"], "2026-08-01T00:00:00.000-03:00")
-        self.assertEqual(impl.await_args.kwargs["date_to"], "2026-09-01T00:00:00.000-03:00")
+        self.assertEqual(impl.await_args.kwargs["date_from"], "2026-07-01T00:00:00.000-03:00")
+        self.assertEqual(impl.await_args.kwargs["date_to"], "2026-09-03T00:00:00.000-03:00")
+        self.assertEqual(impl.await_args.kwargs["scope_month"], "2026-08")
+        self.assertEqual(impl.await_args.kwargs["scope_timezone"], "America/Sao_Paulo")
 
         with (
             patch.object(main, "_report_sku_recent_impl", AsyncMock(return_value=result)) as impl,
@@ -75,8 +191,10 @@ class MonthBackfillTests(unittest.IsolatedAsyncioTestCase):
             patch.object(main.db, "cache_list_orders_for_scope", AsyncMock(return_value=[])),
         ):
             await main.admin_backfill_orders(3383185411, month="2026-08", refresh_after=1000)
-        self.assertEqual(impl.await_args.kwargs["date_from"], "2026-08-01T00:00:00.000-06:00")
-        self.assertEqual(impl.await_args.kwargs["date_to"], "2026-09-01T00:00:00.000-06:00")
+        self.assertEqual(impl.await_args.kwargs["date_from"], "2026-07-01T00:00:00.000-06:00")
+        self.assertEqual(impl.await_args.kwargs["date_to"], "2026-09-03T00:00:00.000-06:00")
+        self.assertEqual(impl.await_args.kwargs["scope_month"], "2026-08")
+        self.assertEqual(impl.await_args.kwargs["scope_timezone"], "America/Mexico_City")
 
     async def test_complete_backfill_replaces_authoritative_platform_month_scope(self):
         result = {
@@ -89,17 +207,20 @@ class MonthBackfillTests(unittest.IsolatedAsyncioTestCase):
             "skipped_other": 0,
             "capped": False,
             "_platform_order_ids": [101, 102],
+            "_month_scope_order_ids": [101],
+            "month_scope_total": 1,
         }
-        cached = [{"order_id": 101}, {"order_id": 102}]
+        cached = [{"order_id": 101}]
         with (
             patch.object(main, "_report_sku_recent_impl", AsyncMock(return_value=result)),
-            patch.object(main.db, "cache_replace_month_scope", AsyncMock(return_value=2)) as replace,
+            patch.object(main.db, "cache_replace_month_scope", AsyncMock(return_value=1)) as replace,
             patch.object(main.db, "cache_list_orders_for_scope", AsyncMock(return_value=cached)),
         ):
             response = await main.admin_backfill_orders(2378517428, month="2026-08", refresh_after=1000)
 
-        replace.assert_awaited_once_with(2378517428, "2026-08", [101, 102])
-        self.assertEqual(response["cached_month_unique"], 2)
+        replace.assert_awaited_once_with(2378517428, "2026-08", [101])
+        self.assertEqual(response["cached_month_unique"], 1)
+        self.assertEqual(response["month_scope_total"], 1)
         self.assertTrue(response["month_scope_replaced"])
 
     async def test_month_backfill_requires_a_stable_refresh_cutoff(self):

@@ -6,8 +6,11 @@ M2: tokens persisted to SQLite; admin endpoints for seed/list/refresh.
 import os
 import json
 import math
+import re
 import secrets
 import time
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Depends, Header, BackgroundTasks
 from fastapi.concurrency import run_in_threadpool
@@ -74,6 +77,10 @@ def health():
         "ml_month_live_ab_hash_guard_20260907": True,
         "ml_month_scope_replace_guard_20260907": True,
         "ml_unified_source_hash_guard_20260907": True,
+        "ml_month_date_closed_scope_20260908": True,
+        "ml_month_shipping_complete_20260908": True,
+        "ml_month_billing_adjustments_20260908": True,
+        "ml_month_manual_logistics_preserve_20260908": True,
     }
 
 
@@ -913,7 +920,9 @@ def _monthly_detail_financial_issues(detail: dict, response) -> list[str]:
 async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id: int,
                                   date_from: str | None = None, date_to: str | None = None,
                                   max_detail_fetch: int | None = None,
-                                  refresh_after: int | None = None):
+                                  refresh_after: int | None = None,
+                                  scope_month: str | None = None,
+                                  scope_timezone: str | None = None):
     row = await db.get_token(parent_user_id)
     if not row:
         raise HTTPException(404, "parent token not found in DB; seed first")
@@ -1057,9 +1066,47 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
                     skipped_other += 1
                     detail_failures.append({"order_id": int(order_id), "status": rd.status_code})
 
+    month_scope_order_ids: list[int] | None = None
+    month_scope_unclosed_excluded = 0
+    scoped_order_details = order_details
+    if scope_month:
+        if not scope_timezone:
+            raise HTTPException(500, "scope_timezone is required with scope_month")
+        try:
+            site_timezone = ZoneInfo(scope_timezone)
+        except Exception as exc:
+            raise HTTPException(500, f"invalid scope_timezone={scope_timezone}") from exc
+        month_scope_order_ids = []
+        scoped_order_details = []
+        for detail in order_details:
+            if detail.get("status") == "cancelled":
+                continue
+            raw_closed = detail.get("date_closed")
+            if not raw_closed:
+                if detail.get("status") in {"paid", "partially_refunded"}:
+                    raise HTTPException(
+                        502,
+                        f"monthly paid order missing date_closed order_id={detail.get('id')}",
+                    )
+                month_scope_unclosed_excluded += 1
+                continue
+            try:
+                closed_at = datetime.fromisoformat(str(raw_closed).replace("Z", "+00:00"))
+                if closed_at.tzinfo is None:
+                    raise ValueError("date_closed has no timezone")
+                local_month = closed_at.astimezone(site_timezone).strftime("%Y-%m")
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    502,
+                    f"monthly order has invalid date_closed order_id={detail.get('id')}",
+                ) from exc
+            if local_month == scope_month:
+                month_scope_order_ids.append(int(detail["id"]))
+                scoped_order_details.append(detail)
+
     # 3. aggregate by seller_sku
     by_sku: dict[str, dict] = {}
-    for od in order_details:
+    for od in scoped_order_details:
         for item in (od.get("order_items") or []):
             it = item.get("item") or {}
             sku = it.get("seller_sku") or it.get("seller_custom_field") or "(no_sku)"
@@ -1119,6 +1166,9 @@ async def _report_sku_recent_impl(seller_id: int, recent_n: int, parent_user_id:
         "unique_skus": len(rows),
         "rows": rows,
         "_platform_order_ids": platform_order_ids,
+        "_month_scope_order_ids": month_scope_order_ids,
+        "month_scope_total": None if month_scope_order_ids is None else len(month_scope_order_ids),
+        "month_scope_unclosed_excluded": month_scope_unclosed_excluded,
         "_note": "Token bucket: 80/min search, 1200/min detail. Order details cached in SQLite. Uses global_price (listing USD).",
     }
 
@@ -1712,11 +1762,36 @@ def _to_ms(date_str: str | None) -> int | None:
     if not date_str:
         return None
     try:
-        from datetime import datetime
         s = date_str[:10]
         return int(datetime.fromisoformat(s).timestamp() * 1000)
     except Exception:
         return None
+
+
+_LOCAL_SELLER_TIMEZONES = {
+    2378517428: "America/Sao_Paulo",
+    3383185411: "America/Mexico_City",
+}
+
+
+def _site_local_closed_date(seller_id: int, order: dict) -> str:
+    """Return the seller-site civil date when the sale was confirmed."""
+    timezone_name = _LOCAL_SELLER_TIMEZONES.get(seller_id)
+    if not timezone_name:
+        raise HTTPException(500, f"monthly timezone missing seller_id={seller_id}")
+    raw_closed = order.get("date_closed")
+    if not raw_closed:
+        raise HTTPException(502, f"monthly order missing date_closed order_id={order.get('id')}")
+    try:
+        closed_at = datetime.fromisoformat(str(raw_closed).replace("Z", "+00:00"))
+        if closed_at.tzinfo is None:
+            raise ValueError("date_closed has no timezone")
+        return closed_at.astimezone(ZoneInfo(timezone_name)).date().isoformat()
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            502,
+            f"monthly order has invalid date_closed order_id={order.get('id')}",
+        ) from exc
 
 
 @app.post("/report/sync-feishu", dependencies=[Depends(require_service_token)])
@@ -1796,7 +1871,8 @@ async def report_sync_feishu(
 @app.post("/report/sync-feishu-monthly", dependencies=[Depends(require_service_token)])
 async def report_sync_feishu_monthly(seller_id: int, month: str, background_tasks: BackgroundTasks,
                                      period_label: str = "", nowait: bool = False,
-                                     commit: bool = True):
+                                     commit: bool = True,
+                                     preserve_existing_as: str = ""):
     """Dispatcher. nowait=true → schedule aggregation in background, return 202 immediately
     (avoids Zeabur gateway ~150s connection reset on heavy sellers like CBT-FULL 1502236229,
     which made the monthly cron 9ZvARULB0wIp19yp false-alarm even though data lands fine).
@@ -1804,11 +1880,20 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, background_task
     if seller_id not in SHOP_LABEL:
         raise HTTPException(400, f"unknown seller_id {seller_id}; allowed: {list(SHOP_LABEL.keys())}")
     if nowait:
-        background_tasks.add_task(_sync_feishu_monthly_impl, seller_id, month, period_label, commit)
+        background_tasks.add_task(
+            _sync_feishu_monthly_impl,
+            seller_id,
+            month,
+            period_label,
+            commit,
+            preserve_existing_as,
+        )
         return {"status": "accepted", "mode": "background", "seller_id": seller_id, "month": month,
                 "commit": commit,
                 "note": "Aggregation runs in background; verify via Feishu 数据拉取时间 in ~3-5min."}
-    result = await _sync_feishu_monthly_impl(seller_id, month, period_label, commit)
+    result = await _sync_feishu_monthly_impl(
+        seller_id, month, period_label, commit, preserve_existing_as
+    )
     if commit and result.get("status") != "synced":
         raise HTTPException(
             422,
@@ -1818,7 +1903,8 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, background_task
 
 
 async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: str = "",
-                                    commit: bool = True):
+                                    commit: bool = True,
+                                    preserve_existing_as: str = ""):
     """Aggregate seller_id's `month` orders FROM SQLite CACHE + Lingxing cost/FX → Feishu.
 
     Reads ml_order_cache, enriches with Lingxing cg_price (RMB cost) and monthly FX rate
@@ -1838,6 +1924,14 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
         return {"status": "skipped_cbt", "seller_id": seller_id, "month": month,
                 "note": "CBT-FULL 走官方导出解析(cbt_export_ingest.py), 不走主sync(缓存仅85%不全)."}
     period = period_label or f"month_{month}"
+    if preserve_existing_as and (
+        preserve_existing_as == period
+        or not re.fullmatch(r"month_\d{4}-\d{2}_[A-Za-z0-9_-]+", preserve_existing_as)
+    ):
+        raise HTTPException(
+            400,
+            "preserve_existing_as 格式不安全，示例：month_2026-08_original_20260908",
+        )
     sync_started_at = time.time_ns()
 
     cached_rows = await db.cache_list_orders_for_scope(seller_id, month)
@@ -1914,7 +2008,7 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
             cell["commission_total"] += sale_fee if gp else sale_fee * quantity
             cell["discount_total"] = cell.get("discount_total", 0) + seller_discount_local
             order_items_skus.append((sku, quantity))
-            dc = (od.get("date_created") or "")[:10]
+            dc = _site_local_closed_date(seller_id, od)
             if dc:
                 cell["first_seen"] = min(cell["first_seen"] or dc, dc)
                 cell["last_seen"] = max(cell["last_seen"] or dc, dc)
@@ -1946,7 +2040,7 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
                 "cached_orders": len(cached_rows)}
 
     # Enrich with Lingxing cost (cg_price) + monthly FX rate → compute RMB revenue/cost/profit
-    from app import lingxing, advertising
+    from app import lingxing, advertising, billing
     try:
         products = await lingxing.fetch_all_products()
         fx_map = await lingxing.fetch_fx_rate(month)
@@ -2004,6 +2098,35 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
     ad_sku_cost: dict[str, float] = {k: v.get("cost", 0.0) for k, v in ad_sku_metrics.items()}
     ad_unallocated_cost = ad_unallocated_metrics.get("cost", 0.0)
 
+    # Billing-period exports contain several non-order charges that are absent
+    # from the orders and Product Ads occurrence APIs. Pull them separately and
+    # fail closed: treating a temporary billing failure as zero overstates profit.
+    try:
+        billing_adjustments = await billing.fetch_month_adjustments(seller_id, month)
+    except Exception as e:
+        print(
+            f"[ERROR] billing adjustments fetch failed: seller_id={seller_id} month={month} "
+            f"error={type(e).__name__} detail={str(e)[:500]}"
+        )
+        raise HTTPException(
+            502,
+            detail=(
+                f"账单费用抓取失败：{SHOP_LABEL[seller_id]} / {month}。"
+                "本次未写入，原报表数据保持不变；禁止将抓取失败自动记为 0。"
+            ),
+        ) from e
+    billing_currency = str(billing_adjustments.get("currency") or rows[0].get("currency") or "?")
+    if int(billing_adjustments.get("unclassified_count") or 0):
+        raise HTTPException(
+            502,
+            detail=(
+                f"发现未识别账单费用：{SHOP_LABEL[seller_id]} / {month}。"
+                "本次未写入，需先确认费用类型和应写字段。"
+                f" amount={billing_adjustments.get('unclassified_amount')} "
+                f"samples={billing_adjustments.get('unclassified')}"
+            ),
+        )
+
     # Phase B1.4: pull shop-level visits (per ML user/items_visits endpoint).
     # CBT sellers return 403 → None. Used to compute 整店 CVR = sum(件数) / 访客.
     shop_visits = await advertising.fetch_shop_visits_for_month(seller_id, month)
@@ -2027,14 +2150,31 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
             order_shipments, ship_token_user, concurrency=5, budget_s=ship_budget)
         for sid, seller, oid in order_shipments:
             r = ship_results.get(sid)
-            if not r:
+            sku_units = order_to_sku.get(oid) or []
+            try:
+                sender_cost = float(r["sender_cost"])
+                shipping_currency = str(r["currency"] or "")
+            except (TypeError, KeyError, ValueError):
+                shipping_skipped += 1
+                continue
+            expected_currencies = {
+                str(by_sku[sku].get("currency") or "")
+                for sku, _ in sku_units
+                if sku in by_sku
+            }
+            total_units = sum(u for _, u in sku_units)
+            if (
+                not math.isfinite(sender_cost)
+                or sender_cost < 0
+                or not shipping_currency
+                or len(expected_currencies) != 1
+                or shipping_currency not in expected_currencies
+                or total_units <= 0
+            ):
                 shipping_skipped += 1
                 continue
             shipping_costs_fetched += 1
-            sender_cost = r.get("sender_cost") or 0
-            sku_units = order_to_sku.get(oid) or []
-            total_units = sum(u for _, u in sku_units)
-            if total_units <= 0 or sender_cost <= 0:
+            if sender_cost <= 0:
                 continue
             for sku, u in sku_units:
                 share = sender_cost * (u / total_units)
@@ -2254,12 +2394,102 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
             "数据拉取时间": pulled_at_ms,
         }})
 
+    # Product Ads stays on the occurrence-month API above. The billing Product
+    # Ads amount is evidence only and is deliberately not written again.
+    billing_fx = _positive_finite(fx_map.get(billing_currency)) or 0
+    billing_values = {
+        "_display_ads": (
+            "Display Ads（账单费用日期口径）",
+            "广告费(原币)",
+            "广告费(RMB)",
+            float(billing_adjustments.get("display_ads") or 0),
+        ),
+        "_full_fees": (
+            "Full 仓储及违规费用（账单费用日期口径）",
+            None,
+            "Full仓储费(RMB)",
+            float(billing_adjustments.get("full_fees") or 0),
+        ),
+        "_return_fees": (
+            "退货处理费（账单费用日期口径）",
+            "退款金额(原币)",
+            "退款金额(RMB)",
+            float(billing_adjustments.get("return_fees") or 0),
+        ),
+        "_other_platform_fees": (
+            "其他已识别平台费用（账单费用日期口径）",
+            "ML佣金(原币)",
+            "ML佣金(RMB)",
+            float(billing_adjustments.get("other_platform_fees") or 0),
+        ),
+    }
+    for synthetic_sku, (title, local_field, rmb_field, local_value) in billing_values.items():
+        if abs(local_value) <= 0.000001:
+            continue
+        if not billing_fx:
+            currencies_missing_fx.append(billing_currency)
+        fields = {
+            "SKU": synthetic_sku,
+            "平台": "Mercado Libre",
+            "店铺": SHOP_LABEL[seller_id],
+            "周期": period,
+            "订单数": 0,
+            "件数": 0,
+            "币种": billing_currency,
+            "营收(原币)": 0,
+            "营收(RMB)": 0,
+            "我的汇率": round(billing_fx, 4) if billing_fx else 0,
+            rmb_field: round(local_value * billing_fx, 2) if billing_fx else 0,
+            "商品标题": title,
+            "数据拉取时间": pulled_at_ms,
+        }
+        if local_field:
+            fields[local_field] = round(local_value, 2)
+        records.append({"fields": fields})
+
     ad_total_local_value = round(
-        sum(v.get("cost", 0.0) for v in ad_sku_metrics.values()) + ad_unallocated_cost,
+        sum(v.get("cost", 0.0) for v in ad_sku_metrics.values())
+        + ad_unallocated_cost
+        + float(billing_adjustments.get("display_ads") or 0),
         2,
     )
     ad_total_rmb_value = round(
         sum(float((record.get("fields") or {}).get("广告费(RMB)") or 0) for record in records),
+        2,
+    )
+    full_total_rmb_value = round(
+        sum(float((record.get("fields") or {}).get("Full仓储费(RMB)") or 0) for record in records),
+        2,
+    )
+    refund_total_local_value = round(
+        sum(float((record.get("fields") or {}).get("退款金额(原币)") or 0) for record in records),
+        2,
+    )
+    refund_total_rmb_value = round(
+        sum(float((record.get("fields") or {}).get("退款金额(RMB)") or 0) for record in records),
+        2,
+    )
+    commission_total_local_value = round(
+        sum(float((record.get("fields") or {}).get("ML佣金(原币)") or 0) for record in records),
+        2,
+    )
+    commission_total_rmb_value = round(
+        sum(float((record.get("fields") or {}).get("ML佣金(RMB)") or 0) for record in records),
+        2,
+    )
+    units_total_value = int(sum(
+        float((record.get("fields") or {}).get("件数") or 0) for record in records
+    ))
+    revenue_local_total_value = round(
+        sum(float((record.get("fields") or {}).get("营收(原币)") or 0) for record in records),
+        2,
+    )
+    shipping_local_total_value = round(
+        sum(float((record.get("fields") or {}).get("物流费(原币)") or 0) for record in records),
+        2,
+    )
+    vat_local_total_value = round(
+        sum(float((record.get("fields") or {}).get("VAT/税费(原币)") or 0) for record in records),
         2,
     )
     if not commit:
@@ -2272,6 +2502,12 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
             "period": period,
             "rows_previewed": len(records),
             "cached_orders_total": len(cached_rows),
+            "units_total": units_total_value,
+            "revenue_local_total": revenue_local_total_value,
+            "commission_local_total": commission_total_local_value,
+            "shipping_local_total": shipping_local_total_value,
+            "vat_local_total": vat_local_total_value,
+            "refund_local_total": refund_total_local_value,
             "unique_skus": len(rows),
             "advertiser_id": ad_advertiser_id,
             "ad_currency": ad_currency,
@@ -2284,6 +2520,19 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
             "lingxing_error": lingxing_error,
             "missing_purchase_cost_skus": sorted(set(skus_missing_cost)),
             "missing_fx_currencies": sorted(set(currencies_missing_fx)),
+            "shipping_costs_required": len(order_shipments),
+            "shipping_costs_fetched": shipping_costs_fetched,
+            "shipping_costs_missing": shipping_skipped,
+            "billing_period_keys": billing_adjustments.get("period_keys") or [],
+            "billing_raw_details": int(billing_adjustments.get("raw_details") or 0),
+            "billing_adjustment_count": int(billing_adjustments.get("detail_count") or 0),
+            "billing_display_ads_local": round(float(billing_adjustments.get("display_ads") or 0), 2),
+            "billing_full_fees_local": round(float(billing_adjustments.get("full_fees") or 0), 2),
+            "billing_return_fees_local": round(float(billing_adjustments.get("return_fees") or 0), 2),
+            "billing_other_platform_fees_local": round(
+                float(billing_adjustments.get("other_platform_fees") or 0), 2
+            ),
+            "billing_product_ads_ignored": round(float(billing_adjustments.get("product_ads_ignored") or 0), 2),
             "ad_rows": [
                 {
                     "sku": fields.get("SKU"),
@@ -2314,6 +2563,12 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
             f" missing_skus={missing[:20]}"
             + (f" lingxing_error={lingxing_error}" if lingxing_error else ""),
         )
+    if shipping_skipped:
+        raise HTTPException(
+            503,
+            "物流费未完整取得；本次未写入，已取得的数据保留在缓存中，可安全重试。"
+            f" required={len(order_shipments)} fetched={shipping_costs_fetched} missing={shipping_skipped}",
+        )
 
     from app import ml_close
     await ml_close.invalidate_ab_verification(period, "local_monthly_sync")
@@ -2326,16 +2581,16 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
         sr_url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{FEISHU_BASE_APP_TOKEN}/tables/{FEISHU_BASE_TABLE_ID}/records/search"
         create_url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{FEISHU_BASE_APP_TOKEN}/tables/{FEISHU_BASE_TABLE_ID}/records/batch_create"
         delete_url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{FEISHU_BASE_APP_TOKEN}/tables/{FEISHU_BASE_TABLE_ID}/records/batch_delete"
+        update_url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{FEISHU_BASE_APP_TOKEN}/tables/{FEISHU_BASE_TABLE_ID}/records/batch_update"
         fs_headers = {
             "Authorization": f"Bearer {feishu_token}",
             "Content-Type": "application/json",
         }
-        sr_body = {"filter": {"conjunction": "and", "conditions": [
-            {"field_name": "店铺", "operator": "is", "value": [shop_label]},
-            {"field_name": "周期", "operator": "is", "value": [period]},
-        ]}}
-
-        async def _search_scope(phase: str) -> list[dict]:
+        async def _search_scope(phase: str, target_period: str = period) -> list[dict]:
+            sr_body = {"filter": {"conjunction": "and", "conditions": [
+                {"field_name": "店铺", "operator": "is", "value": [shop_label]},
+                {"field_name": "周期", "operator": "is", "value": [target_period]},
+            ]}}
             items: list[dict] = []
             page_token: str | None = None
             while True:
@@ -2364,6 +2619,40 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
 
         existing_items = await _search_scope("pre-write")
         existing_ids = [it["record_id"] for it in existing_items if it.get("record_id")]
+        if existing_ids and not preserve_existing_as:
+            raise HTTPException(
+                409,
+                "当前周期已有数据；必须传 preserve_existing_as 先归档旧版，"
+                "本次未创建、删除或覆盖任何记录",
+            )
+        if existing_ids:
+            archive_items = await _search_scope("archive-precheck", preserve_existing_as)
+            if archive_items:
+                raise HTTPException(
+                    409,
+                    f"旧版证据周期已存在：{preserve_existing_as}；未修改任何数据",
+                )
+        # Preserve operator-supplied logistics costs across a monthly rebuild.
+        # Missing and explicit zero are different: zero is a confirmed value and
+        # must survive just like any positive amount.
+        existing_costs_by_sku: dict[str, dict] = {}
+        for item in existing_items:
+            old_fields = item.get("fields") or {}
+            sku = str(old_fields.get("SKU") or "").strip()
+            if not sku:
+                continue
+            preserved = {
+                field: old_fields[field]
+                for field in ("头程成本(RMB)", "海外仓成本(RMB)")
+                if field in old_fields and old_fields[field] not in (None, "")
+            }
+            if preserved:
+                existing_costs_by_sku[sku] = preserved
+        for record in records:
+            new_fields = record.get("fields") or {}
+            preserved = existing_costs_by_sku.get(str(new_fields.get("SKU") or "").strip())
+            if preserved:
+                new_fields.update(preserved)
         if len(existing_ids) > 500 or len(records) > 500:
             raise HTTPException(502, "feishu safe replace limit exceeded; no rows were changed")
 
@@ -2395,16 +2684,51 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
                 f"known-new-row rollback={'ok' if rollback_ok else 'failed'}",
             )
 
+        async def _relabel(record_ids: list[str], target_period: str, phase: str) -> None:
+            if not record_ids:
+                return
+            response = await client.post(
+                update_url,
+                headers=fs_headers,
+                json={"records": [
+                    {"record_id": record_id, "fields": {"周期": target_period}}
+                    for record_id in record_ids
+                ]},
+            )
+            payload = response.json()
+            if response.status_code != 200 or payload.get("code") != 0:
+                raise HTTPException(
+                    502,
+                    f"feishu {phase} failed: status={response.status_code} code={payload.get('code')}",
+                )
+
         def _verify_scope(items: list[dict], phase: str) -> None:
             if len(items) != len(records):
                 raise HTTPException(
                     502,
                     f"feishu {phase} mismatch: expected_rows={len(records)} actual_rows={len(items)}",
                 )
-            for metric_key, expected in (
+            financial_expectations = [
                 ("广告费(原币)", ad_total_local_value),
                 ("广告费(RMB)", ad_total_rmb_value),
-            ):
+                ("Full仓储费(RMB)", full_total_rmb_value),
+                ("退款金额(原币)", refund_total_local_value),
+                ("退款金额(RMB)", refund_total_rmb_value),
+            ]
+            if abs(float(billing_adjustments.get("other_platform_fees") or 0)) > 0.000001:
+                financial_expectations.extend([
+                    ("ML佣金(原币)", commission_total_local_value),
+                    ("ML佣金(RMB)", commission_total_rmb_value),
+                ])
+            for preserved_field in ("头程成本(RMB)", "海外仓成本(RMB)"):
+                financial_expectations.append((
+                    preserved_field,
+                    round(sum(
+                        float((record.get("fields") or {}).get(preserved_field) or 0)
+                        for record in records
+                    ), 2),
+                ))
+            for metric_key, expected in financial_expectations:
                 actual = round(
                     sum(float((it.get("fields") or {}).get(metric_key) or 0) for it in items),
                     2,
@@ -2431,21 +2755,57 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
                 f"{verify_error.detail}; new-row rollback={'ok' if rollback_ok else 'failed'}",
             ) from verify_error
 
+        archived_existing = False
         if existing_ids:
-            dr = await client.post(delete_url, headers=fs_headers, json={"records": existing_ids})
-            dr_payload = dr.json()
-            if dr.status_code != 200 or dr_payload.get("code") != 0:
+            try:
+                await _relabel(existing_ids, preserve_existing_as, "archive old snapshot")
+                archived_existing = True
+            except HTTPException as archive_error:
                 rb = await client.post(delete_url, headers=fs_headers, json={"records": created_ids})
                 rb_payload = rb.json()
                 rollback_ok = rb.status_code == 200 and rb_payload.get("code") == 0
                 raise HTTPException(
                     502,
-                    f"feishu replace delete failed: status={dr.status_code} code={dr_payload.get('code')}; "
-                    f"new-row rollback={'ok' if rollback_ok else 'failed'}",
-                )
+                    f"{archive_error.detail}; new-row rollback={'ok' if rollback_ok else 'failed'}",
+                ) from archive_error
 
-        verified_items = await _search_scope("read-back")
-        _verify_scope(verified_items, "read-back")
+        try:
+            verified_items = await _search_scope("read-back")
+            _verify_scope(verified_items, "read-back")
+            if archived_existing:
+                archived_items = await _search_scope("archive-read-back", preserve_existing_as)
+                archived_ids = {
+                    item.get("record_id") for item in archived_items if item.get("record_id")
+                }
+                if archived_ids != set(existing_ids):
+                    raise HTTPException(
+                        502,
+                        f"feishu archive read-back mismatch: expected_rows={len(existing_ids)} "
+                        f"actual_rows={len(archived_ids)}",
+                    )
+        except HTTPException as verify_error:
+            recovery_errors = []
+            rb = await client.post(delete_url, headers=fs_headers, json={"records": created_ids})
+            rb_payload = rb.json()
+            if rb.status_code != 200 or rb_payload.get("code") != 0:
+                recovery_errors.append("new-row rollback failed")
+            if archived_existing:
+                try:
+                    await _relabel(existing_ids, period, "restore old snapshot")
+                    restored_items = await _search_scope("restore-read-back", period)
+                    restored_ids = {
+                        item.get("record_id") for item in restored_items if item.get("record_id")
+                    }
+                    if restored_ids != set(existing_ids):
+                        raise HTTPException(
+                            502,
+                            f"feishu restore read-back mismatch: expected_rows={len(existing_ids)} "
+                            f"actual_rows={len(restored_ids)}",
+                        )
+                except HTTPException as restore_error:
+                    recovery_errors.append(str(restore_error.detail))
+            suffix = " recovery=ok" if not recovery_errors else f" recovery_errors={recovery_errors}"
+            raise HTTPException(502, f"{verify_error.detail};{suffix}") from verify_error
 
     try:
         from app import ml_close
@@ -2464,8 +2824,16 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
     return {"status": "synced", "seller_id": seller_id, "shop": SHOP_LABEL[seller_id],
             "month": month, "period": period, "rows_written": len(records),
             "rows_replaced": len(existing_ids),
+            "rows_archived": len(existing_ids) if archived_existing else 0,
+            "old_version_period": preserve_existing_as if archived_existing else None,
             "rows_verified": len(verified_items),
             "cached_orders_total": len(cached_rows), "unique_skus": len(rows),
+            "units_total": units_total_value,
+            "revenue_local_total": revenue_local_total_value,
+            "commission_local_total": commission_total_local_value,
+            "shipping_local_total": shipping_local_total_value,
+            "vat_local_total": vat_local_total_value,
+            "refund_local_total": refund_total_local_value,
             "lingxing_products_loaded": len(products),
             "lingxing_error": lingxing_error,
             "skus_missing_cost": skus_missing_cost,
@@ -2477,6 +2845,16 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
             "ad_total_local": ad_total_local_value,
             "ad_total_rmb": ad_total_rmb_value,
             "ad_unallocated_local": round(ad_unallocated_cost, 2),
+            "billing_period_keys": billing_adjustments.get("period_keys") or [],
+            "billing_raw_details": int(billing_adjustments.get("raw_details") or 0),
+            "billing_adjustment_count": int(billing_adjustments.get("detail_count") or 0),
+            "billing_display_ads_local": round(float(billing_adjustments.get("display_ads") or 0), 2),
+            "billing_full_fees_local": round(float(billing_adjustments.get("full_fees") or 0), 2),
+            "billing_return_fees_local": round(float(billing_adjustments.get("return_fees") or 0), 2),
+            "billing_other_platform_fees_local": round(
+                float(billing_adjustments.get("other_platform_fees") or 0), 2
+            ),
+            "billing_product_ads_ignored": round(float(billing_adjustments.get("product_ads_ignored") or 0), 2),
             "vat_rate": vat_rate,
             "site_id_inferred": site_id_for_vat,
             "bitable_url": f"https://u1wpma3xuhr.feishu.cn/base/{FEISHU_BASE_APP_TOKEN}"}
@@ -2513,41 +2891,56 @@ async def admin_backfill_orders(seller_id: int, recent_n: int = 200, parent_user
                 "at least 10 minutes before the caller clock to tolerate clock skew",
             )
         yyyy, mm = (int(x) for x in month.split("-"))
-        # Local stores must use the site's civil-month boundary. Mercado Libre's
-        # bare /orders/search endpoint also requires the `order.` prefix below.
-        offsets = {2378517428: "-03:00", 3383185411: "-06:00"}
-        if seller_id not in offsets:
+        # The search API filters by date_created and can return records across a
+        # civil-month boundary. Pull the previous month plus a two-day tail, then
+        # derive the authoritative month scope from site-local date_closed below.
+        site_timezones = {
+            2378517428: "America/Sao_Paulo",
+            3383185411: "America/Mexico_City",
+        }
+        if seller_id not in site_timezones:
             raise HTTPException(400, f"monthly backfill is not configured for seller_id={seller_id}")
-        offset = offsets[seller_id]
-        date_from = f"{yyyy}-{mm:02d}-01T00:00:00.000{offset}"
+        site_timezone = site_timezones[seller_id]
+        tz = ZoneInfo(site_timezone)
+        py, pm = (yyyy - 1, 12) if mm == 1 else (yyyy, mm - 1)
+        search_start = datetime(py, pm, 1, tzinfo=tz)
         ty, tm = (yyyy + 1, 1) if mm == 12 else (yyyy, mm + 1)
-        date_to = f"{ty}-{tm:02d}-01T00:00:00.000{offset}"
+        month_end = datetime(ty, tm, 1, tzinfo=tz)
+        search_end = month_end + timedelta(days=2)
+        date_from = search_start.isoformat(timespec="milliseconds")
+        date_to = search_end.isoformat(timespec="milliseconds")
     agg = await _report_sku_recent_impl(
         seller_id, recent_n, parent,
         date_from=date_from, date_to=date_to,
         max_detail_fetch=(max_detail_fetch if month else None),
         refresh_after=(refresh_after if month else None),
+        scope_month=(month if month else None),
+        scope_timezone=(site_timezone if month else None),
     )
     cache_extras_pruned = 0
     month_scope_replaced = False
     if month:
         platform_ids = {int(order_id) for order_id in (agg.get("_platform_order_ids") or [])}
+        month_scope_ids = {int(order_id) for order_id in (agg.get("_month_scope_order_ids") or [])}
         platform_total = agg.get("platform_total")
+        month_scope_total = agg.get("month_scope_total")
         complete_detail_pass = (
             isinstance(platform_total, int)
             and len(platform_ids) == platform_total
+            and isinstance(month_scope_total, int)
+            and len(month_scope_ids) == month_scope_total
             and not agg.get("capped")
             and not agg.get("skipped_429")
             and not agg.get("skipped_other")
             and agg.get("orders_with_detail") == platform_total
         )
         if complete_detail_pass:
-            scope_count = await db.cache_replace_month_scope(seller_id, month, sorted(platform_ids))
+            scope_count = await db.cache_replace_month_scope(seller_id, month, sorted(month_scope_ids))
             scoped_rows = await db.cache_list_orders_for_scope(seller_id, month)
-            if scope_count != platform_total or len(scoped_rows) != platform_total:
+            if scope_count != month_scope_total or len(scoped_rows) != month_scope_total:
                 raise HTTPException(
                     502,
-                    f"month scope reconciliation failed platform={platform_total} "
+                    f"month scope reconciliation failed search={platform_total} month={month_scope_total} "
                     f"scope={scope_count} cached={len(scoped_rows)}",
                 )
             agg["cached_month_unique"] = len(scoped_rows)
@@ -2557,6 +2950,8 @@ async def admin_backfill_orders(seller_id: int, recent_n: int = 200, parent_user
             "mode": ("month:" + month) if month else f"recent_{recent_n}",
             "window_orders": agg.get("packs_returned"),
             "platform_total": agg.get("platform_total"),
+            "month_scope_total": agg.get("month_scope_total"),
+            "month_scope_unclosed_excluded": agg.get("month_scope_unclosed_excluded"),
             "orders_with_detail": agg.get("orders_with_detail"),
             "cached_month_unique": agg.get("cached_month_unique"),
             "cache_extras_pruned": cache_extras_pruned,

@@ -96,8 +96,8 @@ for (const seller_id of sellers) {{
     if (!response || response.status !== 'backfilled') {{
       throw new Error(`ML month backfill failed seller=${{seller_id}} month=${{month}} response=${{JSON.stringify(response).slice(0,300)}}`);
     }}
-    results.push({{seller_id, attempt, platform_total: response.platform_total, window_orders: response.window_orders, orders_with_detail: response.orders_with_detail, cached_month_unique: response.cached_month_unique, month_scope_replaced: response.month_scope_replaced, new_fetches: response.new_fetches, skipped_429: response.skipped_429, skipped_other: response.skipped_other, capped: response.capped}});
-    if (Number.isInteger(response.platform_total) && response.month_scope_replaced === true && response.new_fetches === 0 && response.capped === false && (response.skipped_429 || 0) === 0 && (response.skipped_other || 0) === 0 && response.window_orders === response.platform_total && response.cached_month_unique === response.platform_total) {{
+    results.push({{seller_id, attempt, platform_total: response.platform_total, month_scope_total: response.month_scope_total, window_orders: response.window_orders, orders_with_detail: response.orders_with_detail, cached_month_unique: response.cached_month_unique, month_scope_replaced: response.month_scope_replaced, new_fetches: response.new_fetches, skipped_429: response.skipped_429, skipped_other: response.skipped_other, capped: response.capped}});
+    if (Number.isInteger(response.platform_total) && Number.isInteger(response.month_scope_total) && response.month_scope_replaced === true && response.new_fetches === 0 && response.capped === false && (response.skipped_429 || 0) === 0 && (response.skipped_other || 0) === 0 && response.window_orders === response.platform_total && response.orders_with_detail === response.platform_total && response.cached_month_unique === response.month_scope_total) {{
       completed = true;
       break;
     }}

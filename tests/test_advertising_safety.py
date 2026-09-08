@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 
 from fastapi import HTTPException
 
-from app import advertising, db, lingxing, main, ml_close
+from app import advertising, billing, db, lingxing, main, ml_close
 
 
 @asynccontextmanager
@@ -204,8 +204,28 @@ class MonthlySyncSafetyTests(unittest.IsolatedAsyncioTestCase):
             AsyncMock(return_value={"status": "invalidated"}),
         )
         self.invalidate_ab = self.invalidate_patcher.start()
+        self.billing_patcher = patch.object(
+            billing,
+            "fetch_month_adjustments",
+            AsyncMock(return_value={
+                "currency": "MXN",
+                "detail_count": 0,
+                "raw_details": 0,
+                "period_keys": ["2026-07-01"],
+                "display_ads": 0.0,
+                "full_fees": 0.0,
+                "return_fees": 0.0,
+                "other_platform_fees": 0.0,
+                "product_ads_ignored": 0.0,
+                "unclassified_count": 0,
+                "unclassified_amount": 0.0,
+                "unclassified": [],
+            }),
+        )
+        self.billing_fetch = self.billing_patcher.start()
 
     def tearDown(self):
+        self.billing_patcher.stop()
         self.invalidate_patcher.stop()
 
     @staticmethod
@@ -219,6 +239,7 @@ class MonthlySyncSafetyTests(unittest.IsolatedAsyncioTestCase):
             "_payload": {
                 "id": 1,
                 "status": "paid",
+                "date_closed": "2026-07-10T12:00:00.000-06:00",
                 "paid_amount": 100,
                 "total_amount": 100,
                 "currency_id": "MXN",
@@ -321,6 +342,104 @@ class MonthlySyncSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["SKU1"], result["missing_purchase_cost_skus"])
         feishu_token.assert_not_awaited()
 
+    async def test_preview_includes_bill_adjustments_without_double_counting_product_ads(self):
+        self.billing_fetch.return_value = {
+            "currency": "MXN",
+            "detail_count": 4,
+            "raw_details": 4,
+            "period_keys": ["2026-07-01"],
+            "display_ads": 5.0,
+            "full_fees": 7.0,
+            "return_fees": 3.0,
+            "other_platform_fees": 2.0,
+            "product_ads_ignored": 99.0,
+            "unclassified_count": 0,
+            "unclassified_amount": 0.0,
+            "unclassified": [],
+        }
+        metrics = copy.deepcopy(_ad_row()["metrics"])
+
+        with (
+            patch.object(db, "cache_list_orders_for_scope", AsyncMock(return_value=[self._cached_order()])),
+            patch.object(lingxing, "fetch_all_products", AsyncMock(return_value=self._products())),
+            patch.object(lingxing, "fetch_fx_rate", AsyncMock(return_value={"MXN": 0.4})),
+            patch.object(advertising, "fetch_ad_items_for_month", AsyncMock(return_value=[_ad_row()])),
+            patch.object(
+                advertising,
+                "attribute_ad_metrics_by_item_id",
+                AsyncMock(return_value=({"SKU1": metrics}, {}, [])),
+            ),
+            patch.object(advertising, "fetch_shop_visits_for_month", AsyncMock(return_value=0)),
+            patch.object(main, "_feishu_tenant_token", AsyncMock(side_effect=AssertionError("preview only"))),
+        ):
+            result = await main._sync_feishu_monthly_impl(3383185411, "2026-07", commit=False)
+
+        self.assertEqual(15.0, result["ad_total_local"])
+        self.assertEqual(6.0, result["ad_total_rmb"])
+        self.assertEqual(5.0, result["billing_display_ads_local"])
+        self.assertEqual(7.0, result["billing_full_fees_local"])
+        self.assertEqual(3.0, result["billing_return_fees_local"])
+        self.assertEqual(2.0, result["billing_other_platform_fees_local"])
+        self.assertEqual(99.0, result["billing_product_ads_ignored"])
+        self.assertEqual(4, result["billing_raw_details"])
+        self.assertEqual(5, result["rows_previewed"])
+
+    async def test_billing_failure_stops_before_feishu_write(self):
+        self.billing_fetch.side_effect = RuntimeError("billing API status=429")
+        metrics = copy.deepcopy(_ad_row()["metrics"])
+        feishu_token = AsyncMock(side_effect=AssertionError("Feishu write must not be reached"))
+
+        with (
+            patch.object(db, "cache_list_orders_for_scope", AsyncMock(return_value=[self._cached_order()])),
+            patch.object(lingxing, "fetch_all_products", AsyncMock(return_value=self._products())),
+            patch.object(lingxing, "fetch_fx_rate", AsyncMock(return_value={"MXN": 0.4})),
+            patch.object(advertising, "fetch_ad_items_for_month", AsyncMock(return_value=[_ad_row()])),
+            patch.object(
+                advertising,
+                "attribute_ad_metrics_by_item_id",
+                AsyncMock(return_value=({"SKU1": metrics}, {}, [])),
+            ),
+            patch.object(advertising, "fetch_shop_visits_for_month", AsyncMock(return_value=0)),
+            patch.object(main, "_feishu_tenant_token", feishu_token),
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                await main._sync_feishu_monthly_impl(3383185411, "2026-07", commit=True)
+
+        self.assertEqual(502, ctx.exception.status_code)
+        self.assertIn("账单费用抓取失败", str(ctx.exception.detail))
+        feishu_token.assert_not_awaited()
+
+    async def test_unclassified_billing_fee_stops_before_feishu_write(self):
+        current = copy.deepcopy(self.billing_fetch.return_value)
+        current.update({
+            "unclassified_count": 1,
+            "unclassified_amount": 12.5,
+            "unclassified": [{"detail_id": 99, "subtype": "NEWFEE"}],
+        })
+        self.billing_fetch.return_value = current
+        metrics = copy.deepcopy(_ad_row()["metrics"])
+        feishu_token = AsyncMock(side_effect=AssertionError("Feishu write must not be reached"))
+
+        with (
+            patch.object(db, "cache_list_orders_for_scope", AsyncMock(return_value=[self._cached_order()])),
+            patch.object(lingxing, "fetch_all_products", AsyncMock(return_value=self._products())),
+            patch.object(lingxing, "fetch_fx_rate", AsyncMock(return_value={"MXN": 0.4})),
+            patch.object(advertising, "fetch_ad_items_for_month", AsyncMock(return_value=[_ad_row()])),
+            patch.object(
+                advertising,
+                "attribute_ad_metrics_by_item_id",
+                AsyncMock(return_value=({"SKU1": metrics}, {}, [])),
+            ),
+            patch.object(advertising, "fetch_shop_visits_for_month", AsyncMock(return_value=0)),
+            patch.object(main, "_feishu_tenant_token", feishu_token),
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                await main._sync_feishu_monthly_impl(3383185411, "2026-07", commit=True)
+
+        self.assertEqual(502, ctx.exception.status_code)
+        self.assertIn("未识别账单费用", str(ctx.exception.detail))
+        feishu_token.assert_not_awaited()
+
     async def test_missing_purchase_cost_blocks_commit_before_feishu_write(self):
         feishu_token = AsyncMock(side_effect=AssertionError("Feishu write must not be reached"))
         metrics = copy.deepcopy(_ad_row()["metrics"])
@@ -369,6 +488,61 @@ class MonthlySyncSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.invalidate_ab.assert_not_awaited()
         feishu_token.assert_not_awaited()
 
+    async def test_missing_shipping_cost_blocks_commit_before_feishu_write(self):
+        feishu_token = AsyncMock(side_effect=AssertionError("Feishu write must not be reached"))
+        metrics = copy.deepcopy(_ad_row()["metrics"])
+        cached = self._cached_order()
+        cached["_payload"]["shipping"] = {"id": 501}
+        with (
+            patch.object(db, "cache_list_orders_for_scope", AsyncMock(return_value=[cached])),
+            patch.object(lingxing, "fetch_all_products", AsyncMock(return_value=self._products())),
+            patch.object(lingxing, "fetch_fx_rate", AsyncMock(return_value={"MXN": 0.4})),
+            patch.object(advertising, "fetch_ad_items_for_month", AsyncMock(return_value=[_ad_row()])),
+            patch.object(
+                advertising,
+                "attribute_ad_metrics_by_item_id",
+                AsyncMock(return_value=({"SKU1": metrics}, {}, [])),
+            ),
+            patch.object(advertising, "fetch_shop_visits_for_month", AsyncMock(return_value=0)),
+            patch("app.shipping.fetch_many_shipping_costs", AsyncMock(return_value={})),
+            patch.object(main, "_feishu_tenant_token", feishu_token),
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                await main._sync_feishu_monthly_impl(3383185411, "2026-07", commit=True)
+
+        self.assertEqual(503, ctx.exception.status_code)
+        self.assertIn("物流费未完整取得", str(ctx.exception.detail))
+        self.invalidate_ab.assert_not_awaited()
+        feishu_token.assert_not_awaited()
+
+    async def test_incomplete_shipping_payload_is_not_accepted_as_zero_cost(self):
+        feishu_token = AsyncMock(side_effect=AssertionError("Feishu write must not be reached"))
+        metrics = copy.deepcopy(_ad_row()["metrics"])
+        cached = self._cached_order()
+        cached["_payload"]["shipping"] = {"id": 501}
+        with (
+            patch.object(db, "cache_list_orders_for_scope", AsyncMock(return_value=[cached])),
+            patch.object(lingxing, "fetch_all_products", AsyncMock(return_value=self._products())),
+            patch.object(lingxing, "fetch_fx_rate", AsyncMock(return_value={"MXN": 0.4})),
+            patch.object(advertising, "fetch_ad_items_for_month", AsyncMock(return_value=[_ad_row()])),
+            patch.object(
+                advertising,
+                "attribute_ad_metrics_by_item_id",
+                AsyncMock(return_value=({"SKU1": metrics}, {}, [])),
+            ),
+            patch.object(advertising, "fetch_shop_visits_for_month", AsyncMock(return_value=0)),
+            patch("app.shipping.fetch_many_shipping_costs", AsyncMock(return_value={
+                501: {"sender_cost": 0, "currency": ""},
+            })),
+            patch.object(main, "_feishu_tenant_token", feishu_token),
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                await main._sync_feishu_monthly_impl(3383185411, "2026-07", commit=True)
+
+        self.assertEqual(503, ctx.exception.status_code)
+        self.assertIn("物流费未完整取得", str(ctx.exception.detail))
+        feishu_token.assert_not_awaited()
+
     async def _run_commit_with_feishu_responses(self, responses):
         metrics = copy.deepcopy(_ad_row()["metrics"])
         fake_client = _FakePostClient(responses)
@@ -388,7 +562,12 @@ class MonthlySyncSafetyTests(unittest.IsolatedAsyncioTestCase):
             patch.object(main, "_feishu_tenant_token", AsyncMock(return_value="test")),
             patch.object(main.httpx, "AsyncClient", return_value=fake_client),
         ):
-            result = await main._sync_feishu_monthly_impl(3383185411, "2026-07", commit=True)
+            result = await main._sync_feishu_monthly_impl(
+                3383185411,
+                "2026-07",
+                commit=True,
+                preserve_existing_as="month_2026-07_original_test",
+            )
         self.clear_recorder = clear_recorder
         return result, fake_client
 
@@ -436,22 +615,9 @@ class MonthlySyncSafetyTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(1, len(fake_client.calls))
 
-    async def test_feishu_delete_failure_rolls_back_new_rows(self):
+    async def test_existing_period_requires_archive_label_before_any_write(self):
         fake_client = _FakePostClient([
             ({"code": 0, "data": {"items": [{"record_id": "rec-old"}], "has_more": False}}, 200),
-            ({"code": 0, "data": {"records": [{"record_id": "rec-new"}]}}, 200),
-            ({"code": 0, "data": {
-                "items": [
-                    {"record_id": "rec-old", "fields": {}},
-                    {"record_id": "rec-new", "fields": {
-                        "广告费(原币)": 10.0,
-                        "广告费(RMB)": 4.0,
-                    }},
-                ],
-                "has_more": False,
-            }}, 200),
-            ({"code": 999}, 500),
-            ({"code": 0}, 200),
         ])
         metrics = copy.deepcopy(_ad_row()["metrics"])
         with (
@@ -467,17 +633,16 @@ class MonthlySyncSafetyTests(unittest.IsolatedAsyncioTestCase):
             patch.object(advertising, "fetch_shop_visits_for_month", AsyncMock(return_value=0)),
             patch.object(main, "_feishu_tenant_token", AsyncMock(return_value="test")),
             patch.object(main.httpx, "AsyncClient", return_value=fake_client),
-            self.assertRaisesRegex(HTTPException, "replace delete failed"),
+            self.assertRaisesRegex(HTTPException, "必须传 preserve_existing_as"),
         ):
             await main._sync_feishu_monthly_impl(3383185411, "2026-07", commit=True)
 
-        self.assertEqual(5, len(fake_client.calls))
-        rollback_payload = fake_client.calls[-1][1]["json"]
-        self.assertEqual(["rec-new"], rollback_payload["records"])
+        self.assertEqual(1, len(fake_client.calls))
 
     async def test_feishu_create_failure_keeps_old_rows(self):
         fake_client = _FakePostClient([
             ({"code": 0, "data": {"items": [{"record_id": "rec-old"}], "has_more": False}}, 200),
+            ({"code": 0, "data": {"items": [], "has_more": False}}, 200),
             ({"code": 999}, 500),
         ])
         metrics = copy.deepcopy(_ad_row()["metrics"])
@@ -496,9 +661,14 @@ class MonthlySyncSafetyTests(unittest.IsolatedAsyncioTestCase):
             patch.object(main.httpx, "AsyncClient", return_value=fake_client),
             self.assertRaisesRegex(HTTPException, "create failed"),
         ):
-            await main._sync_feishu_monthly_impl(3383185411, "2026-07", commit=True)
+            await main._sync_feishu_monthly_impl(
+                3383185411,
+                "2026-07",
+                commit=True,
+                preserve_existing_as="month_2026-07_original_test",
+            )
 
-        self.assertEqual(2, len(fake_client.calls))
+        self.assertEqual(3, len(fake_client.calls))
 
     async def test_feishu_lookup_follows_all_pages_before_replace(self):
         result, fake_client = await self._run_commit_with_feishu_responses([
@@ -511,6 +681,7 @@ class MonthlySyncSafetyTests(unittest.IsolatedAsyncioTestCase):
                 "items": [{"record_id": "rec-old-2"}],
                 "has_more": False,
             }}, 200),
+            ({"code": 0, "data": {"items": [], "has_more": False}}, 200),
             ({"code": 0, "data": {"records": [{"record_id": "rec-new"}]}}, 200),
             ({"code": 0, "data": {
                 "items": [
@@ -531,17 +702,237 @@ class MonthlySyncSafetyTests(unittest.IsolatedAsyncioTestCase):
                 }}],
                 "has_more": False,
             }}, 200),
+            ({"code": 0, "data": {
+                "items": [
+                    {"record_id": "rec-old-1", "fields": {"周期": "month_2026-07_original_test"}},
+                    {"record_id": "rec-old-2", "fields": {"周期": "month_2026-07_original_test"}},
+                ],
+                "has_more": False,
+            }}, 200),
         ])
 
         self.assertEqual(2, result["rows_replaced"])
         self.assertEqual(1, result["rows_verified"])
-        self.assertEqual(6, len(fake_client.calls))
+        self.assertEqual(8, len(fake_client.calls))
         self.clear_recorder.assert_awaited_once()
         self.assertEqual(
             ("month_2026-07", "ML 本土3店 DISTRIBUIDOR VALMIGOZ"),
             self.clear_recorder.await_args.args,
         )
         self.assertGreater(self.clear_recorder.await_args.kwargs["success_started_at"], 0)
+
+    async def test_commit_preserves_existing_manual_logistics_costs_by_sku(self):
+        result, fake_client = await self._run_commit_with_feishu_responses([
+            ({"code": 0, "data": {
+                "items": [{"record_id": "rec-old", "fields": {
+                    "SKU": "SKU1",
+                    "头程成本(RMB)": 12.34,
+                    "海外仓成本(RMB)": 0,
+                }}],
+                "has_more": False,
+            }}, 200),
+            ({"code": 0, "data": {"items": [], "has_more": False}}, 200),
+            ({"code": 0, "data": {"records": [{"record_id": "rec-new"}]}}, 200),
+            ({"code": 0, "data": {
+                "items": [
+                    {"record_id": "rec-old", "fields": {}},
+                    {"record_id": "rec-new", "fields": {
+                        "广告费(原币)": 10.0,
+                        "广告费(RMB)": 4.0,
+                        "头程成本(RMB)": 12.34,
+                        "海外仓成本(RMB)": 0,
+                    }},
+                ],
+                "has_more": False,
+            }}, 200),
+            ({"code": 0}, 200),
+            ({"code": 0, "data": {
+                "items": [{"record_id": "rec-new", "fields": {
+                    "广告费(原币)": 10.0,
+                    "广告费(RMB)": 4.0,
+                    "头程成本(RMB)": 12.34,
+                    "海外仓成本(RMB)": 0,
+                }}],
+                "has_more": False,
+            }}, 200),
+            ({"code": 0, "data": {
+                "items": [{"record_id": "rec-old", "fields": {
+                    "周期": "month_2026-07_original_test",
+                }}],
+                "has_more": False,
+            }}, 200),
+        ])
+
+        self.assertEqual("synced", result["status"])
+        create_payload = fake_client.calls[2][1]["json"]
+        created_fields = create_payload["records"][0]["fields"]
+        self.assertEqual(12.34, created_fields["头程成本(RMB)"])
+        self.assertEqual(0, created_fields["海外仓成本(RMB)"])
+
+    async def test_missing_preserved_cost_in_feishu_readback_rolls_back_new_rows(self):
+        fake_client = _FakePostClient([
+            ({"code": 0, "data": {
+                "items": [{"record_id": "rec-old", "fields": {
+                    "SKU": "SKU1",
+                    "头程成本(RMB)": 12.34,
+                }}],
+                "has_more": False,
+            }}, 200),
+            ({"code": 0, "data": {"items": [], "has_more": False}}, 200),
+            ({"code": 0, "data": {"records": [{"record_id": "rec-new"}]}}, 200),
+            ({"code": 0, "data": {
+                "items": [
+                    {"record_id": "rec-old", "fields": {}},
+                    {"record_id": "rec-new", "fields": {
+                        "广告费(原币)": 10.0,
+                        "广告费(RMB)": 4.0,
+                    }},
+                ],
+                "has_more": False,
+            }}, 200),
+            ({"code": 0}, 200),
+        ])
+        metrics = copy.deepcopy(_ad_row()["metrics"])
+        with (
+            patch.object(db, "cache_list_orders_for_scope", AsyncMock(return_value=[self._cached_order()])),
+            patch.object(lingxing, "fetch_all_products", AsyncMock(return_value=self._products())),
+            patch.object(lingxing, "fetch_fx_rate", AsyncMock(return_value={"MXN": 0.4})),
+            patch.object(advertising, "fetch_ad_items_for_month", AsyncMock(return_value=[_ad_row()])),
+            patch.object(
+                advertising,
+                "attribute_ad_metrics_by_item_id",
+                AsyncMock(return_value=({"SKU1": metrics}, {}, [])),
+            ),
+            patch.object(advertising, "fetch_shop_visits_for_month", AsyncMock(return_value=0)),
+            patch.object(main, "_feishu_tenant_token", AsyncMock(return_value="test")),
+            patch.object(main.httpx, "AsyncClient", return_value=fake_client),
+        ):
+            with self.assertRaisesRegex(HTTPException, "头程成本"):
+                await main._sync_feishu_monthly_impl(
+                    3383185411,
+                    "2026-07",
+                    commit=True,
+                    preserve_existing_as="month_2026-07_original_test",
+                )
+
+        self.assertEqual(["rec-new"], fake_client.calls[-1][1]["json"]["records"])
+
+    async def test_commit_can_archive_old_snapshot_before_switching_current_period(self):
+        fake_client = _FakePostClient([
+            ({"code": 0, "data": {
+                "items": [{"record_id": "rec-old", "fields": {
+                    "SKU": "SKU1",
+                    "头程成本(RMB)": 12.34,
+                }}],
+                "has_more": False,
+            }}, 200),
+            ({"code": 0, "data": {"items": [], "has_more": False}}, 200),
+            ({"code": 0, "data": {"records": [{"record_id": "rec-new"}]}}, 200),
+            ({"code": 0, "data": {
+                "items": [
+                    {"record_id": "rec-old", "fields": {}},
+                    {"record_id": "rec-new", "fields": {
+                        "广告费(原币)": 10.0,
+                        "广告费(RMB)": 4.0,
+                        "头程成本(RMB)": 12.34,
+                    }},
+                ],
+                "has_more": False,
+            }}, 200),
+            ({"code": 0}, 200),
+            ({"code": 0, "data": {
+                "items": [{"record_id": "rec-new", "fields": {
+                    "广告费(原币)": 10.0,
+                    "广告费(RMB)": 4.0,
+                    "头程成本(RMB)": 12.34,
+                }}],
+                "has_more": False,
+            }}, 200),
+            ({"code": 0, "data": {
+                "items": [{"record_id": "rec-old", "fields": {"周期": "month_2026-07_original_20260908"}}],
+                "has_more": False,
+            }}, 200),
+        ])
+        metrics = copy.deepcopy(_ad_row()["metrics"])
+        with (
+            patch.object(db, "cache_list_orders_for_scope", AsyncMock(return_value=[self._cached_order()])),
+            patch.object(lingxing, "fetch_all_products", AsyncMock(return_value=self._products())),
+            patch.object(lingxing, "fetch_fx_rate", AsyncMock(return_value={"MXN": 0.4})),
+            patch.object(advertising, "fetch_ad_items_for_month", AsyncMock(return_value=[_ad_row()])),
+            patch.object(
+                advertising,
+                "attribute_ad_metrics_by_item_id",
+                AsyncMock(return_value=({"SKU1": metrics}, {}, [])),
+            ),
+            patch.object(advertising, "fetch_shop_visits_for_month", AsyncMock(return_value=0)),
+            patch.object(ml_close, "clear_advertising_failure", AsyncMock(return_value={})),
+            patch.object(main, "_feishu_tenant_token", AsyncMock(return_value="test")),
+            patch.object(main.httpx, "AsyncClient", return_value=fake_client),
+        ):
+            result = await main._sync_feishu_monthly_impl(
+                3383185411,
+                "2026-07",
+                commit=True,
+                preserve_existing_as="month_2026-07_original_20260908",
+            )
+
+        self.assertEqual(1, result["rows_archived"])
+        self.assertEqual("month_2026-07_original_20260908", result["old_version_period"])
+        self.assertTrue(fake_client.calls[4][0][0].endswith("/batch_update"))
+
+    async def test_final_readback_failure_restores_and_verifies_old_snapshot(self):
+        fake_client = _FakePostClient([
+            ({"code": 0, "data": {
+                "items": [{"record_id": "rec-old", "fields": {"SKU": "SKU1"}}],
+                "has_more": False,
+            }}, 200),
+            ({"code": 0, "data": {"items": [], "has_more": False}}, 200),
+            ({"code": 0, "data": {"records": [{"record_id": "rec-new"}]}}, 200),
+            ({"code": 0, "data": {
+                "items": [
+                    {"record_id": "rec-old", "fields": {}},
+                    {"record_id": "rec-new", "fields": {
+                        "广告费(原币)": 10.0,
+                        "广告费(RMB)": 4.0,
+                    }},
+                ],
+                "has_more": False,
+            }}, 200),
+            ({"code": 0}, 200),
+            ({"code": 0, "data": {"items": [], "has_more": False}}, 200),
+            ({"code": 0}, 200),
+            ({"code": 0}, 200),
+            ({"code": 0, "data": {
+                "items": [{"record_id": "rec-old", "fields": {"周期": "month_2026-07"}}],
+                "has_more": False,
+            }}, 200),
+        ])
+        metrics = copy.deepcopy(_ad_row()["metrics"])
+        with (
+            patch.object(db, "cache_list_orders_for_scope", AsyncMock(return_value=[self._cached_order()])),
+            patch.object(lingxing, "fetch_all_products", AsyncMock(return_value=self._products())),
+            patch.object(lingxing, "fetch_fx_rate", AsyncMock(return_value={"MXN": 0.4})),
+            patch.object(advertising, "fetch_ad_items_for_month", AsyncMock(return_value=[_ad_row()])),
+            patch.object(
+                advertising,
+                "attribute_ad_metrics_by_item_id",
+                AsyncMock(return_value=({"SKU1": metrics}, {}, [])),
+            ),
+            patch.object(advertising, "fetch_shop_visits_for_month", AsyncMock(return_value=0)),
+            patch.object(main, "_feishu_tenant_token", AsyncMock(return_value="test")),
+            patch.object(main.httpx, "AsyncClient", return_value=fake_client),
+        ):
+            with self.assertRaisesRegex(HTTPException, "recovery=ok"):
+                await main._sync_feishu_monthly_impl(
+                    3383185411,
+                    "2026-07",
+                    commit=True,
+                    preserve_existing_as="month_2026-07_original_test",
+                )
+
+        self.assertEqual(9, len(fake_client.calls))
+        self.assertTrue(fake_client.calls[7][0][0].endswith("/batch_update"))
+        self.assertIn("/records/search", fake_client.calls[8][0][0])
 
 
 class MonthlyCloseAdvertisingFailureTests(unittest.IsolatedAsyncioTestCase):
