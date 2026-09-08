@@ -221,9 +221,10 @@ async def fetch_month_adjustments(seller_id: int, month: str) -> dict:
                         )
                     if expected_total is None:
                         expected_total = total
-                    elif expected_total != total:
+                    elif total != expected_total - fetched:
                         raise RuntimeError(
-                            f"billing {endpoint_suffix} total changed during pagination key={key}"
+                            f"billing {endpoint_suffix} remaining total mismatch key={key} "
+                            f"expected={expected_total - fetched} actual={total}"
                         )
                     all_details.extend(page)
                     if endpoint_suffix == "full/details":

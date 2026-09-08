@@ -134,6 +134,39 @@ class BillingFetchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(35.0, result["full_fees"])
         self.assertEqual(1, result["raw_full_details"])
 
+    async def test_fetch_accepts_remaining_total_that_decreases_after_cursor(self):
+        def row(detail_id):
+            return {
+                "charge_info": {
+                    "detail_id": detail_id,
+                    "creation_date_time": "2026-08-12T10:00:00",
+                    "transaction_detail": "Cargo por venta",
+                    "detail_sub_type": "CV",
+                    "detail_type": "CHARGE",
+                    "detail_amount": 1,
+                },
+                "currency_info": {"currency_id": "MXN"},
+            }
+
+        getter = AsyncMock(side_effect=[
+            {"results": [{
+                "key": "2026-08-01",
+                "period": {"date_from": "2026-08-01", "date_to": "2026-08-31"},
+            }]},
+            {"total": 3, "results": [row(1), row(2)], "last_id": 2},
+            {"total": 1, "results": [row(3)], "last_id": 3},
+            {"total": 0, "results": []},
+        ])
+
+        with (
+            patch.object(billing.db, "get_token", AsyncMock(return_value={"access_token": "x"})),
+            patch.object(billing, "_get_json", getter),
+        ):
+            result = await billing.fetch_month_adjustments(3383185411, "2026-08")
+
+        self.assertEqual(3, result["raw_details"])
+        self.assertEqual(2, getter.await_args_list[2].args[3]["from_id"])
+
 
 if __name__ == "__main__":
     unittest.main()
