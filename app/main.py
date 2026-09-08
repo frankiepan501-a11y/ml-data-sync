@@ -89,6 +89,7 @@ def health():
         "ml_billing_brazil_remaining_fee_map_20260908": True,
         "lingxing_product_empty_retry_20260908": True,
         "ml_month_logistics_archive_restore_20260908": True,
+        "ml_shipping_package_dedupe_20260908": True,
         "ml_month_manual_logistics_preserve_20260908": True,
     }
 
@@ -1964,7 +1965,11 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
     by_sku: dict[str, dict] = {}
     item_id_to_sku: dict[str, str] = {}
     # Order-level shipment + refund data for later allocation
-    order_shipments: list[tuple[int, int, int]] = []  # (shipment_id, seller_id, order_id)
+    # A Mercado Libre package can contain multiple orders that share one shipment_id.
+    # Shipping is charged once per shipment, so keep one fetch key and combine all
+    # package SKU units before allocating the cost.
+    shipment_keys: dict[int, tuple[int, int, int]] = {}  # shipment_id -> fetch key
+    shipment_to_sku_units: dict[int, list[tuple[str, int]]] = {}
     order_to_sku: dict[int, list[tuple[str, int]]] = {}  # order_id → [(sku, units), ...]
     refunds_by_order: dict[int, float] = {}  # order_id → total refunded amount in order currency
     cancelled_count = 0
@@ -2037,7 +2042,9 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
         ship = od.get("shipping") or {}
         sid = ship.get("id")
         if sid and order_id:
-            order_shipments.append((int(sid), seller_id, order_id))
+            shipment_id = int(sid)
+            shipment_keys.setdefault(shipment_id, (shipment_id, seller_id, order_id))
+            shipment_to_sku_units.setdefault(shipment_id, []).extend(order_items_skus)
             order_to_sku[order_id] = order_items_skus
         # Refund total (sum across payments)
         refunded = 0.0
@@ -2055,6 +2062,7 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
                   f"status={od.get('status')} refunded={refunded} order_cur={od.get('currency_id')} "
                   f"— verify currency (CBT refunded=MXN buyer ccy) before trusting refund_total")
 
+    order_shipments = list(shipment_keys.values())
     rows = sorted(by_sku.values(), key=lambda x: x["revenue_total"], reverse=True)
     if not rows:
         return {"status": "no_data", "seller_id": seller_id, "month": month,
@@ -2156,7 +2164,8 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
     shop_cvr = (total_units_in_shop / shop_visits) if (shop_visits and shop_visits > 0) else 0
 
     # Phase B2: fetch shipping costs (cache-first) + allocate per SKU
-    # Each shipment.sender_cost is allocated to the order's SKUs by units share.
+    # Each shipment.sender_cost is allocated once across every SKU unit in the
+    # package. Iterating by order would double/triple count multi-order packages.
     shipping_costs_fetched = 0
     shipping_skipped = 0
     if order_shipments:
@@ -2172,7 +2181,7 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
             order_shipments, ship_token_user, concurrency=5, budget_s=ship_budget)
         for sid, seller, oid in order_shipments:
             r = ship_results.get(sid)
-            sku_units = order_to_sku.get(oid) or []
+            sku_units = shipment_to_sku_units.get(sid) or []
             try:
                 sender_cost = float(r["sender_cost"])
                 shipping_currency = str(r["currency"] or "")

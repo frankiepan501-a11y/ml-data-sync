@@ -543,6 +543,38 @@ class MonthlySyncSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("物流费未完整取得", str(ctx.exception.detail))
         feishu_token.assert_not_awaited()
 
+    async def test_orders_in_same_package_count_shipping_once(self):
+        first = self._cached_order()
+        first["_payload"]["shipping"] = {"id": 501}
+        second = copy.deepcopy(first)
+        second["_payload"]["id"] = 2
+        shipping_fetch = AsyncMock(return_value={
+            501: {"sender_cost": 70, "currency": "MXN"},
+        })
+        metrics = copy.deepcopy(_ad_row()["metrics"])
+
+        with (
+            patch.object(db, "cache_list_orders_for_scope", AsyncMock(return_value=[first, second])),
+            patch.object(lingxing, "fetch_all_products", AsyncMock(return_value=self._products())),
+            patch.object(lingxing, "fetch_fx_rate", AsyncMock(return_value={"MXN": 0.4})),
+            patch.object(advertising, "fetch_ad_items_for_month", AsyncMock(return_value=[_ad_row()])),
+            patch.object(
+                advertising,
+                "attribute_ad_metrics_by_item_id",
+                AsyncMock(return_value=({"SKU1": metrics}, {}, [])),
+            ),
+            patch.object(advertising, "fetch_shop_visits_for_month", AsyncMock(return_value=0)),
+            patch("app.shipping.fetch_many_shipping_costs", shipping_fetch),
+            patch.object(main, "_feishu_tenant_token", AsyncMock(side_effect=AssertionError("preview only"))),
+        ):
+            result = await main._sync_feishu_monthly_impl(3383185411, "2026-07", commit=False)
+
+        self.assertEqual(70.0, result["shipping_local_total"])
+        self.assertEqual(1, result["shipping_costs_required"])
+        self.assertEqual(1, result["shipping_costs_fetched"])
+        shipment_keys = shipping_fetch.await_args.args[0]
+        self.assertEqual([(501, 3383185411, 1)], shipment_keys)
+
     async def _run_commit_with_feishu_responses(self, responses, **sync_kwargs):
         metrics = copy.deepcopy(_ad_row()["metrics"])
         fake_client = _FakePostClient(responses)
