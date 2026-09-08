@@ -196,17 +196,22 @@ async def fetch_month_adjustments(seller_id: int, month: str) -> dict:
                 fetched = 0
                 expected_total = None
                 while True:
+                    page_params = {
+                        "document_type": "BILL",
+                        "limit": 1000,
+                        "sort_by": "ID",
+                        "order_by": "ASC",
+                    }
+                    # Mercado Libre returns 404 when from_id=0 is sent on the
+                    # first page.  Add the cursor only after the API gives us a
+                    # real last_id from the preceding page.
+                    if from_id:
+                        page_params["from_id"] = from_id
                     payload = await _get_json(
                         client,
                         f"{base}/billing/integration/periods/key/{key}/group/ML/{endpoint_suffix}",
                         headers,
-                        {
-                            "document_type": "BILL",
-                            "limit": 1000,
-                            "from_id": from_id,
-                            "sort_by": "ID",
-                            "order_by": "ASC",
-                        },
+                        page_params,
                     )
                     page = payload.get("results") or []
                     total = payload.get("total")

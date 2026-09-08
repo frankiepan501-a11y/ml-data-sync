@@ -129,6 +129,8 @@ class BillingFetchTests(unittest.IsolatedAsyncioTestCase):
         called_urls = [call.args[1] for call in getter.await_args_list]
         self.assertTrue(any(url.endswith("/group/ML/details") for url in called_urls))
         self.assertTrue(any(url.endswith("/group/ML/full/details") for url in called_urls))
+        self.assertNotIn("from_id", getter.await_args_list[1].args[3])
+        self.assertNotIn("from_id", getter.await_args_list[2].args[3])
         self.assertEqual(35.0, result["full_fees"])
         self.assertEqual(1, result["raw_full_details"])
 
