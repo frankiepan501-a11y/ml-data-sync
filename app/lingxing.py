@@ -14,6 +14,7 @@ In-memory cache:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -130,23 +131,49 @@ async def fetch_all_products() -> dict[str, dict]:
     if _products_cache["items"] is not None and _products_cache["expires_at"] > now:
         return _products_cache["items"]
 
-    all_p: dict[str, dict] = {}
-    offset = 0
-    page_size = 200
-    while True:
-        r = await lx_api(
-            "/erp/sc/routing/data/local_inventory/productList",
-            {"offset": offset, "length": page_size},
-        )
-        data = r.get("data") or []
-        for p in data:
-            sku = p.get("sku")
-            if sku:
-                all_p[sku] = p
-        total = r.get("total", 0)
-        if offset + page_size >= total or not data:
+    retry_delays = (2.0, 5.0, 12.0)
+    for attempt in range(len(retry_delays) + 1):
+        try:
+            all_p: dict[str, dict] = {}
+            offset = 0
+            page_size = 200
+            while True:
+                r = await lx_api(
+                    "/erp/sc/routing/data/local_inventory/productList",
+                    {"offset": offset, "length": page_size},
+                )
+                code = r.get("code")
+                if code not in (None, 0, "0"):
+                    raise RuntimeError(
+                        f"lingxing productList rejected code={code} message={str(r.get('message') or r.get('msg') or '')[:120]}"
+                    )
+                data = r.get("data")
+                if not isinstance(data, list):
+                    raise RuntimeError("lingxing productList missing data list")
+                try:
+                    total = int(r.get("total"))
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError("lingxing productList missing total") from exc
+                if offset == 0 and not data:
+                    raise RuntimeError("lingxing productList returned empty first page")
+                for p in data:
+                    sku = p.get("sku")
+                    if sku:
+                        all_p[sku] = p
+                if offset + page_size >= total:
+                    break
+                if not data:
+                    raise RuntimeError(
+                        f"lingxing productList truncated offset={offset} total={total}"
+                    )
+                offset += page_size
+            if not all_p:
+                raise RuntimeError("lingxing productList returned no products")
             break
-        offset += page_size
+        except (httpx.HTTPError, RuntimeError):
+            if attempt == len(retry_delays):
+                raise
+            await asyncio.sleep(retry_delays[attempt])
 
     _products_cache["items"] = all_p
     _products_cache["expires_at"] = now + 300  # 5 min

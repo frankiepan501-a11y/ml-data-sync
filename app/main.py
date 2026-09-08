@@ -87,6 +87,7 @@ def health():
         "ml_billing_rate_limit_retry_20260908": True,
         "ml_billing_brazil_fee_map_20260908": True,
         "ml_billing_brazil_remaining_fee_map_20260908": True,
+        "lingxing_product_empty_retry_20260908": True,
         "ml_month_manual_logistics_preserve_20260908": True,
     }
 
