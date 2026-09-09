@@ -840,16 +840,17 @@ async def _style_report(
     styles = [
         {"ranges": f"{main_id}!A1:AU1", "style": {"bold": True, "fontSize": 10, "hAlign": 1, "vAlign": 1, "foreColor": "#FFFFFF", "backColor": "#0F766E"}},
         {"ranges": f"{main_id}!A2:AU{last_row}", "style": {"fontSize": 9, "vAlign": 1}},
-        {"ranges": f"{main_id}!L2:X{last_row}", "style": {"formatter": "#,##0.00;[Red]-#,##0.00"}},
-        {"ranges": f"{main_id}!Z2:AL{last_row}", "style": {"formatter": "#,##0.00;[Red]-#,##0.00"}},
-        {"ranges": f"{main_id}!Y2:Y{last_row}", "style": {"formatter": "0.0000"}},
+        {"ranges": f"{main_id}!L2:X{last_row}", "style": {"formatter": "#,##0.00"}},
+        {"ranges": f"{main_id}!Z2:AL{last_row}", "style": {"formatter": "#,##0.00"}},
+        # Preserve the approved template's exchange-rate format. The v2 API
+        # rejects custom formatter "0.0000" (90204); values retain full precision.
         {"ranges": f"{main_id}!AM2:AU{last_row}", "style": {"formatter": "0.00%"}},
         {"ranges": f"{main_id}!J2:K{last_row}", "style": {"formatter": "0"}},
         {"ranges": f"{source_id}!A1:AW1", "style": {"bold": True, "fontSize": 10, "hAlign": 1, "vAlign": 1, "foreColor": "#FFFFFF", "backColor": "#0F766E"}},
         {"ranges": f"{source_id}!A2:AW{last_row}", "style": {"fontSize": 9, "vAlign": 1}},
         {"ranges": f"{check_id}!A1:C1", "style": {"bold": True, "fontSize": 10, "hAlign": 1, "vAlign": 1, "backColor": "#D9EAF7"}},
         {"ranges": f"{check_id}!A2:C18", "style": {"fontSize": 10, "vAlign": 1}},
-        {"ranges": f"{check_id}!B8:B11", "style": {"formatter": "#,##0.00;[Red]-#,##0.00"}},
+        {"ranges": f"{check_id}!B8:B11", "style": {"formatter": "#,##0.00"}},
     ]
     await _api_json(
         "PUT",
