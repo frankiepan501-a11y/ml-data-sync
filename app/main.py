@@ -103,6 +103,7 @@ def health():
         "ml_month_manual_logistics_preserve_20260908": True,
         "ml_two_stage_close_20260908": True,
         "ml_finance_review_47_columns_20260909": True,
+        "ml_review_system_fee_rows_20260909": True,
     }
 
 

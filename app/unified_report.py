@@ -333,7 +333,24 @@ def prepare_report(
         raise ReportGenerationError(f"{month} 没有可生成的美客多月报数据")
 
     skus = [_text(_record_fields(row).get("SKU")) for row in rows]
-    mappings = resolve_product_mappings(skus, maintenance_records, cost_records)
+    fee_names = {
+        "_full_fees": "Full仓储及违规费用",
+        "_other_platform_fees": "其他已识别平台费用",
+        "_display_ads": "展示广告费用",
+        "_return_fees": "退货处理费",
+        "_unallocated_ads": "未归因广告花费（无商品SKU）",
+    }
+    for record in rows:
+        fields = _record_fields(record)
+        if _text(fields.get("SKU")) in fee_names and any(
+            _number(fields.get(field)) != 0
+            for field in ("订单数", "件数", "营收(原币)", "营收(RMB)", "采购成本(RMB)", "头程成本(RMB)", "海外仓成本(RMB)")
+        ):
+            raise ReportGenerationError("店铺费用行含商品销量、营收或采购物流成本，需核实后生成")
+    mappings = resolve_product_mappings([sku for sku in skus if sku not in fee_names], maintenance_records, cost_records)
+    for sku in set(skus) & fee_names.keys():
+        mappings[sku] = {"product_name": fee_names[sku], "category": "店铺公共费用（非商品）",
+                         "source": "系统费用分类", "record_ids": []}
 
     source_headers = SOURCE_HEADERS + ["record_id"]
     source_values: list[list[Any]] = [source_headers]
@@ -474,7 +491,7 @@ def prepare_report(
             "",
         ],
         ["记录数", len(rows), "SKU×店铺明细", "", ""],
-        ["ERP映射", "通过", f"{summary['unique_skus']} 个唯一 SKU，未命中/冲突/空值均为 0", "", ""],
+        ["ERP映射", "通过", "商品SKU精确匹配；系统费用行单独分类，不伪造ERP产品", "", ""],
         ["店铺数", summary["store_count"], "生产表汇总", "", ""],
         ["订单数", summary["orders"], "生产表汇总", "", ""],
         ["销量", summary["units"], "生产表汇总", "", ""],

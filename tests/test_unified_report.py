@@ -28,6 +28,17 @@ async def _ready_action_guard(
 
 
 class FinanceReviewTests(unittest.IsolatedAsyncioTestCase):
+    def test_known_fee_rows_are_preserved_without_fake_erp_products(self):
+        for sku in ('_full_fees', '_other_platform_fees', '_display_ads', '_return_fees', '_unallocated_ads'):
+            source = _record(SKU=sku, 周期='month_2026-08', 店铺='ML 巴西本土店 AIRSOFT COMERCIAL', 币种='BRL', 件数=0, 订单数=0, **{'营收(RMB)':0, '我的汇率':1, '广告费(原币)':10, '广告费(RMB)':10, '全额毛利(RMB)':-10})
+            result = unified_report.prepare_report('month_2026-08', [source], [], [], close_mode='review')
+            self.assertEqual(47, len(result['main_values'][1]))
+            self.assertEqual('店铺公共费用（非商品）', result['main_values'][1][6])
+            self.assertEqual(-10, result['summary']['full_profit_rmb'])
+            source['fields']['件数'] = 1
+            with self.assertRaises(unified_report.ReportGenerationError):
+                unified_report.prepare_report('month_2026-08', [source], [], [], close_mode='review')
+
     async def test_refresh_updates_only_current_card_without_sending(self):
         summary = {"period": "month_2026-08", "month": "2026-08", "report_hash": "v1", "operating_ready": True, "next_card": "finance_operating"}
         current = {"fields": {"状态": "运营已确认", "最后卡片 message_id": "om-current"}}
