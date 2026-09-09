@@ -562,6 +562,8 @@ async def _commit_audit_snapshot(
         ),
     }
     for key in (
+        "review_source_hash",
+        "review_report_url",
         "operating_close_confirmed",
         "operating_report_hash",
         "operating_content_hash",
@@ -992,7 +994,8 @@ def build_card(kind: str, summary: dict[str, Any], status_fields: dict[str, Any]
             els.append(store_section)
             els.append({"tag": "hr"})
         els.append({"tag": "div", "text": _md(
-            "放行后系统会生成一份独立的**经营暂结报表**并冻结当前数据版本，可用于运营提成和公司毛利汇总。"
+            "请先打开上方**47列财务审核版**（沿用7月定稿格式，含数据源、检查页）。"
+            "审核版尚未放行；确认后系统另存并冻结**经营暂结报表**，可用于运营提成和公司毛利汇总。"
             "后续官方账单差异只进入最终核销，不会覆盖本次暂结报表。"
         )})
         els.append({"tag": "action", "actions": [
@@ -1313,6 +1316,39 @@ async def patch_or_fallback(message_id: str, card: dict[str, Any], chat_id: str 
     return result
 
 
+async def _prepare_finance_review(summary: dict[str, Any]) -> dict[str, Any]:
+    """Create the approved-format review copy without granting financial approval."""
+    from app import unified_report
+
+    source_hash = _text(summary.get("report_hash"))
+    if not source_hash or not summary.get("operating_ready"):
+        raise ValueError("当前数据未通过经营审核检查，不能生成财务审核版")
+    report = await unified_report.generate(
+        summary["period"], commit=True, expected_source_hash=source_hash, close_mode="review"
+    )
+    latest = await audit(period=summary["period"], commit=False, run_cost_preview=False)
+    if not latest.get("operating_ready") or _text(latest.get("report_hash")) != source_hash:
+        raise ValueError("审核版生成期间数据变化，请重新生成审核版")
+    if not report.get("spreadsheet_token"):
+        raise ValueError("财务审核版缺少电子表格地址")
+    status = await _get_status(summary["period"]) or {}
+    fields = status.get("fields") or {}
+    result = _last_result(fields)
+    result.update({"review_source_hash": source_hash,
+                   "review_report_url": f"https://u1wpma3xuhr.feishu.cn/sheets/{report['spreadsheet_token']}"})
+    await _upsert_status(summary["period"], {"最后结果JSON": json.dumps(result, ensure_ascii=False)})
+    return {**summary, "report_url": f"https://u1wpma3xuhr.feishu.cn/sheets/{report['spreadsheet_token']}",
+            "review_source_hash": source_hash}
+
+
+def _bind_review_hash(card: dict[str, Any], summary: dict[str, Any]) -> None:
+    for element in card.get("elements", []):
+        for button in element.get("actions", []):
+            value = button.get("value", {})
+            if value.get("action") == "ml_profit_finance_operating_confirm" and summary.get("review_source_hash"):
+                value["review_source_hash"] = summary["review_source_hash"]
+
+
 async def card_endpoint(
     kind: str | None = None,
     month: str | None = None,
@@ -1320,7 +1356,10 @@ async def card_endpoint(
     send: bool = False,
     receive_id: str | None = None,
     receive_id_type: str = "chat_id",
+    refresh_message_id: str | None = None,
 ) -> dict[str, Any]:
+    if refresh_message_id and (send or kind != "finance_operating"):
+        raise ValueError("更新原卡仅支持财务经营暂结审核，且不能同时发送新卡")
     p, normalized_month = normalize_period(month, period)
     summary: dict[str, Any] | None = None
     async with _status_mutation_lock(p):
@@ -1397,8 +1436,20 @@ async def card_endpoint(
                 "period": summary["period"],
                 "summary": summary,
             }
+        if refresh_message_id and refresh_message_id != _text(status_fields.get("最后卡片 message_id")):
+            raise ValueError("目标已不是当前审核卡，禁止覆盖旧卡")
+        if kind == "finance_operating" and (send or refresh_message_id):
+            if current_state != "运营已确认":
+                raise ValueError("请先完成运营确认，再生成财务审核卡")
+            summary = await _prepare_finance_review(summary)
         card = build_card(kind, summary, status_fields)
+        _bind_review_hash(card, summary)
         out = {"status": "ok", "kind": kind, "period": summary["period"], "summary": summary, "card": card}
+        if refresh_message_id:
+            if kind != "finance_operating":
+                raise ValueError("当前存在异常，不能更新财务审核卡")
+            out["patch_result"] = await patch_card(refresh_message_id, card)
+            out["message_id"] = refresh_message_id
         if send:
             target = receive_id or (
                 FINANCE_GROUP_ID
@@ -1940,6 +1991,13 @@ async def _confirm_action_impl(
         reason = _text(summary.get("last_error")) or "月结存在未解决异常，确认已拦截。"
         return await _blocked_confirmation(reason)
     approved_report_hash = _text(summary.get("report_hash"))
+    if action == "ml_profit_finance_operating_confirm":
+        reviewed_hash = payload.get("review_source_hash") or (payload.get("value") or {}).get("review_source_hash")
+        published_review = _last_result((await _get_status(period, tok) or {}).get("fields") or {})
+        if (not reviewed_hash or reviewed_hash != approved_report_hash
+                or reviewed_hash != published_review.get("review_source_hash")
+                or not published_review.get("review_report_url")):
+            return await _blocked_confirmation("审核版缺失或数据已变化，请打开更新后的47列审核卡再确认。")
     if action in final_ab_actions and (
         summary.get("ab_verified") is not True or not approved_report_hash
     ):
@@ -1964,6 +2022,7 @@ async def _confirm_action_impl(
         block_reason = ""
         finance_card: dict[str, Any] = {}
         sent: dict[str, Any] = {}
+        review_summary: dict[str, Any] = {}
         async with _status_mutation_lock(period):
             latest = await _get_status(period, tok) or {}
             latest_fields = latest.get("fields") or {}
@@ -1978,6 +2037,8 @@ async def _confirm_action_impl(
                 block_reason = "本月已由财务确认终稿，旧运营卡片不能覆盖终稿状态。"
             if not block_reason and _ACTION_EPOCHS.get(period) != action_epoch:
                 block_reason = "确认期间收到新的月结操作，本次运营确认已拦截。"
+            if not block_reason and not summary.get("ab_verified"):
+                review_summary = await _prepare_finance_review(summary)
             if not block_reason:
                 async with db.ml_close_action_finalization_guard(
                     period, action_key, action_owner
@@ -2013,7 +2074,11 @@ async def _confirm_action_impl(
                                 if live_summary.get("ab_verified")
                                 else "finance_operating"
                             )
+                            if finance_kind == "finance_operating":
+                                live_summary = {**live_summary, "report_url": review_summary["report_url"],
+                                                "review_source_hash": review_summary["review_source_hash"]}
                             finance_card = build_card(finance_kind, live_summary, status.get("fields") or {})
+                            _bind_review_hash(finance_card, live_summary)
                             sent = await send_card(finance_card, FINANCE_GROUP_ID)
                             sent_id = _message_id(sent)
                             if sent_id:

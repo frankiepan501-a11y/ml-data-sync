@@ -102,6 +102,7 @@ def health():
         "ml_month_logistics_sku_cell_normalized_20260908": True,
         "ml_month_manual_logistics_preserve_20260908": True,
         "ml_two_stage_close_20260908": True,
+        "ml_finance_review_47_columns_20260909": True,
     }
 
 
@@ -1345,13 +1346,14 @@ async def ml_close_recalc_cost(month: str | None = None, period: str | None = No
 @app.api_route("/report/ml-close/card", methods=["GET", "POST"], dependencies=[Depends(require_service_token)])
 async def ml_close_card(kind: str | None = None, month: str | None = None, period: str | None = None,
                         send: bool = False, receive_id: str | None = None,
-                        receive_id_type: str = "chat_id"):
+                        receive_id_type: str = "chat_id", refresh_message_id: str | None = None):
     """Build, and optionally send, the next ML monthly close interactive card."""
     import traceback
     from app import ml_close
     try:
         return await ml_close.card_endpoint(kind=kind, month=month, period=period, send=send,
-                                            receive_id=receive_id, receive_id_type=receive_id_type)
+                                            receive_id=receive_id, receive_id_type=receive_id_type,
+                                            refresh_message_id=refresh_message_id)
     except Exception as e:
         return {"status": "error", "exc": type(e).__name__, "msg": str(e), "traceback": traceback.format_exc()[:3000]}
 

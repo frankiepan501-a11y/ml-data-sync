@@ -61,7 +61,7 @@ STORE_ORDER = [
 ]
 
 MARKER_PREFIX = "ML_UNIFIED_REPORT_V1"
-VALID_CLOSE_MODES = {"final", "operating"}
+VALID_CLOSE_MODES = {"final", "operating", "review"}
 COMMISSION_TOLERANCE_RMB = 0.05
 PROFIT_TOLERANCE_RMB = 0.02
 
@@ -301,10 +301,12 @@ def _period_parts(period: str) -> tuple[str, str]:
 def _report_identity(period: str, close_mode: str) -> str:
     if close_mode not in VALID_CLOSE_MODES:
         raise ValueError(f"invalid close_mode: {close_mode}")
-    return period if close_mode == "final" else f"{period}::operating"
+    return period if close_mode == "final" else f"{period}::{close_mode}"
 
 
 def _report_title(month: str, close_mode: str) -> str:
+    if close_mode == "review":
+        return f"美客多毛利报表-{month}-财务审核版"
     return (
         f"美客多毛利报表-{month}"
         if close_mode == "final"
@@ -460,8 +462,10 @@ def prepare_report(
         ["数据期间", month, f"生产表周期 {period}", "", ""],
         [
             "报表性质",
-            "经营暂结" if close_mode == "operating" else "最终核销",
+            "财务审核版（未放行）" if close_mode == "review" else ("经营暂结" if close_mode == "operating" else "最终核销"),
             (
+                "仅供财务审核；未确认前不可用于提成和公司管理毛利"
+                if close_mode == "review" else
                 "可用于提成和公司管理毛利；官方账单仍待最终核销"
                 if close_mode == "operating"
                 else "官方账单 A/B 已完成，作为最终核销版本"
