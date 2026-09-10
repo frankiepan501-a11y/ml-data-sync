@@ -4,12 +4,12 @@ import os
 import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
-from app import db, ml_close, unified_report
+from app import db, ml_close, unified_report, company_report_index
 
 
 class OperatingLedgerTests(unittest.IsolatedAsyncioTestCase):
     async def test_operating_confirmation_checks_operating_generation(self):
-        for mode, complete, expected in [('operating', True, 'ok'), ('final', True, 'blocked'), ('operating', False, 'blocked')]:
+        for mode, complete, index_fails, expected in [('operating', True, False, 'ok'), ('final', True, False, 'blocked'), ('operating', False, False, 'blocked'), ('operating', True, True, 'blocked')]:
             with self.subTest(mode=mode, complete=complete), tempfile.TemporaryDirectory() as directory:
                 current = {'record_id': 'r', 'fields': {'状态': '运营已确认', '最后卡片 message_id': 'card', '最后结果JSON': json.dumps({'review_source_hash': 'v3', 'review_report_url': 'https://example.test/review'})}}
                 summary = {'period': 'month_2026-08', 'month': '2026-08', 'status': 'ok', 'state': '运营已确认', 'next_card': 'finance_operating', 'report_hash': 'v3', 'operating_ready': True, 'ab_verified': False}
@@ -24,6 +24,7 @@ class OperatingLedgerTests(unittest.IsolatedAsyncioTestCase):
                 with patch.object(db, 'DB_PATH', os.path.join(directory, 'test.db')):
                     await db.init_db()
                     with (
+                        patch.object(company_report_index, 'publish', AsyncMock(return_value={'verified': True}, side_effect=RuntimeError('index write failed') if index_fails else None)),
                         patch.object(ml_close, '_tenant_token', AsyncMock(return_value='test')),
                         patch.object(ml_close, '_get_status', AsyncMock(return_value=current)),
                         patch.object(ml_close, '_upsert_status', writer),

@@ -951,6 +951,10 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
                 generator.assert_not_awaited()
 
     def setUp(self):
+        from app import company_report_index
+        index_patcher = patch.object(company_report_index, "publish", AsyncMock(return_value={"verified": True}))
+        self.index_publish = index_patcher.start()
+        self.addCleanup(index_patcher.stop)
         self.clean_summary = {
             "status": "ok",
             "period": "month_2026-08",

@@ -106,6 +106,7 @@ def health():
         "ml_review_system_fee_rows_20260909": True,
         "ml_finance_revision_v3_20260910": True,
         "ml_operating_generation_guard_20260910": True,
+        "ml_company_report_index_20260910": True,
     }
 
 

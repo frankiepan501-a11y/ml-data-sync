@@ -140,6 +140,19 @@ async def _fs_json(
     return j
 
 
+async def _complete_finance_with_index(period, fields, tok, close_mode):
+    from app import company_report_index
+    receipt = await company_report_index.publish(period, fields["报表链接"], close_mode, tok, _fs_json)
+    result = json.loads(fields["最后结果JSON"])
+    result["company_index"] = receipt
+    fields = {**fields, "最后结果JSON": json.dumps(result, ensure_ascii=False)}
+    try:
+        return await _upsert_status(period, fields, tok)
+    except Exception:
+        await company_report_index.rollback(receipt, tok, _fs_json)
+        raise
+
+
 def _text(v: Any) -> str:
     if v is None:
         return ""
@@ -2219,7 +2232,7 @@ async def _confirm_action_impl(
                                 "final_reconciliation_due_on": due_on,
                                 "final_reconciliation_status": "待官方账单核销",
                             })
-                            await _upsert_status(
+                            await _complete_finance_with_index(
                                 period,
                                 {
                                     "状态": "财务已确认暂结",
@@ -2234,7 +2247,7 @@ async def _confirm_action_impl(
                                     "最后按钮动作时间": now_ms,
                                     "最后结果JSON": json.dumps(latest_result, ensure_ascii=False),
                                 },
-                                tok,
+                                tok, "operating",
                             )
                 except Exception as exc:
                     block_reason = f"经营暂结终态保护失败：{type(exc).__name__}"
@@ -2411,7 +2424,7 @@ async def _confirm_action_impl(
                                     "final_closed_at": now_ms,
                                     "final_closed_by": actor,
                                 })
-                                await _upsert_status(
+                                await _complete_finance_with_index(
                                     period,
                                     {
                                         "状态": "财务已确认终稿",
@@ -2424,7 +2437,7 @@ async def _confirm_action_impl(
                                         "最后按钮动作时间": now_ms,
                                         "最后结果JSON": json.dumps(final_result, ensure_ascii=False),
                                     },
-                                    tok,
+                                    tok, "final",
                                 )
                     except Exception as e:
                         block_reason = f"月报终态保护失败：{type(e).__name__}"
