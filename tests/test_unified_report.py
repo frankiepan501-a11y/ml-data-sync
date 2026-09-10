@@ -287,7 +287,36 @@ class WorkbookBuildTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("游戏手柄", row[6])
         self.assertEqual({"type": "formula", "text": "=ROUND(L2*Y2,2)"}, row[25])
         self.assertEqual({"type": "formula", "text": "=IFERROR(AL2/Z2,0)"}, row[45])
-        self.assertEqual(49, len(prepared["source_values"][0]))
+        self.assertEqual(52, len(prepared["source_values"][0]))
+
+    def test_revision_adjustments_and_exact_rmb_are_preserved(self):
+        source = _source_row()
+        source['fields'].update({'财务修订版本': unified_report.FINANCE_REVISION_VERSION, '调整(原币)': 5, '调整(RMB)': 2, '全额毛利(RMB)': 234})
+        prepared = unified_report.prepare_report('month_2026-08', [source], [_record(**{
+            'ERP SKU': 'FF01A-01', 'ERP品名': 'Test product', '产品类型': '游戏手柄',
+        })], [], close_mode='review')
+        row = prepared['main_values'][1]
+        self.assertEqual(47, len(row))
+        self.assertIn('数据源', row[17]['text'])
+        self.assertIn('数据源', row[31]['text'])
+        self.assertIn('数据源', row[27]['text'])
+        self.assertEqual('通过', prepared['summary']['profit_check'])
+
+    def test_unbound_adjustment_is_rejected(self):
+        with self.assertRaises(unified_report.ReportGenerationError):
+            unified_report.revision_cost_rounding_delta({'调整(RMB)': 1})
+
+    def test_revision_cost_rounding_preserves_source_cost(self):
+        fields = {'财务修订版本': unified_report.FINANCE_REVISION_VERSION, '周期': 'month_2026-08', '我的汇率': 7.12,
+                  '采购成本(RMB)': 0, '头程成本(RMB)': 1425.38, '海外仓成本(RMB)': 0}
+        before = dict(fields)
+        # 1425.38 / 7.12 -> 200.19; 200.19 * 7.12 -> 1425.35.
+        self.assertAlmostEqual(0.03, unified_report.revision_cost_rounding_delta(fields))
+        self.assertEqual(before, fields)
+
+    def test_revision_cannot_leak_into_other_months(self):
+        with self.assertRaises(unified_report.ReportGenerationError):
+            unified_report.revision_cost_rounding_delta({'财务修订版本': unified_report.FINANCE_REVISION_VERSION, '周期': 'month_2026-07'})
 
     def test_operating_close_report_is_clearly_labelled(self):
         prepared = unified_report.prepare_report(

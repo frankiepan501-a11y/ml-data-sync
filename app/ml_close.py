@@ -22,6 +22,7 @@ import anyio
 import httpx
 
 from app import db, meitong_cost
+from app.unified_report import revision_cost_rounding_delta
 
 FEISHU = "https://open.feishu.cn/open-apis"
 APP_TOKEN = os.getenv("FEISHU_BASE_APP_TOKEN", "WM3LbBr76aRqMys2of8c1dGInEb")
@@ -694,6 +695,7 @@ async def audit(
         )
         calculated_profit = (
             rev
+            + _num(f.get("调整(RMB)"))
             - cg
             - _num(f.get("ML佣金(RMB)"))
             - ad_fee
@@ -704,6 +706,7 @@ async def audit(
             - head
             - ovs
         )
+        calculated_profit += revision_cost_rounding_delta(f)
         profit_max_abs_delta = max(
             profit_max_abs_delta,
             abs(_num(f.get("全额毛利(RMB)")) - calculated_profit),

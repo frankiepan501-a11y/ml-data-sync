@@ -6,6 +6,8 @@
 
 ## 项目背景
 
+财务修正版/确认卡修复必读：[生产公式与修正版绑定规则](docs/repairs/2026-09-10-finance-revision-formula.md)。不能只修改Excel附件而让确认卡重新生成旧Base数据。
+
 详见 `~/.claude/projects/C--Users-Administrator/memory/project_ml_direct_sync.md`。
 
 - 启动：2026-05-09

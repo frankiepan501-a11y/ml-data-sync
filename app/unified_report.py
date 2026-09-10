@@ -15,6 +15,7 @@ import re
 import unicodedata
 import uuid
 import weakref
+from decimal import Decimal, ROUND_HALF_UP
 from collections import defaultdict
 from typing import Any
 from urllib.parse import quote
@@ -52,6 +53,7 @@ SOURCE_HEADERS = [
     "数据拉取时间", "VAT估算(RMB)", "广告直接销售(原币)", "CPC(原币)", "广告费(RMB)", "广告归因件数",
     "卖家折扣(RMB)", "广告点击", "平台", "币种", "退款率", "ML ROAS", "简易毛利(RMB)", "VAT估算(原币)",
     "物流费(原币)", "退款金额(RMB)", "自然销售(RMB)", "头程成本(RMB)", "最后销售日",
+    "财务修订版本", "调整(原币)", "调整(RMB)",
 ]
 
 STORE_ORDER = [
@@ -64,6 +66,7 @@ MARKER_PREFIX = "ML_UNIFIED_REPORT_V1"
 VALID_CLOSE_MODES = {"final", "operating", "review"}
 COMMISSION_TOLERANCE_RMB = 0.05
 PROFIT_TOLERANCE_RMB = 0.02
+FINANCE_REVISION_VERSION = "2026-08-V3-766e720b5f74"
 
 _GENERATION_LOCKS_BY_LOOP: weakref.WeakKeyDictionary[
     asyncio.AbstractEventLoop, dict[str, asyncio.Lock]
@@ -314,6 +317,25 @@ def _report_title(month: str, close_mode: str) -> str:
     )
 
 
+def revision_cost_rounding_delta(fields: dict[str, Any]) -> float:
+    """Match July's two-step cost conversion without changing stored costs."""
+    if not _text(fields.get("财务修订版本")):
+        if _number(fields.get("调整(原币)")) or _number(fields.get("调整(RMB)")):
+            raise ReportGenerationError("调整金额缺少财务修订版本，禁止生成确认报表")
+        return 0.0
+    if (_text(fields.get("财务修订版本")) != FINANCE_REVISION_VERSION
+            or _text(fields.get("周期")) != "month_2026-08"):
+        raise ReportGenerationError("财务修订版本与授权月份不匹配，禁止生成确认报表")
+    fx = Decimal(str(_number(fields.get("我的汇率"))))
+    if fx <= 0:
+        raise ReportGenerationError("财务修订行缺少有效汇率")
+    procurement = Decimal(str(_number(fields.get("采购成本(RMB)"))))
+    freight = Decimal(str(_number(fields.get("头程成本(RMB)")))) + Decimal(str(_number(fields.get("海外仓成本(RMB)"))))
+    def displayed(cost: Decimal) -> Decimal:
+        return ((cost / fx).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP) * fx).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    return float(procurement + freight - displayed(procurement) - displayed(freight))
+
+
 def prepare_report(
     period: str,
     report_records: list[dict[str, Any]],
@@ -420,6 +442,16 @@ def prepare_report(
         row[44] = _formula(f'=IFERROR(AK{index}/Z{index},0)')
         row[45] = _formula(f'=IFERROR(AL{index}/Z{index},0)')
         row[46] = _formula(f'=IFERROR(AI{index}/Z{index},0)')
+        if _text(fields.get("财务修订版本")):
+            row[17] = _formula(f'={ref("调整(原币)")}')
+            row[31] = _formula(f'={ref("调整(RMB)")}')
+            for column, field, sign in (
+                (25, "营收(RMB)", ""), (26, "退款金额(RMB)", "-"),
+                (27, "ML佣金(RMB)", "-"), (28, "物流费(RMB)", "-"),
+                (29, "Full仓储费(RMB)", "-"), (30, "广告费(RMB)", "-"),
+                (33, "VAT估算(RMB)", "-"),
+            ):
+                row[column] = _formula(f'={sign}{ref(field)}')
         main_values.append(row)
 
     def sum_field(name: str) -> float:
@@ -435,6 +467,8 @@ def prepare_report(
         ))
         calculated_profit = (
             _number(fields.get("营收(RMB)"))
+            + revision_cost_rounding_delta(fields)
+            + _number(fields.get("调整(RMB)"))
             - _number(fields.get("采购成本(RMB)"))
             - _number(fields.get("ML佣金(RMB)"))
             - _number(fields.get("广告费(RMB)"))
