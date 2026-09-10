@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, patch
 import openpyxl
 from fastapi import HTTPException
 
-from app import cbt_ingest, main
+from app import cbt_ingest, main, ml_close
 
 
 class _Response:
@@ -234,11 +234,15 @@ class CbtIngestPeriodSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("2026-07", result["msg"])
 
     async def test_endpoint_turns_validation_error_into_non_2xx_failure(self):
-        with patch.object(cbt_ingest, "run", AsyncMock(return_value={"status": "error", "msg": "wrong month"})):
+        with (
+            patch.object(cbt_ingest, "run", AsyncMock(return_value={"status": "error", "msg": "wrong month"})),
+            patch.object(ml_close, "invalidate_ab_verification", AsyncMock()) as invalidate,
+        ):
             with self.assertRaises(HTTPException) as raised:
                 await main.cbt_ingest(month="2026-08", commit=True)
 
         self.assertEqual(raised.exception.status_code, 422)
+        invalidate.assert_awaited_once_with("month_2026-08", "cbt_ingest")
         self.assertIn("wrong month", str(raised.exception.detail))
 
     async def test_commit_archives_entire_old_scope_and_preserves_stale_skus(self):

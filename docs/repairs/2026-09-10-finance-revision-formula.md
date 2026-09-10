@@ -44,3 +44,5 @@
 `tests/test_operating_close_ledger.py` 使用真实SQLite和确认handler验证：暂结完成可放行、只有终稿完成不得冒充暂结、暂结未完成仍拦截。旧测试模拟守卫恒为True，无法发现身份错配，新增测试不得替换真实守卫。
 
 失败恢复只允许使用可验证的原始人员点击记录，检查原卡仍为当前卡、人员及源版本一致，再经修复后的原确认接口重试。禁止伪造同事点击或直接写ready字段。已生成且内容相同的报表应被复用。
+
+测试安全：旧 test_endpoint_turns_validation_error_into_non_2xx_failure 漏隔离 invalidate_ab_verification，加载真实凭据后会误撤销月结状态。已补模拟并校验调用；统一用 scripts/run_tests_offline.py 禁止真实HTTP，显式优先本worktree模块。161测试在禁止外部HTTP条件下通过。不要禁止全部socket.connect：Windows asyncio自身需要本地socketpair。
