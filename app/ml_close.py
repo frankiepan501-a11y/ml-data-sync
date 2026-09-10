@@ -2190,6 +2190,7 @@ async def _confirm_action_impl(
                         action_key,
                         action_owner,
                         _text(report.get("content_hash")),
+                        required_report_identity=unified_report._report_identity(period, "operating"),
                     ) as generation_ready:
                         if not generation_ready:
                             block_reason = "经营暂结报表生成被新的退回或重算操作中断。"

@@ -21,6 +21,7 @@ async def _ready_action_guard(
     owner,
     required_report_hash=None,
     complete_on_success=True,
+    required_report_identity=None,
 ):
     yield True
     if complete_on_success:

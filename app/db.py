@@ -445,6 +445,7 @@ async def ml_close_action_finalization_guard(
     owner: str,
     required_report_hash: str | None = None,
     complete_on_success: bool = True,
+    required_report_identity: str | None = None,
 ):
     """Let only the latest distinct monthly action publish its final state.
 
@@ -485,7 +486,7 @@ async def ml_close_action_finalization_guard(
                 FROM ml_unified_report_generation
                 WHERE period = ?
                 """,
-                (period,),
+                (required_report_identity or period,),
             )
             report_row = await cur.fetchone()
             ready = bool(
