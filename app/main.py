@@ -41,6 +41,10 @@ def require_service_token(authorization: str | None = Header(default=None)) -> N
         raise HTTPException(401, "invalid service token")
 
 
+from app.final_review_api import router as final_review_router
+app.include_router(final_review_router(require_service_token))
+
+
 def _feishu_cell_text(value) -> str:
     """Normalize Feishu text/formula cells to a stable comparison string."""
     if isinstance(value, list):
