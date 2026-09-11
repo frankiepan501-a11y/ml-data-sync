@@ -43,6 +43,8 @@ def require_service_token(authorization: str | None = Header(default=None)) -> N
 
 from app.final_review_api import router as final_review_router
 app.include_router(final_review_router(require_service_token))
+from app.billing_upload_api import install as install_billing_upload
+install_billing_upload(app, require_service_token)
 
 
 def _feishu_cell_text(value) -> str:

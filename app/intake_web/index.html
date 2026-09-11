@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>美客多账单提交 · 仅测试</title>
+<style>body{font:16px/1.6 system-ui,sans-serif;max-width:950px;margin:24px auto;padding:0 18px;color:#243247;background:#f6f8fc}section{background:white;padding:22px;border-radius:12px;margin:18px 0;border:1px solid #dbe3ef}h1{font-size:25px}h2{font-size:19px}label{display:block;margin:12px 0}select,input,button{font:inherit;max-width:100%;padding:9px}button{background:#235dde;color:white;border:0;border-radius:6px;cursor:pointer;margin:6px 8px 6px 0}button:disabled{opacity:.5}small{color:#54647a}.warning{background:#fff2d5;padding:12px;border-radius:8px}li{margin-bottom:14px;overflow-wrap:anywhere}#message{white-space:pre-wrap}strong{color:#9b4413}</style>
+</head><body><h1>美客多官方账单提交</h1><p class="warning">2026年8月 · 独立测试<br>上传不代表核销通过，不会改变真实报表、工资或提成。请勿转发此链接。</p>
+<section><h2>1. 选择店铺并上传原件</h2><p>按平台实际账期上传，无需自定义日期。每份文件上限20MB；本批最多30份、200MB。链接24小时有效，关闭页面后请从原卡重新打开。</p>
+<form id="form"><label>店铺 <select id="seller"><option value="1502236229">CBT-FULL</option><option value="2378517428">巴西本土</option><option value="3383185411">MX3 DISTRIBUIDOR VALMIGOZ</option></select></label>
+<label>文件用途 <select id="kind"><option value="charges">费用明细</option><option value="period">官方账期/单据清单</option><option value="support">补充证明（发票、贷项、Full或零费用证明）</option></select></label>
+<label>测试材料来源 <select id="source" required><option value="">请选择</option><option value="historical_official">历史官方原件</option><option value="synthetic">构造测试样本</option><option value="unverified">待核实</option></select></label><small>来源由提交人声明，不代表已核实官方真实性。测试材料不进入正式核销。</small>
+<label>官方文件 <input id="file" type="file" accept=".xlsx,.pdf,.png,.jpg,.jpeg" required></label><button id="send" type="submit">上传并查看回执</button></form><p id="message" role="status" aria-live="polite"></p></section>
+<section><h2>2. 已收文件</h2><p>“已保存”仅表示原件已收。读取失败请先核对原因，不用反复上传同一份。</p><button id="refresh" type="button">刷新检查结果</button><ul id="files"></ul></section>
+<section><h2>3. 三店缺件与待核实事项</h2><div id="checks"></div><p><strong>最终核销尚未通过。</strong>CBT模板适配及官方账期、单据完整性仍须后续核实。</p></section><script src="portal.js"></script></body></html>
