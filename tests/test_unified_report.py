@@ -523,12 +523,23 @@ class WorkbookBuildTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("UnformattedValue", reader.await_args_list[3].args[3])
         column_growth = [
             call for call in api.await_args_list
-            if call.args[1].endswith("/insert_dimension_range")
+            if call.args[1].endswith("/dimension_range")
             and call.args[3]["dimension"]["majorDimension"] == "COLUMNS"
         ]
         self.assertEqual(1, len(column_growth))
-        self.assertEqual(49, column_growth[0].args[3]["dimension"]["startIndex"])
-        self.assertEqual(52, column_growth[0].args[3]["dimension"]["endIndex"])
+        self.assertEqual(
+            {
+                "dimension": {
+                    "sheetId": "source",
+                    "majorDimension": "COLUMNS",
+                    "length": 3,
+                }
+            },
+            column_growth[0].args[3],
+        )
+        self.assertFalse(
+            any(call.args[1].endswith("/insert_dimension_range") for call in api.await_args_list)
+        )
 
     def test_calculated_anchor_cells_must_be_native_numbers(self):
         for column, cell in ((11, "L2"), (20, "U2"), (25, "Z2"), (34, "AI2")):

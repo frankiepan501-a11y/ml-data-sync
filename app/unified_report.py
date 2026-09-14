@@ -932,16 +932,14 @@ async def _ensure_columns(
         return current
     await _api_json(
         "POST",
-        f"{FEISHU}/sheets/v2/spreadsheets/{spreadsheet_token}/insert_dimension_range",
+        f"{FEISHU}/sheets/v2/spreadsheets/{spreadsheet_token}/dimension_range",
         token,
         {
             "dimension": {
                 "sheetId": sheet["sheetId"],
                 "majorDimension": "COLUMNS",
-                "startIndex": current,
-                "endIndex": needed_columns,
+                "length": needed_columns - current,
             },
-            "inheritStyle": "BEFORE",
         },
     )
     return needed_columns

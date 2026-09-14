@@ -114,6 +114,7 @@ def health():
         "ml_operating_generation_guard_20260910": True,
         "ml_company_report_index_20260910": True,
         "ml_feishu_numeric_readback_v4_20260914": True,
+        "ml_feishu_column_append_v4_20260914": True,
     }
 
 
