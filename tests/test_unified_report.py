@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import tempfile
@@ -92,7 +93,7 @@ class FinanceReviewTests(unittest.IsolatedAsyncioTestCase):
         final = unified_report.prepare_report(*args, close_mode="final")
         self.assertEqual(final["main_values"], review["main_values"])
         self.assertEqual(47, len(review["main_values"][0]))
-        self.assertEqual("month_2026-08::review", review["summary"]["report_identity"])
+        self.assertEqual("month_2026-08::review::V4", review["summary"]["report_identity"])
         self.assertIn("财务审核版", review["summary"]["report_title"])
         self.assertIn("未放行", str(review["check_values"]))
 
@@ -131,6 +132,75 @@ def _source_row(sku="FF01A-01", period="month_2026-08"):
             "全额毛利(RMB)": 232,
         },
     )
+
+
+def _calculated_main_values(
+    *, revenue_original=1000, payment_original=805, revenue_rmb=400, payment_rmb=322
+):
+    row = [None] * len(unified_report.REPORT_HEADERS)
+    for column, value in {
+        9: 2,
+        11: revenue_original,
+        12: -10,
+        13: -100,
+        14: -50,
+        15: -10,
+        16: -20,
+        17: 0,
+        18: 0,
+        19: -5,
+        20: payment_original,
+        21: -200,
+        22: -50,
+        23: 555,
+        24: 0.4,
+        25: revenue_rmb,
+        26: -4,
+        27: -40,
+        28: -20,
+        29: -4,
+        30: -8,
+        31: 0,
+        32: 0,
+        33: -2,
+        34: payment_rmb,
+        35: -80,
+        36: -20,
+        37: 222,
+        38: 0.01,
+        39: -0.1,
+        40: -0.05,
+        41: -0.01,
+        42: -0.02,
+        43: -0.2,
+        44: -0.05,
+        45: 0.555,
+        46: 0.805,
+    }.items():
+        row[column] = value
+    return [list(unified_report.REPORT_HEADERS), row]
+
+
+def _legacy_approval_hash(records):
+    normalized = [
+        {
+            "record_id": str(row.get("record_id") or ""),
+            "fields": row.get("fields") or {},
+        }
+        for row in records
+    ]
+    normalized.sort(key=lambda row: row["record_id"])
+    if not normalized:
+        return ""
+    return hashlib.sha256(
+        json.dumps(
+            normalized,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 class ProductMappingTests(unittest.TestCase):
@@ -269,6 +339,70 @@ class ProductSourceCredentialTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WorkbookBuildTests(unittest.IsolatedAsyncioTestCase):
+    def test_july_approval_hash_keeps_legacy_records_only_algorithm(self):
+        rows = [_source_row(period="month_2026-07")]
+
+        self.assertEqual(_legacy_approval_hash(rows), unified_report.approval_source_hash(rows))
+        self.assertEqual(
+            _legacy_approval_hash(rows),
+            unified_report.source_report_hash(rows, "month_2026-07"),
+        )
+        self.assertEqual(_legacy_approval_hash(rows), ml_close._report_content_hash(rows))
+
+    def test_august_approval_hash_changes_with_report_revision(self):
+        rows = [_source_row(period="month_2026-08")]
+        with patch.object(unified_report, "REPORT_FORMAT_REVISION", "V3"):
+            v3_hash = unified_report.approval_source_hash(rows)
+        with patch.object(unified_report, "REPORT_FORMAT_REVISION", "V4"):
+            v4_hash = unified_report.approval_source_hash(rows)
+
+        self.assertNotEqual(_legacy_approval_hash(rows), v4_hash)
+        self.assertNotEqual(v3_hash, v4_hash)
+        self.assertEqual(v4_hash, unified_report.source_report_hash(rows, "month_2026-08"))
+
+    def test_approval_hash_fails_closed_for_missing_or_mixed_periods(self):
+        self.assertEqual("", unified_report.approval_source_hash([]))
+        missing = [_source_row()]
+        missing[0]["fields"].pop("周期")
+        with self.assertRaises(unified_report.ReportGenerationError):
+            unified_report.approval_source_hash(missing)
+        with self.assertRaises(unified_report.ReportGenerationError):
+            unified_report.approval_source_hash(
+                [
+                    _source_row(period="month_2026-07"),
+                    _source_row(sku="FF01A-02", period="month_2026-08"),
+                ]
+            )
+
+    def test_string_revenue_is_numeric_and_payment_formulas_cannot_drop_it(self):
+        source = _source_row()
+        source["fields"]["营收(原币)"] = "1000"
+        source["fields"]["营收(RMB)"] = "400"
+        prepared = unified_report.prepare_report(
+            "month_2026-08",
+            [source],
+            [_record(**{
+                "ERP SKU": "FF01A-01",
+                "ERP品名": "YS11 Pro 手柄-涂鸦",
+                "产品类型": "游戏手柄",
+            })],
+            [],
+        )
+
+        source_row = dict(zip(prepared["source_values"][0], prepared["source_values"][1]))
+        self.assertEqual(1000.0, source_row["营收(原币)"])
+        self.assertIsInstance(source_row["营收(原币)"], float)
+        self.assertEqual(400.0, source_row["营收(RMB)"])
+        self.assertIsInstance(source_row["营收(RMB)"], float)
+        self.assertEqual(
+            {"type": "formula", "text": "=ROUND(L2+SUM(M2:T2),2)"},
+            prepared["main_values"][1][20],
+        )
+        self.assertEqual(
+            {"type": "formula", "text": "=ROUND(Z2+SUM(AA2:AH2),2)"},
+            prepared["main_values"][1][34],
+        )
+
     def test_builds_approved_47_columns_and_erp_display_fields(self):
         prepared = unified_report.prepare_report(
             "month_2026-08",
@@ -333,14 +467,193 @@ class WorkbookBuildTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual("operating", prepared["summary"]["close_mode"])
-        self.assertEqual("month_2026-08::operating", prepared["summary"]["report_identity"])
-        self.assertEqual("美客多毛利报表-2026-08-经营暂结", prepared["summary"]["report_title"])
+        self.assertEqual("month_2026-08::operating::V4", prepared["summary"]["report_identity"])
+        self.assertEqual("美客多毛利报表-2026-08-经营暂结-V4", prepared["summary"]["report_title"])
         self.assertIn(
             ["报表性质", "经营暂结", "可用于提成和公司管理毛利；官方账单仍待最终核销", "", ""],
             prepared["check_values"],
         )
         self.assertEqual(1, prepared["summary"]["report_rows"])
         self.assertEqual(1, prepared["summary"]["unique_skus"])
+
+    async def test_write_uses_all_52_source_columns_and_reads_calculated_values(self):
+        prepared = unified_report.prepare_report(
+            "month_2026-08",
+            [_source_row()],
+            [_record(**{
+                "ERP SKU": "FF01A-01",
+                "ERP品名": "YS11 Pro 手柄-涂鸦",
+                "产品类型": "游戏手柄",
+            })],
+            [],
+        )
+        checks = [list(row) for row in prepared["check_values"]]
+        checks[0][4] = "ML_UNIFIED_REPORT_V1|IN_PROGRESS|month_2026-08::V4"
+        content_hash = unified_report.report_content_hash(prepared)
+        marker = f"ML_UNIFIED_REPORT_V1|COMPLETE|month_2026-08::V4|{content_hash}"
+        report = {
+            "spreadsheet_token": "sheet-token",
+            "sheets": [
+                {"sheetId": "main", "title": "美客多毛利报表-2026-08-V4", "rowCount": 200, "columnCount": 47},
+                {"sheetId": "source", "title": "数据源", "rowCount": 200, "columnCount": 49},
+                {"sheetId": "checks", "title": "检查", "rowCount": 200, "columnCount": 20},
+            ],
+        }
+        writer = AsyncMock()
+        api = AsyncMock(return_value={"data": {}})
+        reader = AsyncMock(side_effect=[
+            prepared["main_values"],
+            prepared["source_values"],
+            checks,
+            _calculated_main_values(),
+            [[marker]],
+        ])
+        with (
+            patch.object(unified_report, "_write_range", writer),
+            patch.object(unified_report, "_style_report", AsyncMock()),
+            patch.object(unified_report, "_read_range", reader),
+            patch.object(unified_report, "_api_json", api),
+        ):
+            result = await unified_report._write_report("token", report, prepared)
+
+        self.assertEqual(marker, result["marker"])
+        self.assertEqual("source!A1:AZ200", writer.await_args_list[0].args[2])
+        self.assertTrue(all(len(row) == 52 for row in writer.await_args_list[0].args[3]))
+        self.assertEqual("source!A1:AZ2", reader.await_args_list[1].args[2])
+        self.assertEqual("UnformattedValue", reader.await_args_list[3].args[3])
+        column_growth = [
+            call for call in api.await_args_list
+            if call.args[1].endswith("/insert_dimension_range")
+            and call.args[3]["dimension"]["majorDimension"] == "COLUMNS"
+        ]
+        self.assertEqual(1, len(column_growth))
+        self.assertEqual(49, column_growth[0].args[3]["dimension"]["startIndex"])
+        self.assertEqual(52, column_growth[0].args[3]["dimension"]["endIndex"])
+
+    def test_calculated_anchor_cells_must_be_native_numbers(self):
+        for column, cell in ((11, "L2"), (20, "U2"), (25, "Z2"), (34, "AI2")):
+            calculated = _calculated_main_values()
+            calculated[1][column] = str(calculated[1][column])
+            with self.subTest(cell=cell):
+                with self.assertRaises(unified_report.ReportGenerationError) as caught:
+                    unified_report.validate_report_calculated_readback(calculated, 2)
+                self.assertIn(cell, str(caught.exception))
+
+    def test_every_numeric_formula_cell_must_be_a_finite_native_number(self):
+        for column, cell in ((9, "J2"), (13, "N2"), (23, "X2"), (37, "AL2"), (46, "AU2")):
+            for invalid in ("123", float("nan"), float("inf")):
+                calculated = _calculated_main_values()
+                calculated[1][column] = invalid
+                with self.subTest(cell=cell, invalid=invalid):
+                    with self.assertRaises(unified_report.ReportGenerationError) as caught:
+                        unified_report.validate_report_calculated_readback(calculated, 2)
+                    self.assertIn(cell, str(caught.exception))
+
+    def test_calculated_payment_identity_uses_two_cent_tolerance(self):
+        unified_report.validate_report_calculated_readback(
+            _calculated_main_values(payment_original=805.019, payment_rmb=322.019),
+            2,
+        )
+
+    async def test_calculated_payment_identity_mismatch_blocks_complete_marker(self):
+        prepared = unified_report.prepare_report(
+            "month_2026-08",
+            [_source_row()],
+            [_record(**{
+                "ERP SKU": "FF01A-01",
+                "ERP品名": "YS11 Pro 手柄-涂鸦",
+                "产品类型": "游戏手柄",
+            })],
+            [],
+        )
+        checks = [list(row) for row in prepared["check_values"]]
+        checks[0][4] = "ML_UNIFIED_REPORT_V1|IN_PROGRESS|month_2026-08::V4"
+        report = {
+            "spreadsheet_token": "sheet-token",
+            "sheets": [
+                {"sheetId": "main", "title": "美客多毛利报表-2026-08-V4", "rowCount": 200, "columnCount": 47},
+                {"sheetId": "source", "title": "数据源", "rowCount": 200, "columnCount": 52},
+                {"sheetId": "checks", "title": "检查", "rowCount": 200, "columnCount": 20},
+            ],
+        }
+        writer = AsyncMock()
+        reader = AsyncMock(side_effect=[
+            prepared["main_values"],
+            prepared["source_values"],
+            checks,
+            _calculated_main_values(payment_original=-195, payment_rmb=-78),
+        ])
+        with (
+            patch.object(unified_report, "_write_range", writer),
+            patch.object(unified_report, "_style_report", AsyncMock()),
+            patch.object(unified_report, "_read_range", reader),
+        ):
+            with self.assertRaises(unified_report.ReportGenerationError) as caught:
+                await unified_report._write_report("token", report, prepared)
+
+        self.assertIn("恒等式", str(caught.exception))
+        complete_writes = [
+            call for call in writer.await_args_list
+            if call.args[2].endswith("!E1:E1") and "|COMPLETE|" in str(call.args[3])
+        ]
+        self.assertEqual([], complete_writes)
+
+    def test_source_readback_compares_all_52_columns(self):
+        prepared = unified_report.prepare_report(
+            "month_2026-08",
+            [_source_row()],
+            [_record(**{
+                "ERP SKU": "FF01A-01",
+                "ERP品名": "YS11 Pro 手柄-涂鸦",
+                "产品类型": "游戏手柄",
+            })],
+            [],
+        )
+        source_read = [list(row) for row in prepared["source_values"]]
+        source_read[1][-1] = 999
+        checks = [list(row) for row in prepared["check_values"]]
+        checks[0][4] = "ML_UNIFIED_REPORT_V1|IN_PROGRESS|month_2026-08::V4"
+
+        with self.assertRaises(unified_report.ReportGenerationError) as caught:
+            unified_report.validate_report_readback(
+                prepared["main_values"],
+                prepared["main_values"],
+                source_read,
+                prepared["source_values"],
+                checks,
+                checks,
+            )
+
+        self.assertIn("数据源第 2 行", str(caught.exception))
+
+    def test_source_numeric_readback_rejects_numeric_looking_text(self):
+        prepared = unified_report.prepare_report(
+            "month_2026-08",
+            [_source_row()],
+            [_record(**{
+                "ERP SKU": "FF01A-01",
+                "ERP品名": "YS11 Pro 手柄-涂鸦",
+                "产品类型": "游戏手柄",
+            })],
+            [],
+        )
+        source_read = [list(row) for row in prepared["source_values"]]
+        revenue_column = source_read[0].index("营收(原币)")
+        source_read[1][revenue_column] = str(source_read[1][revenue_column])
+        checks = [list(row) for row in prepared["check_values"]]
+        checks[0][4] = "ML_UNIFIED_REPORT_V1|IN_PROGRESS|month_2026-08::V4"
+
+        with self.assertRaises(unified_report.ReportGenerationError) as caught:
+            unified_report.validate_report_readback(
+                prepared["main_values"],
+                prepared["main_values"],
+                source_read,
+                prepared["source_values"],
+                checks,
+                checks,
+            )
+
+        self.assertIn("数据源第 2 行", str(caught.exception))
 
     def test_formula_readback_mismatch_blocks_completion(self):
         prepared = unified_report.prepare_report(
@@ -357,7 +670,7 @@ class WorkbookBuildTests(unittest.IsolatedAsyncioTestCase):
         main_read[1][25] = "not-a-formula"
 
         checks = [list(row) for row in prepared["check_values"]]
-        checks[0][4] = "ML_UNIFIED_REPORT_V1|IN_PROGRESS|month_2026-08"
+        checks[0][4] = "ML_UNIFIED_REPORT_V1|IN_PROGRESS|month_2026-08::V4"
         with self.assertRaises(unified_report.ReportGenerationError) as caught:
             unified_report.validate_report_readback(
                 main_read,
@@ -384,7 +697,7 @@ class WorkbookBuildTests(unittest.IsolatedAsyncioTestCase):
         main_read = [list(row) for row in prepared["main_values"]]
         main_read[1][5] = "错误品名"
         checks = [list(row) for row in prepared["check_values"]]
-        checks[0][4] = "ML_UNIFIED_REPORT_V1|IN_PROGRESS|month_2026-08"
+        checks[0][4] = "ML_UNIFIED_REPORT_V1|IN_PROGRESS|month_2026-08::V4"
 
         with self.assertRaises(unified_report.ReportGenerationError) as caught:
             unified_report.validate_report_readback(
@@ -412,13 +725,13 @@ class WorkbookBuildTests(unittest.IsolatedAsyncioTestCase):
         bad_main = [list(row) for row in prepared["main_values"]]
         bad_main[1][25] = "not-a-formula"
         checks = [list(row) for row in prepared["check_values"]]
-        checks[0][4] = "ML_UNIFIED_REPORT_V1|IN_PROGRESS|month_2026-08"
+        checks[0][4] = "ML_UNIFIED_REPORT_V1|IN_PROGRESS|month_2026-08::V4"
         report = {
             "spreadsheet_token": "sheet-token",
             "sheets": [
-                {"sheetId": "main", "title": "美客多毛利报表-2026-08", "rowCount": 200},
-                {"sheetId": "source", "title": "数据源", "rowCount": 200},
-                {"sheetId": "checks", "title": "检查", "rowCount": 200},
+                {"sheetId": "main", "title": "美客多毛利报表-2026-08-V4", "rowCount": 200, "columnCount": 47},
+                {"sheetId": "source", "title": "数据源", "rowCount": 200, "columnCount": 52},
+                {"sheetId": "checks", "title": "检查", "rowCount": 200, "columnCount": 20},
             ],
         }
         writer = AsyncMock()
@@ -475,7 +788,7 @@ class ReportGenerationAsyncTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual("operating", result["close_mode"])
-        self.assertEqual("month_2026-08::operating", claim.await_args.args[0])
+        self.assertEqual("month_2026-08::operating::V4", claim.await_args.args[0])
 
     async def test_expected_source_hash_mismatch_stops_before_report_write(self):
         sources = (
@@ -1084,7 +1397,7 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
                 "状态": "财务已确认暂结",
                 "最后卡片 message_id": "om-current",
                 "最后结果JSON": json.dumps({
-                    "report_hash": "current-v2",
+                    "report_hash": "frozen-v1",
                     "operating_close_confirmed": True,
                     "operating_report_hash": "frozen-v1",
                     "operating_report_url": "https://example.test/wiki/frozen",
@@ -1096,6 +1409,7 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(ml_close, "_tenant_token", AsyncMock(return_value="token")),
             patch.object(ml_close, "_get_status", AsyncMock(return_value=frozen)),
+            patch.object(ml_close, "_current_report_hash", AsyncMock(return_value="frozen-v1")),
             patch.object(ml_close, "patch_or_fallback", AsyncMock(return_value={})),
             patch("app.unified_report.generate", generator),
         ):

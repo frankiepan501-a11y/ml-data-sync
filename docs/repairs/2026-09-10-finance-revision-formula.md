@@ -43,7 +43,9 @@
 
 财务按钮的 `review_source_hash` 必须从飞书 `card_action` 原样传入确认接口。事件中心的 `ML Profit Payload` 使用字段白名单，新增按钮字段时必须同步并以真实回调本地执行该JavaScript，断言版本与操作人、原卡ID均保留；不得只测服务端合成payload。
 
-经营暂结生成记录使用 `month_YYYY-MM::operating`，终稿使用 `month_YYYY-MM`。最终写状态的守卫必须查询生成器同一身份；月度动作顺序仍使用原月份，不能为修复目录不一致而放松最新动作、owner、完成状态或内容hash检查。
+V3 经营暂结生成记录使用 `month_YYYY-MM::operating`，终稿使用 `month_YYYY-MM`。2026-09-14 起的新 V4 在身份末尾增加 `::V4`，例如经营暂结为 `month_YYYY-MM::operating::V4`、终稿为 `month_YYYY-MM::V4`；Wiki 标题和完成标记也必须带 V4。最终写状态的守卫必须查询生成器同一身份；月度动作顺序仍使用原月份，不能为修复目录不一致而放松最新动作、owner、完成状态或内容hash检查。
+
+在线飞书表必须把财务数值字段写成真正数字，不能只凭“显示像数字”判断类型。生成器完成前要用 `UnformattedValue` 回读全部公式列，并逐行验证 `回款=销售额+费用` 和 `回款RMB=售价RMB+费用RMB`；详细规则见 `docs/repairs/2026-09-14-feishu-numeric-readback.md`。离线 Excel 正确不能替代在线回读。
 
 `tests/test_operating_close_ledger.py` 使用真实SQLite和确认handler验证：暂结完成可放行、只有终稿完成不得冒充暂结、暂结未完成仍拦截。旧测试模拟守卫恒为True，无法发现身份错配，新增测试不得替换真实守卫。
 

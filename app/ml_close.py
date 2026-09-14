@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import datetime as _dt
-import hashlib
 import json
 import os
 import time
@@ -22,7 +21,7 @@ import anyio
 import httpx
 
 from app import db, meitong_cost
-from app.unified_report import revision_cost_rounding_delta
+from app.unified_report import approval_source_hash, revision_cost_rounding_delta
 
 FEISHU = "https://open.feishu.cn/open-apis"
 APP_TOKEN = os.getenv("FEISHU_BASE_APP_TOKEN", "WM3LbBr76aRqMys2of8c1dGInEb")
@@ -213,22 +212,51 @@ def _last_result(fields: dict[str, Any]) -> dict[str, Any]:
 
 def _report_content_hash(rows: list[dict[str, Any]]) -> str:
     """Bind an A/B approval to the exact Base record version it reviewed."""
-    normalized = [
-        {
-            "record_id": _text(row.get("record_id")),
-            "fields": row.get("fields") or {},
-        }
-        for row in rows
-    ]
-    normalized.sort(key=lambda row: row["record_id"])
-    encoded = json.dumps(
-        normalized,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest() if normalized else ""
+    return approval_source_hash(rows)
+
+
+def _operating_snapshot_is_current(
+    result: dict[str, Any], current_report_hash: str
+) -> bool:
+    return bool(
+        result.get("operating_close_confirmed")
+        and current_report_hash
+        and _text(result.get("operating_report_hash")) == current_report_hash
+    )
+
+
+def _confirmed_state_for_current_report(
+    prior_state: str,
+    prior_result: dict[str, Any],
+    current_report_hash: str,
+) -> str:
+    if prior_state not in ("运营已确认", "财务已确认暂结", "财务已确认终稿"):
+        return prior_state
+    if not current_report_hash or _text(prior_result.get("report_hash")) != current_report_hash:
+        return ""
+    if (
+        prior_state == "财务已确认暂结"
+        and not _operating_snapshot_is_current(prior_result, current_report_hash)
+    ):
+        return ""
+    return prior_state
+
+
+def _final_state_blocks_action(
+    prior_state: str,
+    prior_result: dict[str, Any],
+    current_report_hash: str,
+) -> bool:
+    if prior_state != "财务已确认终稿":
+        return False
+    if not current_report_hash or not _text(prior_result.get("report_hash")):
+        return True
+    return (
+        _confirmed_state_for_current_report(
+            prior_state, prior_result, current_report_hash
+        )
+        == "财务已确认终稿"
+    )
 
 
 def _failed_ad_shops(fields: dict[str, Any]) -> list[str]:
@@ -401,6 +429,16 @@ async def _list_records(tok: str, table_id: str, field_names: list[str] | None =
     return out
 
 
+async def _current_report_hash(period: str, tok: str) -> str:
+    records = await _list_records(tok, REPORT_TABLE_ID)
+    rows = [
+        row
+        for row in records
+        if _text((row.get("fields") or {}).get("周期")) == period
+    ]
+    return _report_content_hash(rows)
+
+
 async def _status_table(tok: str) -> str:
     if STATUS_TABLE_ID_ENV:
         return STATUS_TABLE_ID_ENV
@@ -515,6 +553,13 @@ async def _commit_audit_snapshot(
     latest_fields = latest.get("fields", {}) if latest else {}
     latest_state = _text(latest_fields.get("状态"))
     latest_result = _last_result(latest_fields)
+    current_report_hash = _text(result.get("report_hash"))
+    latest_state = _confirmed_state_for_current_report(
+        latest_state, latest_result, current_report_hash
+    )
+    current_operating_snapshot = _operating_snapshot_is_current(
+        latest_result, current_report_hash
+    )
     latest_marker_error = ""
     try:
         latest_failed_ad_shops = await _open_ad_failures(period, latest_fields)
@@ -533,7 +578,7 @@ async def _commit_audit_snapshot(
         latest_state,
         last_error,
         bool(result.get("ab_verified")),
-        bool(latest_result.get("operating_close_confirmed")),
+        current_operating_snapshot,
     )
     result.update(
         {
@@ -576,21 +621,28 @@ async def _commit_audit_snapshot(
         ),
     }
     for key in (
-        "review_source_hash",
-        "review_report_url",
-        "operating_close_confirmed",
-        "operating_report_hash",
-        "operating_content_hash",
-        "operating_report_url",
-        "operating_report_sheet_url",
-        "operating_closed_at",
-        "operating_closed_by",
         "final_reconciliation_due_on",
         "final_reconciliation_status",
         "provisional_items",
     ):
         if key in latest_result:
             status_result[key] = latest_result[key]
+    if _text(latest_result.get("review_source_hash")) == current_report_hash:
+        for key in ("review_source_hash", "review_report_url"):
+            if key in latest_result:
+                status_result[key] = latest_result[key]
+    if current_operating_snapshot:
+        for key in (
+            "operating_close_confirmed",
+            "operating_report_hash",
+            "operating_content_hash",
+            "operating_report_url",
+            "operating_report_sheet_url",
+            "operating_closed_at",
+            "operating_closed_by",
+        ):
+            if key in latest_result:
+                status_result[key] = latest_result[key]
     status_result["final_reconciliation_due_on"] = (
         _text(status_result.get("final_reconciliation_due_on"))
         or _text(result.get("final_reconciliation_due_on"))
@@ -650,6 +702,12 @@ async def audit(
     rows = [r for r in records if _text(r.get("fields", {}).get("周期")) == period]
     report_hash = _report_content_hash(rows)
     effective_ab_verified = _resolve_ab_verified(prior_fields, ab_verified, report_hash)
+    effective_prior_state = _confirmed_state_for_current_report(
+        prior_state, prior_result, report_hash
+    )
+    operating_snapshot_current = _operating_snapshot_is_current(
+        prior_result, report_hash
+    )
 
     cost_error = ""
     if cost_summary is None and run_cost_preview:
@@ -756,10 +814,10 @@ async def audit(
     state, next_card = _close_state(
         bool(rows),
         bool(purchase_gaps or freight_gaps),
-        prior_state,
+        effective_prior_state,
         last_error,
         effective_ab_verified,
-        bool(prior_result.get("operating_close_confirmed")),
+        operating_snapshot_current,
     )
 
     result = {
@@ -808,9 +866,18 @@ async def audit(
         "ab_verified": effective_ab_verified,
         "report_hash": report_hash,
         "operating_ready": bool(rows) and not bool(purchase_gaps or freight_gaps) and not bool(last_error),
-        "operating_close_confirmed": bool(prior_result.get("operating_close_confirmed")),
-        "operating_report_hash": _text(prior_result.get("operating_report_hash")),
-        "operating_report_url": _text(prior_result.get("operating_report_url")),
+        "operating_close_confirmed": operating_snapshot_current,
+        "operating_snapshot_current": operating_snapshot_current,
+        "operating_report_hash": (
+            _text(prior_result.get("operating_report_hash"))
+            if operating_snapshot_current
+            else ""
+        ),
+        "operating_report_url": (
+            _text(prior_result.get("operating_report_url"))
+            if operating_snapshot_current
+            else ""
+        ),
         "final_reconciliation_due_on": (
             _text(prior_result.get("final_reconciliation_due_on"))
             or _final_reconciliation_due(month)[0]
@@ -1403,8 +1470,6 @@ async def card_endpoint(
             }
         elif kind in ("none", "skip"):
             return {"status": "skipped", "reason": "no_next_card", "kind": kind, "period": p}
-        elif kind is None and early_state in ("运营已确认", "财务已确认终稿"):
-            return {"status": "skipped", "reason": "already_confirmed", "state": early_state, "period": p}
 
     if summary is None:
         summary = await audit(month=month, period=period, commit=False, run_cost_preview=(kind != "instruction"))
@@ -1494,20 +1559,37 @@ async def status_endpoint(month: str | None = None, period: str | None = None) -
     except Exception as e:
         failed_ad_shops = _failed_ad_shops(fields)
         marker_error = f"广告失败状态读取失败：{type(e).__name__}"
-    state = "异常" if failed_ad_shops or marker_error else (_text(fields.get("状态")) if fields else "待数据同步")
+    report_hash_error = ""
     result = _last_result(fields)
-    report_hash = _text(result.get("report_hash"))
-    ab_verified = _resolve_ab_verified(fields, None, report_hash)
-    operating_close_confirmed = bool(result.get("operating_close_confirmed"))
-    operating_report_hash = _text(result.get("operating_report_hash"))
-    operating_snapshot_current = bool(
-        operating_report_hash and report_hash and operating_report_hash == report_hash
+    if failed_ad_shops or marker_error:
+        report_hash = ""
+    else:
+        try:
+            tok = await _tenant_token()
+            report_hash = await _current_report_hash(period, tok)
+        except Exception as e:
+            report_hash = ""
+            report_hash_error = f"当前报表版本读取失败：{type(e).__name__}"
+    raw_state = _text(fields.get("状态")) if fields else ""
+    effective_state = _confirmed_state_for_current_report(
+        raw_state, result, report_hash
     )
+    if failed_ad_shops or marker_error or report_hash_error:
+        state = "异常"
+    elif raw_state in ("运营已确认", "财务已确认暂结", "财务已确认终稿") and not effective_state:
+        state = "待运营确认"
+    else:
+        state = effective_state or raw_state or "待数据同步"
+    ab_verified = _resolve_ab_verified(fields, None, report_hash)
+    operating_report_hash = _text(result.get("operating_report_hash"))
+    operating_snapshot_current = _operating_snapshot_is_current(result, report_hash)
+    operating_close_confirmed = operating_snapshot_current
     operating_ready = (
         operating_close_confirmed
         and operating_snapshot_current
         and not failed_ad_shops
         and not marker_error
+        and not report_hash_error
     )
     return {
         "status": "ok",
@@ -1533,6 +1615,7 @@ async def status_endpoint(month: str | None = None, period: str | None = None) -
         "report_hash": report_hash,
         "failed_ad_shops": failed_ad_shops,
         "marker_error": marker_error,
+        "report_hash_error": report_hash_error,
         "record": status,
     }
 
@@ -1686,33 +1769,51 @@ async def _confirm_action_impl(
             action == "ml_profit_finance_operating_confirm"
             and pre_result.get("operating_close_confirmed")
         ):
-            report_url = _text(pre_result.get("operating_report_url"))
-            sheet_url = _text(pre_result.get("operating_report_sheet_url"))
-            processed = build_processed_card(
-                month,
-                "财务已确认暂结",
-                actor,
-                "经营暂结报表已经冻结；重复操作不会覆盖原快照。",
-                report_url=report_url,
-            )
-            feedback = await patch_or_fallback(message_id, processed, chat_id) if patch else {}
-            return {
-                "status": "ok",
-                "action": action,
-                "period": period,
-                "state": "财务已确认暂结",
-                "deduped": True,
-                "report": {"url": report_url, "sheet_url": sheet_url},
-                "processed_card": processed,
-                "feedback": feedback,
-            }
+            try:
+                current_report_hash = await _current_report_hash(period, tok)
+            except Exception as exc:
+                return await _blocked_confirmation(
+                    f"经营暂结版本预检失败：{type(exc).__name__}"
+                )
+            if _operating_snapshot_is_current(pre_result, current_report_hash):
+                report_url = _text(pre_result.get("operating_report_url"))
+                sheet_url = _text(pre_result.get("operating_report_sheet_url"))
+                processed = build_processed_card(
+                    month,
+                    "财务已确认暂结",
+                    actor,
+                    "经营暂结报表已经冻结；重复操作不会覆盖原快照。",
+                    report_url=report_url,
+                )
+                feedback = await patch_or_fallback(message_id, processed, chat_id) if patch else {}
+                return {
+                    "status": "ok",
+                    "action": action,
+                    "period": period,
+                    "state": "财务已确认暂结",
+                    "deduped": True,
+                    "report": {"url": report_url, "sheet_url": sheet_url},
+                    "processed_card": processed,
+                    "feedback": feedback,
+                }
         if (
             pre_state == "财务已确认终稿"
             and action != "ml_profit_finance_confirm"
         ):
-            return await _blocked_confirmation(
-                "本月已由财务确认终稿，旧卡片不能再修改终稿状态。"
-            )
+            current_report_hash = ""
+            if _text(pre_result.get("report_hash")):
+                try:
+                    current_report_hash = await _current_report_hash(period, tok)
+                except Exception as exc:
+                    return await _blocked_confirmation(
+                        f"终稿版本预检失败：{type(exc).__name__}"
+                    )
+            if _final_state_blocks_action(
+                pre_state, pre_result, current_report_hash
+            ):
+                return await _blocked_confirmation(
+                    "本月已由财务确认终稿，旧卡片不能再修改终稿状态。"
+                )
         if action in confirmation_actions:
             try:
                 pre_failed = await _open_ad_failures(period, pre_fields)
@@ -1830,12 +1931,23 @@ async def _confirm_action_impl(
                 discard_claim=True,
             )
         try:
-            await db.cancel_unified_report_generation(
-                period, f"close action requested: {action}"
+            from app import unified_report
+
+            generation_keys = {
+                unified_report._report_identity(period, mode)
+                for mode in ("final", "operating", "review")
+            }
+            generation_keys.update(
+                {
+                    period,
+                    f"{period}::operating",
+                    f"{period}::review",
+                }
             )
-            await db.cancel_unified_report_generation(
-                f"{period}::operating", f"close action requested: {action}"
-            )
+            for generation_key in sorted(generation_keys):
+                await db.cancel_unified_report_generation(
+                    generation_key, f"close action requested: {action}"
+                )
         except Exception as exc:
             return await _blocked_confirmation(
                 f"月报生成取消失败：{type(exc).__name__}"
@@ -2049,7 +2161,12 @@ async def _confirm_action_impl(
                 block_reason = f"广告失败状态读取失败：{type(e).__name__}"
             if latest_failed:
                 block_reason = _ad_failure_message(latest_failed)
-            if not block_reason and _text(latest_fields.get("状态")) == "财务已确认终稿":
+            latest_state = _text(latest_fields.get("状态"))
+            if not block_reason and _final_state_blocks_action(
+                latest_state,
+                _last_result(latest_fields),
+                approved_report_hash,
+            ):
                 block_reason = "本月已由财务确认终稿，旧运营卡片不能覆盖终稿状态。"
             if not block_reason and _ACTION_EPOCHS.get(period) != action_epoch:
                 block_reason = "确认期间收到新的月结操作，本次运营确认已拦截。"
@@ -2064,7 +2181,12 @@ async def _confirm_action_impl(
                     else:
                         guard_status = await _get_status(period, tok) or {}
                         guard_fields = guard_status.get("fields") or {}
-                        if _text(guard_fields.get("状态")) == "财务已确认终稿":
+                        guard_state = _text(guard_fields.get("状态"))
+                        if _final_state_blocks_action(
+                            guard_state,
+                            _last_result(guard_fields),
+                            approved_report_hash,
+                        ):
                             block_reason = "本月已由财务确认终稿，旧运营卡片不能覆盖终稿状态。"
                         if not block_reason:
                             live_summary = await audit(
@@ -2403,6 +2525,9 @@ async def _confirm_action_impl(
                             action_key,
                             action_owner,
                             _text(report.get("content_hash")),
+                            required_report_identity=unified_report._report_identity(
+                                period, "final"
+                            ),
                         ) as generation_ready:
                             if not generation_ready:
                                 block_reason = "月报生成被新的退回/失败操作中断，终稿写入已拦截。"

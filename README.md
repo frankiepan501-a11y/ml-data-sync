@@ -154,6 +154,13 @@ CBT-FULL 仍以官方导出 3 文件为准；本土店和巴西店走 ML API/cac
 - 只读预演：`POST /report/ml-unified-monthly?period=month_YYYY-MM&commit=false`。已财务确认月份可用 `commit=true` 幂等回放；未确认月份禁止直接提交。
 - 2026-07 真实数据只读回归：57 行、44 个唯一 SKU、3 店，ERP 映射缺口/冲突/空值均为 0；佣金换算最大舍入差 `0.034328 RMB`，毛利重算最大差 `0`。
 
+### 2026-09-14 飞书在线数值类型与 V4 报表
+
+- 根因：Base 返回的销售额字段是数字外观的字符串；飞书 `SUM` 忽略文本，而离线 Excel 会自动转成数字，造成线上回款只剩负费用、本地验收却看似正常。
+- 修复：所有财务数值字段在写入时转换为真正数字；回款公式显式写为“销售额 + 费用合计”；数据源写入/回读扩为完整 52 列；写完成标记前回读线上全部公式的实际数值并验证关键恒等式。
+- 版本隔离：新报表使用 V4 独立标题、生成键、完成标记和审批哈希。V3 保留为历史证据，V4 必须重新经过运营和财务本人确认，公司汇总只在新财务确认成功后更新。
+- 详细修复与验收边界见 `docs/repairs/2026-09-14-feishu-numeric-readback.md`。
+
 ## 部署
 
 Zeabur 生产项目 `n8n-aments` 下 service `ml-sync`，详见 [zeabur-deploy-workflow](../../.claude/projects/C--Users-Administrator/memory/zeabur-deploy-workflow.md)。

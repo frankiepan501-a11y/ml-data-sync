@@ -1230,7 +1230,11 @@ class MonthlyCloseAdvertisingFailureTests(unittest.IsolatedAsyncioTestCase):
             },
         }
 
-        with patch.object(ml_close, "_get_status", AsyncMock(return_value=confirmed)):
+        with (
+            patch.object(ml_close, "_get_status", AsyncMock(return_value=confirmed)),
+            patch.object(ml_close, "_tenant_token", AsyncMock(return_value="token")),
+            patch.object(ml_close, "_current_report_hash", AsyncMock(return_value="v1")),
+        ):
             result = await ml_close.status_endpoint(period="month_2026-08")
 
         self.assertTrue(result["ready_for_finance"])

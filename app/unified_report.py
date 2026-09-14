@@ -10,12 +10,13 @@ import datetime as dt
 import asyncio
 import hashlib
 import json
+import math
 import os
 import re
 import unicodedata
 import uuid
 import weakref
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from collections import defaultdict
 from typing import Any
 from urllib.parse import quote
@@ -55,6 +56,19 @@ SOURCE_HEADERS = [
     "物流费(原币)", "退款金额(RMB)", "自然销售(RMB)", "头程成本(RMB)", "最后销售日",
     "财务修订版本", "调整(原币)", "调整(RMB)",
 ]
+SOURCE_COLUMN_COUNT = len(SOURCE_HEADERS) + 1  # 数据源字段 + record_id
+
+_TEXT_SOURCE_FIELDS = {
+    "SKU", "商品标题", "首次销售日", "父记录", "店铺", "周期", "数据拉取时间",
+    "平台", "币种", "最后销售日", "财务修订版本",
+}
+_NUMERIC_SOURCE_FIELDS = set(SOURCE_HEADERS) - _TEXT_SOURCE_FIELDS
+
+# J is the calculated sales quantity; every cell from L through AU is a
+# numeric amount, exchange rate, cost, profit or ratio.  The UnformattedValue
+# readback must return native numbers for this entire calculated surface, not
+# numeric-looking text that spreadsheet formulas may silently ignore.
+_NUMERIC_REPORT_READBACK_COLUMNS = frozenset({9, *range(11, 47)})
 
 STORE_ORDER = [
     "ML 巴西本土店 AIRSOFT COMERCIAL",
@@ -63,6 +77,8 @@ STORE_ORDER = [
 ]
 
 MARKER_PREFIX = "ML_UNIFIED_REPORT_V1"
+REPORT_FORMAT_REVISION = "V4"
+APPROVAL_HASH_REVISION_START_PERIOD = "month_2026-08"
 VALID_CLOSE_MODES = {"final", "operating", "review"}
 COMMISSION_TOLERANCE_RMB = 0.05
 PROFIT_TOLERANCE_RMB = 0.02
@@ -272,6 +288,21 @@ def _sheet_scalar(value: Any) -> Any:
     return _text(value)
 
 
+def _source_sheet_value(field: str, value: Any) -> Any:
+    scalar = _sheet_scalar(value)
+    if field not in _NUMERIC_SOURCE_FIELDS or scalar is None or scalar == "":
+        return scalar
+    if isinstance(scalar, bool):
+        raise ReportGenerationError(f"数据源数值字段无效：{field}")
+    try:
+        number = float(str(scalar).replace(",", ""))
+    except (TypeError, ValueError):
+        raise ReportGenerationError(f"数据源数值字段无效：{field}") from None
+    if not math.isfinite(number):
+        raise ReportGenerationError(f"数据源数值字段无效：{field}")
+    return number
+
+
 def _sheet_cell_matches(actual: Any, expected: Any) -> bool:
     if expected is None or expected == "":
         return _text(actual) == ""
@@ -304,17 +335,20 @@ def _period_parts(period: str) -> tuple[str, str]:
 def _report_identity(period: str, close_mode: str) -> str:
     if close_mode not in VALID_CLOSE_MODES:
         raise ValueError(f"invalid close_mode: {close_mode}")
-    return period if close_mode == "final" else f"{period}::{close_mode}"
+    base = period if close_mode == "final" else f"{period}::{close_mode}"
+    return f"{base}::{REPORT_FORMAT_REVISION}"
 
 
 def _report_title(month: str, close_mode: str) -> str:
     if close_mode == "review":
-        return f"美客多毛利报表-{month}-财务审核版"
-    return (
-        f"美客多毛利报表-{month}"
-        if close_mode == "final"
-        else f"美客多毛利报表-{month}-经营暂结"
-    )
+        base = f"美客多毛利报表-{month}-财务审核版"
+    else:
+        base = (
+            f"美客多毛利报表-{month}"
+            if close_mode == "final"
+            else f"美客多毛利报表-{month}-经营暂结"
+        )
+    return f"{base}-{REPORT_FORMAT_REVISION}"
 
 
 def revision_cost_rounding_delta(fields: dict[str, Any]) -> float:
@@ -379,7 +413,8 @@ def prepare_report(
     for record in rows:
         fields = _record_fields(record)
         source_values.append(
-            [_sheet_scalar(fields.get(name)) for name in SOURCE_HEADERS] + [record.get("record_id") or ""]
+            [_source_sheet_value(name, fields.get(name)) for name in SOURCE_HEADERS]
+            + [record.get("record_id") or ""]
         )
     source_columns = {name: _column_letter(index + 1) for index, name in enumerate(source_headers)}
 
@@ -415,7 +450,7 @@ def prepare_report(
         row[15] = _formula(f'=ROUND(IFERROR(-{ref("Full仓储费(RMB)")}/{ref("我的汇率")},0),2)')
         row[16] = _formula(f'=-{ref("广告费(原币)")}')
         row[19] = _formula(f'=-{ref("VAT估算(原币)")}')
-        row[20] = _formula(f'=ROUND(SUM(L{index}:T{index}),2)')
+        row[20] = _formula(f'=ROUND(L{index}+SUM(M{index}:T{index}),2)')
         row[21] = _formula(f'=ROUND(IFERROR(-{ref("采购成本(RMB)")}/{ref("我的汇率")},0),2)')
         row[22] = _formula(
             f'=ROUND(IFERROR(-({ref("头程成本(RMB)")}+{ref("海外仓成本(RMB)")})/{ref("我的汇率")},0),2)'
@@ -429,7 +464,7 @@ def prepare_report(
         row[29] = _formula(f'=ROUND(P{index}*Y{index},2)')
         row[30] = _formula(f'=ROUND(Q{index}*Y{index},2)')
         row[33] = _formula(f'=ROUND(T{index}*Y{index},2)')
-        row[34] = _formula(f'=ROUND(SUM(Z{index}:AH{index}),2)')
+        row[34] = _formula(f'=ROUND(Z{index}+SUM(AA{index}:AH{index}),2)')
         row[35] = _formula(f'=ROUND(V{index}*Y{index},2)')
         row[36] = _formula(f'=ROUND(W{index}*Y{index},2)')
         row[37] = _formula(f'=ROUND(SUM(AI{index}:AK{index}),2)')
@@ -561,28 +596,59 @@ def report_content_hash(prepared: dict[str, Any]) -> str:
     ).hexdigest()[:16]
 
 
-def source_report_hash(records: list[dict[str, Any]], period: str) -> str:
-    """Hash the exact production Base rows used by the close A/B approval."""
+def approval_source_hash(records: list[dict[str, Any]]) -> str:
+    """Hash exact Base rows under the format rules for their single period."""
+    if not records:
+        return ""
+    periods: set[str] = set()
+    for row in records:
+        raw_period = _text((row.get("fields") or {}).get("周期"))
+        if not raw_period:
+            raise ReportGenerationError("审批源数据缺少周期，禁止生成确认哈希")
+        try:
+            normalized_period, _ = _period_parts(raw_period)
+        except ValueError:
+            raise ReportGenerationError("审批源数据周期无效，禁止生成确认哈希") from None
+        periods.add(normalized_period)
+    if len(periods) != 1:
+        raise ReportGenerationError("审批源数据包含多个周期，禁止生成确认哈希")
+    period = next(iter(periods))
+
     normalized = [
         {
             "record_id": _text(row.get("record_id")),
             "fields": row.get("fields") or {},
         }
         for row in records
-        if _text((row.get("fields") or {}).get("周期")) == period
     ]
     normalized.sort(key=lambda row: row["record_id"])
-    if not normalized:
-        return ""
+    payload: Any = normalized
+    if period >= APPROVAL_HASH_REVISION_START_PERIOD:
+        payload = {
+            "report_format_revision": REPORT_FORMAT_REVISION,
+            "records": normalized,
+        }
     return hashlib.sha256(
         json.dumps(
-            normalized,
+            payload,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
             default=str,
         ).encode("utf-8")
     ).hexdigest()
+
+
+def source_report_hash(records: list[dict[str, Any]], period: str) -> str:
+    """Hash the exact production Base rows used by the close A/B approval."""
+    period, _ = _period_parts(period)
+    return approval_source_hash(
+        [
+            row
+            for row in records
+            if _text((row.get("fields") or {}).get("周期")) == period
+        ]
+    )
 
 
 async def _tenant_token(app_id: str, secret: str) -> str:
@@ -855,12 +921,91 @@ async def _ensure_rows(
     return needed_rows
 
 
+async def _ensure_columns(
+    token: str,
+    spreadsheet_token: str,
+    sheet: dict[str, Any],
+    needed_columns: int,
+) -> int:
+    current = int(sheet.get("columnCount") or sheet.get("column_count") or 0)
+    if current >= needed_columns:
+        return current
+    await _api_json(
+        "POST",
+        f"{FEISHU}/sheets/v2/spreadsheets/{spreadsheet_token}/insert_dimension_range",
+        token,
+        {
+            "dimension": {
+                "sheetId": sheet["sheetId"],
+                "majorDimension": "COLUMNS",
+                "startIndex": current,
+                "endIndex": needed_columns,
+            },
+            "inheritStyle": "BEFORE",
+        },
+    )
+    return needed_columns
+
+
 def _pad_matrix(values: list[list[Any]], rows: int, columns: int) -> list[list[Any]]:
     if len(values) > rows:
         raise ReportGenerationError(f"写入行数 {len(values)} 超过工作表行数 {rows}")
     padded = [list(row[:columns]) + [None] * max(0, columns - len(row)) for row in values]
     padded.extend([[None] * columns for _ in range(rows - len(padded))])
     return padded
+
+
+def _calculated_cell_number(
+    row: list[Any], column: int, row_number: int, *, require_native: bool = False
+) -> Decimal:
+    cell = f"{_column_letter(column + 1)}{row_number}"
+    if column >= len(row):
+        raise ReportGenerationError(f"统一毛利报表计算结果回读失败：{cell} 不是数字")
+    value = row[column]
+    if isinstance(value, bool) or (
+        require_native and not isinstance(value, (int, float))
+    ):
+        raise ReportGenerationError(f"统一毛利报表计算结果回读失败：{cell} 不是数字")
+    text = _text(value).replace(",", "")
+    try:
+        number = Decimal(text)
+    except (InvalidOperation, ValueError):
+        raise ReportGenerationError(f"统一毛利报表计算结果回读失败：{cell} 不是数字") from None
+    if not number.is_finite():
+        raise ReportGenerationError(f"统一毛利报表计算结果回读失败：{cell} 不是数字")
+    return number
+
+
+def validate_report_calculated_readback(
+    actual_rows: list[list[Any]], expected_row_count: int
+) -> None:
+    """Verify every numeric result and the revenue/payment identities."""
+    if len(actual_rows) != expected_row_count or not actual_rows:
+        raise ReportGenerationError("统一毛利报表计算结果回读失败：行数不一致")
+    tolerance = Decimal("0.02")
+    for row_number, row in enumerate(actual_rows[1:], start=2):
+        for column in _NUMERIC_REPORT_READBACK_COLUMNS:
+            _calculated_cell_number(row, column, row_number, require_native=True)
+        revenue_original = _calculated_cell_number(row, 11, row_number, require_native=True)
+        payment_original = _calculated_cell_number(row, 20, row_number, require_native=True)
+        fees_original = sum(
+            (_calculated_cell_number(row, column, row_number) for column in range(12, 20)),
+            Decimal(0),
+        )
+        revenue_rmb = _calculated_cell_number(row, 25, row_number, require_native=True)
+        payment_rmb = _calculated_cell_number(row, 34, row_number, require_native=True)
+        fees_rmb = sum(
+            (_calculated_cell_number(row, column, row_number) for column in range(26, 34)),
+            Decimal(0),
+        )
+        if abs(payment_original - revenue_original - fees_original) > tolerance:
+            raise ReportGenerationError(
+                f"统一毛利报表计算结果回读失败：第 {row_number} 行原币回款恒等式不成立"
+            )
+        if abs(payment_rmb - revenue_rmb - fees_rmb) > tolerance:
+            raise ReportGenerationError(
+                f"统一毛利报表计算结果回读失败：第 {row_number} 行人民币回款恒等式不成立"
+            )
 
 
 async def _style_report(
@@ -880,8 +1025,8 @@ async def _style_report(
         # rejects custom formatter "0.0000" (90204); values retain full precision.
         {"ranges": f"{main_id}!AM2:AU{last_row}", "style": {"formatter": "0.00%"}},
         {"ranges": f"{main_id}!J2:K{last_row}", "style": {"formatter": "0"}},
-        {"ranges": f"{source_id}!A1:AW1", "style": {"bold": True, "fontSize": 10, "hAlign": 1, "vAlign": 1, "foreColor": "#FFFFFF", "backColor": "#0F766E"}},
-        {"ranges": f"{source_id}!A2:AW{last_row}", "style": {"fontSize": 9, "vAlign": 1}},
+        {"ranges": f"{source_id}!A1:{_column_letter(SOURCE_COLUMN_COUNT)}1", "style": {"bold": True, "fontSize": 10, "hAlign": 1, "vAlign": 1, "foreColor": "#FFFFFF", "backColor": "#0F766E"}},
+        {"ranges": f"{source_id}!A2:{_column_letter(SOURCE_COLUMN_COUNT)}{last_row}", "style": {"fontSize": 9, "vAlign": 1}},
         {"ranges": f"{check_id}!A1:C1", "style": {"bold": True, "fontSize": 10, "hAlign": 1, "vAlign": 1, "backColor": "#D9EAF7"}},
         {"ranges": f"{check_id}!A2:C18", "style": {"fontSize": 10, "vAlign": 1}},
         {"ranges": f"{check_id}!B8:B11", "style": {"formatter": "#,##0.00"}},
@@ -918,12 +1063,14 @@ async def _write_report(
     main_rows = await _ensure_rows(token, spreadsheet_token, main, needed)
     source_rows = await _ensure_rows(token, spreadsheet_token, source, needed)
     check_rows = await _ensure_rows(token, spreadsheet_token, checks, needed)
+    await _ensure_columns(token, spreadsheet_token, source, SOURCE_COLUMN_COUNT)
 
     check_values = [list(row) for row in prepared["check_values"]]
     check_values[0][4] = f"{MARKER_PREFIX}|IN_PROGRESS|{report_identity}"
+    source_last_column = _column_letter(SOURCE_COLUMN_COUNT)
     await _write_range(
-        token, spreadsheet_token, f"{source['sheetId']}!A1:AW{source_rows}",
-        _pad_matrix(prepared["source_values"], source_rows, 49),
+        token, spreadsheet_token, f"{source['sheetId']}!A1:{source_last_column}{source_rows}",
+        _pad_matrix(prepared["source_values"], source_rows, SOURCE_COLUMN_COUNT),
     )
     await _write_range(
         token, spreadsheet_token, f"{main['sheetId']}!A1:AU{main_rows}",
@@ -945,7 +1092,7 @@ async def _write_report(
         token, spreadsheet_token, f"{main['sheetId']}!A1:AU{main_last_row}", "Formula"
     )
     source_read = await _read_range(
-        token, spreadsheet_token, f"{source['sheetId']}!A1:AW{source_last_row}", "Formula"
+        token, spreadsheet_token, f"{source['sheetId']}!A1:{source_last_column}{source_last_row}", "Formula"
     )
     checks_read = await _read_range(
         token, spreadsheet_token, f"{checks['sheetId']}!A1:T{check_last_row}", "Formula"
@@ -958,6 +1105,13 @@ async def _write_report(
         checks_read,
         check_values,
     )
+    calculated_main_read = await _read_range(
+        token,
+        spreadsheet_token,
+        f"{main['sheetId']}!A1:AU{main_last_row}",
+        "UnformattedValue",
+    )
+    validate_report_calculated_readback(calculated_main_read, len(prepared["main_values"]))
 
     content_hash = report_content_hash(prepared)
     marker = f"{MARKER_PREFIX}|COMPLETE|{report_identity}|{content_hash}"
@@ -1008,17 +1162,38 @@ def validate_report_readback(
     if (
         len(actual_source_rows) != len(expected_source_rows)
         or not actual_source_rows
-        or actual_source_rows[0][:49] != expected_source_rows[0][:49]
+        or actual_source_rows[0][:SOURCE_COLUMN_COUNT]
+        != expected_source_rows[0][:SOURCE_COLUMN_COUNT]
     ):
         raise ReportGenerationError("统一毛利报表写后回读失败：数据源标题或行数不一致")
     for row_number, (actual, expected) in enumerate(
         zip(actual_source_rows[1:], expected_source_rows[1:]), start=2
     ):
-        if any(
-            column >= len(actual) or not _sheet_cell_matches(actual[column], expected[column])
-            for column in range(49)
-        ):
-            raise ReportGenerationError(f"统一毛利报表写后回读失败：数据源第 {row_number} 行不一致")
+        for column in range(SOURCE_COLUMN_COUNT):
+            if column >= len(actual):
+                raise ReportGenerationError(
+                    f"统一毛利报表写后回读失败：数据源第 {row_number} 行不一致"
+                )
+            expected_cell = expected[column]
+            if (
+                column < len(SOURCE_HEADERS)
+                and SOURCE_HEADERS[column] in _NUMERIC_SOURCE_FIELDS
+                and expected_cell is not None
+                and expected_cell != ""
+            ):
+                actual_cell = actual[column]
+                if (
+                    isinstance(actual_cell, bool)
+                    or not isinstance(actual_cell, (int, float))
+                    or not math.isfinite(float(actual_cell))
+                ):
+                    raise ReportGenerationError(
+                        f"统一毛利报表写后回读失败：数据源第 {row_number} 行不一致"
+                    )
+            if not _sheet_cell_matches(actual[column], expected_cell):
+                raise ReportGenerationError(
+                    f"统一毛利报表写后回读失败：数据源第 {row_number} 行不一致"
+                )
 
     if (
         len(actual_check_rows) != len(expected_check_rows)
