@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as _dt
+import hashlib
 import json
 import os
 import time
@@ -42,6 +43,35 @@ ML_CLOSE_FINANCE_APPROVER_OPEN_ID = os.getenv(
     "ML_CLOSE_FINANCE_APPROVER_OPEN_ID",
     "ou_2ced41d585239cb0e8aebd9b5b7b28f0",
 ).strip()
+
+# Single-use, fail-closed recovery for the 2026-09-14 wrong-operator incident.
+# The fixed identifiers make the endpoint unusable for any other month/card.
+IDENTITY_RECOVERY_INCIDENT_ID = "ml-2026-08-wrong-ops-confirmation-20260914"
+IDENTITY_RECOVERY_PERIOD = "month_2026-08"
+IDENTITY_RECOVERY_WRONG_OPERATOR = "ou_8bdf206fafc9086a3e6f2742bb54ccb3"
+IDENTITY_RECOVERY_WRONG_FINANCE_CARD = "om_x100b654fc0e4a900c4ae6f9e57c710a"
+IDENTITY_RECOVERY_REPORT_HASH = (
+    "cb516d71671754a19c5f4e079335fb43f320b74534c0b4fb62d6f1d2d31669de"
+)
+IDENTITY_RECOVERY_REVIEW_URL = (
+    "https://u1wpma3xuhr.feishu.cn/sheets/J8mbscl7jhdVmdtjLpWc5JxPnZg"
+)
+IDENTITY_RECOVERY_REVIEW_MARKER = (
+    "ML_UNIFIED_REPORT_V1|COMPLETE|month_2026-08::review::V4|6162d4def80e731a"
+)
+IDENTITY_RECOVERY_STATUS_TABLE_ID = "tblISLSNE8HLmNvQ"
+IDENTITY_RECOVERY_STATUS_RECORD_ID = "recvu5dD4d1Myh"
+IDENTITY_RECOVERY_BASE_APP_ID = "cli_a9f6ae86fce8dbd8"
+IDENTITY_RECOVERY_CARD_APP_ID = "cli_a9457898bd78dccc"
+IDENTITY_RECOVERY_APP_TOKEN = "WM3LbBr76aRqMys2of8c1dGInEb"
+IDENTITY_RECOVERY_REPORT_TABLE_ID = "tbl09sRPkX35PDfU"
+IDENTITY_RECOVERY_COMPANY_APP_TOKEN = "P9awbhG9faFstxsO1KZc9b9Qnxb"
+IDENTITY_RECOVERY_COMPANY_TABLE_ID = "tblrProDcHtwD5Vr"
+IDENTITY_RECOVERY_COMPANY_RECORD_ID = "recvuoIDRcdbvh"
+IDENTITY_RECOVERY_COMPANY_MONTH = "2026/08"
+IDENTITY_RECOVERY_COMPANY_V3_URL = (
+    "https://u1wpma3xuhr.feishu.cn/wiki/VINMwgK9yinxMVkc2H1cmsGBnLe"
+)
 
 _STATUS_LOCKS_BY_LOOP: weakref.WeakKeyDictionary[
     asyncio.AbstractEventLoop, dict[str, asyncio.Lock]
@@ -216,6 +246,110 @@ def _last_result(fields: dict[str, Any]) -> dict[str, Any]:
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+def _identity_recovery_card_document(raw_content: Any) -> dict[str, Any]:
+    """Parse the revoked card and reject any remaining interactive control."""
+    content = _text(raw_content)
+    try:
+        document = json.loads(content)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("错误财务卡内容无法结构化核验，未执行恢复") from exc
+    if not isinstance(document, dict):
+        raise ValueError("错误财务卡内容格式异常，未执行恢复")
+
+    interactive_tags = {
+        "button",
+        "form_submit",
+        "input",
+        "select_static",
+        "select_person",
+        "picker_date",
+        "picker_time",
+        "picker_datetime",
+        "overflow",
+    }
+
+    def walk(value: Any) -> bool:
+        if isinstance(value, dict):
+            if _text(value.get("tag")) in interactive_tags:
+                return True
+            if _text(value.get("type")) == "callback":
+                return True
+            behavior = value.get("behaviors") or value.get("behavior")
+            if isinstance(behavior, dict) and _text(behavior.get("type")) == "callback":
+                return True
+            action_value = value.get("value")
+            if isinstance(action_value, dict) and _text(action_value.get("action")):
+                return True
+            return any(walk(child) for child in value.values())
+        if isinstance(value, list):
+            return any(walk(child) for child in value)
+        return False
+
+    if walk(document):
+        raise ValueError("错误财务卡仍含可交互控件，未执行恢复")
+    return document
+
+
+def _identity_recovery_preflight_hash(
+    fields: dict[str, Any],
+    report_hash: str,
+    card_document: dict[str, Any],
+    marker: str,
+    company_month: str,
+    company_link: str,
+    update_payload: dict[str, Any],
+) -> str:
+    canonical = json.dumps(
+        {
+            "incident_id": IDENTITY_RECOVERY_INCIDENT_ID,
+            "period": IDENTITY_RECOVERY_PERIOD,
+            "status_table_id": IDENTITY_RECOVERY_STATUS_TABLE_ID,
+            "status_record_id": IDENTITY_RECOVERY_STATUS_RECORD_ID,
+            "status_fields": fields,
+            "report_hash": report_hash,
+            "wrong_finance_card": IDENTITY_RECOVERY_WRONG_FINANCE_CARD,
+            "wrong_finance_card_document": card_document,
+            "review_marker": marker,
+            "company_record_id": IDENTITY_RECOVERY_COMPANY_RECORD_ID,
+            "company_month": company_month,
+            "company_link": company_link,
+            "planned_update": update_payload,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _identity_recovery_release_flags(
+    fields: dict[str, Any], report_hash: str
+) -> dict[str, bool]:
+    result = _last_result(fields)
+    raw_state = _text(fields.get("状态"))
+    state = (
+        _confirmed_state_for_current_report(raw_state, result, report_hash)
+        or raw_state
+        or "待数据同步"
+    )
+    ab_verified = _resolve_ab_verified(fields, None, report_hash)
+    operating_ready = _operating_snapshot_is_current(result, report_hash)
+    return {
+        "ready_for_finance": operating_ready or state == "财务已确认终稿",
+        "ready_for_management": operating_ready or state == "财务已确认终稿",
+        "ready_for_commission": operating_ready or state == "财务已确认终稿",
+        "ready_for_final_reconciliation": ab_verified
+        and state
+        in (
+            "运营已确认",
+            "财务已确认暂结",
+            "待最终核销",
+            "财务已确认终稿",
+        ),
+    }
 
 
 def _report_content_hash(rows: list[dict[str, Any]]) -> str:
@@ -546,6 +680,28 @@ async def _get_status(period: str, tok: str | None = None) -> dict[str, Any] | N
         if _text(r.get("fields", {}).get("周期")) == period:
             return {"record_id": r["record_id"], "fields": r.get("fields", {}), "table_id": table["table_id"]}
     return None
+
+
+async def _get_identity_recovery_status(tok: str) -> dict[str, Any]:
+    """Read the pinned incident record without schema discovery or mutation."""
+    payload = await _fs_json(
+        "GET",
+        f"{FEISHU}/bitable/v1/apps/{IDENTITY_RECOVERY_APP_TOKEN}/tables/"
+        f"{IDENTITY_RECOVERY_STATUS_TABLE_ID}/records/"
+        f"{IDENTITY_RECOVERY_STATUS_RECORD_ID}",
+        tok,
+    )
+    record = (payload.get("data") or {}).get("record") or {}
+    if record.get("record_id") not in (
+        None,
+        IDENTITY_RECOVERY_STATUS_RECORD_ID,
+    ):
+        raise ValueError("月结状态记录已变化，未执行恢复")
+    return {
+        "record_id": IDENTITY_RECOVERY_STATUS_RECORD_ID,
+        "table_id": IDENTITY_RECOVERY_STATUS_TABLE_ID,
+        "fields": record.get("fields") or {},
+    }
 
 
 async def _commit_audit_snapshot(
@@ -1626,6 +1782,325 @@ async def status_endpoint(month: str | None = None, period: str | None = None) -
         "report_hash_error": report_hash_error,
         "record": status,
     }
+
+
+async def recover_identity_incident(
+    incident_id: str,
+    commit: bool = False,
+    expected_preflight_hash: str | None = None,
+) -> dict[str, Any]:
+    """Undo one known unauthorized ops confirmation under the month lock.
+
+    This incident-specific recovery is intentionally not a general rollback
+    endpoint.  It becomes inert as soon as any expected state, report, card or
+    record identifier changes.
+    """
+    if incident_id != IDENTITY_RECOVERY_INCIDENT_ID:
+        raise ValueError("恢复编号不匹配，未修改月结状态")
+    if (
+        os.getenv("FEISHU_APP_ID", IDENTITY_RECOVERY_BASE_APP_ID)
+        != IDENTITY_RECOVERY_BASE_APP_ID
+        or CARD_APP_ID != IDENTITY_RECOVERY_CARD_APP_ID
+        or APP_TOKEN != IDENTITY_RECOVERY_APP_TOKEN
+        or REPORT_TABLE_ID != IDENTITY_RECOVERY_REPORT_TABLE_ID
+        or (
+            STATUS_TABLE_ID_ENV
+            and STATUS_TABLE_ID_ENV != IDENTITY_RECOVERY_STATUS_TABLE_ID
+        )
+    ):
+        raise ValueError("恢复服务身份或数据源配置不匹配，未执行恢复")
+
+    period = IDENTITY_RECOVERY_PERIOD
+    async with _status_mutation_lock(period):
+        tok = await _tenant_token()
+        status = await _get_identity_recovery_status(tok)
+        if status.get("table_id") != IDENTITY_RECOVERY_STATUS_TABLE_ID:
+            raise ValueError("月结状态表已变化，未执行恢复")
+        if status.get("record_id") != IDENTITY_RECOVERY_STATUS_RECORD_ID:
+            raise ValueError("月结状态记录已变化，未执行恢复")
+
+        fields = status.get("fields") or {}
+        result = _last_result(fields)
+        if _text(fields.get("周期")) != period:
+            raise ValueError("月结状态记录周期已变化，未执行恢复")
+        if _text(fields.get("状态")) != "运营已确认":
+            raise ValueError("月结状态已变化，未执行恢复")
+        if _text(fields.get("运营确认人")) != IDENTITY_RECOVERY_WRONG_OPERATOR:
+            raise ValueError("运营确认人已变化，未执行恢复")
+        if not fields.get("运营确认时间"):
+            raise ValueError("错误运营确认时间缺失，未执行恢复")
+        if (
+            _text(fields.get("最后卡片 message_id"))
+            != IDENTITY_RECOVERY_WRONG_FINANCE_CARD
+        ):
+            raise ValueError("最新卡片已变化，未执行恢复")
+        if _text(fields.get("最后错误")):
+            raise ValueError("月结出现新错误，未执行恢复")
+
+        current_report_hash = await _current_report_hash(period, tok)
+        expected_hash = IDENTITY_RECOVERY_REPORT_HASH
+        if current_report_hash != expected_hash:
+            raise ValueError("当前报表哈希已变化，未执行恢复")
+        for key in ("report_hash", "review_source_hash"):
+            if _text(result.get(key)) != expected_hash:
+                raise ValueError(f"{key} 已变化，未执行恢复")
+        if _text(result.get("review_report_url")) != IDENTITY_RECOVERY_REVIEW_URL:
+            raise ValueError("V4 审核表链接已变化，未执行恢复")
+        if _resolve_ab_verified(fields, None, current_report_hash):
+            raise ValueError("A/B 核销状态已变化，未执行恢复")
+        if result.get("operating_close_confirmed") or _operating_snapshot_is_current(
+            result, current_report_hash
+        ):
+            raise ValueError("经营暂结快照已生成，未执行恢复")
+        for result_key in (
+            "operating_report_hash",
+            "operating_report_url",
+            "operating_report_sheet_url",
+        ):
+            if _text(result.get(result_key)):
+                raise ValueError(f"{result_key} 已有值，未执行恢复")
+        for field_name in (
+            "财务确认人",
+            "财务确认时间",
+            "经营暂结确认人",
+            "经营暂结确认时间",
+            "经营暂结报表链接",
+        ):
+            if fields.get(field_name):
+                raise ValueError(f"{field_name} 已有值，未执行恢复")
+        if await _open_ad_failures(period, fields):
+            raise ValueError("当前存在广告抓取失败，未执行恢复")
+
+        card_tok = await _tenant_token(CARD_APP_ID, CARD_APP_SECRET)
+        card_payload = await _fs_json(
+            "GET",
+            f"{FEISHU}/im/v1/messages/{IDENTITY_RECOVERY_WRONG_FINANCE_CARD}",
+            card_tok,
+        )
+        items = (card_payload.get("data") or {}).get("items") or []
+        if len(items) != 1:
+            raise ValueError("无法唯一读取错误财务卡，未执行恢复")
+        card_item = items[0]
+        card_content = _text((card_item.get("body") or {}).get("content"))
+        if not card_item.get("updated") or card_item.get("deleted"):
+            raise ValueError("错误财务卡未处于已撤销状态，未执行恢复")
+        if (
+            "美客多财务卡已撤销" not in card_content
+            or "放行经营暂结" in card_content
+            or "退回运营复核" in card_content
+            or "ml_profit_finance_operating_confirm" in card_content
+            or "ml_profit_finance_reject" in card_content
+        ):
+            raise ValueError("错误财务卡仍可操作，未执行恢复")
+        card_document = _identity_recovery_card_document(card_content)
+
+        from app import unified_report
+
+        async def verify_unchanged_assets() -> dict[str, str]:
+            spreadsheet_token = IDENTITY_RECOVERY_REVIEW_URL.rsplit("/", 1)[-1]
+            sheets = await unified_report._spreadsheet_meta(tok, spreadsheet_token)
+            check_sheet = unified_report._sheet_by_title(sheets, "检查")
+            marker_rows = await unified_report._read_range(
+                tok,
+                spreadsheet_token,
+                f"{check_sheet['sheetId']}!E1:E1",
+                "FormattedValue",
+            )
+            marker = (
+                _text(marker_rows[0][0])
+                if marker_rows and marker_rows[0]
+                else ""
+            )
+            if marker != IDENTITY_RECOVERY_REVIEW_MARKER:
+                raise ValueError("V4 完成标记已变化，未执行恢复")
+
+            company_payload = await _fs_json(
+                "GET",
+                f"{FEISHU}/bitable/v1/apps/{IDENTITY_RECOVERY_COMPANY_APP_TOKEN}/"
+                f"tables/{IDENTITY_RECOVERY_COMPANY_TABLE_ID}/records/"
+                f"{IDENTITY_RECOVERY_COMPANY_RECORD_ID}",
+                tok,
+            )
+            company_fields = (
+                (company_payload.get("data") or {}).get("record") or {}
+            ).get("fields") or {}
+            if _text(company_fields.get("日期")) != IDENTITY_RECOVERY_COMPANY_MONTH:
+                raise ValueError("公司汇总月份已变化，未执行恢复")
+            company_cell = company_fields.get("美客多毛利报表") or {}
+            company_link = _text(company_cell.get("link"))
+            if company_link != IDENTITY_RECOVERY_COMPANY_V3_URL:
+                raise ValueError("公司汇总中的美客多链接已变化，未执行恢复")
+            return {
+                "review_marker": marker,
+                "company_month": _text(company_fields.get("日期")),
+                "company_summary_link": company_link,
+            }
+
+        assets_before = await verify_unchanged_assets()
+        before_fields = dict(fields)
+        update_payload = {
+            "fields": {
+                "状态": "待运营确认",
+                "运营确认人": "",
+                "运营确认时间": None,
+            }
+        }
+        preflight_hash = _identity_recovery_preflight_hash(
+            before_fields,
+            current_report_hash,
+            card_document,
+            assets_before["review_marker"],
+            assets_before["company_month"],
+            assets_before["company_summary_link"],
+            update_payload,
+        )
+        preflight_release_flags = _identity_recovery_release_flags(
+            before_fields, current_report_hash
+        )
+        if any(preflight_release_flags.values()):
+            raise ValueError("恢复前已存在下游放行标记，未执行恢复")
+        preflight_result = {
+            "status": "preflight_ok",
+            "incident_id": incident_id,
+            "period": period,
+            "commit": False,
+            "record_id": IDENTITY_RECOVERY_STATUS_RECORD_ID,
+            "before": {
+                "状态": fields.get("状态"),
+                "运营确认人": fields.get("运营确认人"),
+                "运营确认时间": fields.get("运营确认时间"),
+            },
+            "planned_update": update_payload,
+            "preflight_hash": preflight_hash,
+            "report_hash": current_report_hash,
+            "review_report_url": IDENTITY_RECOVERY_REVIEW_URL,
+            **assets_before,
+            "release_flags": preflight_release_flags,
+            "release_flags_closed": not any(preflight_release_flags.values()),
+        }
+        if not commit:
+            return preflight_result
+        if not expected_preflight_hash or expected_preflight_hash != preflight_hash:
+            raise ValueError("预演指纹缺失或已变化，未执行恢复")
+        allowed = {"状态", "运营确认人", "运营确认时间"}
+        before_unchanged = {
+            key: value for key, value in before_fields.items() if key not in allowed
+        }
+        after: dict[str, Any] = {}
+        after_fields: dict[str, Any] = {}
+
+        put_outcome = "acknowledged"
+        try:
+            await _fs_json(
+                "PUT",
+                f"{FEISHU}/bitable/v1/apps/{IDENTITY_RECOVERY_APP_TOKEN}/tables/"
+                f"{IDENTITY_RECOVERY_STATUS_TABLE_ID}/records/"
+                f"{IDENTITY_RECOVERY_STATUS_RECORD_ID}",
+                tok,
+                update_payload,
+            )
+        except Exception as put_exc:
+            put_outcome = "unknown"
+            last_read_error = ""
+            observed_before = False
+            for attempt in range(5):
+                try:
+                    candidate = await _get_identity_recovery_status(tok)
+                    candidate_fields = candidate.get("fields") or {}
+                except Exception as read_exc:
+                    last_read_error = f"{type(read_exc).__name__}: {read_exc}"
+                else:
+                    last_read_error = ""
+                    candidate_unchanged = {
+                        key: value
+                        for key, value in candidate_fields.items()
+                        if key not in allowed
+                    }
+                    if (
+                        _text(candidate_fields.get("状态")) == "待运营确认"
+                        and not _text(candidate_fields.get("运营确认人"))
+                        and not candidate_fields.get("运营确认时间")
+                        and candidate_unchanged == before_unchanged
+                    ):
+                        after = candidate
+                        after_fields = candidate_fields
+                        put_outcome = "applied_after_uncertain_response"
+                        break
+                    if candidate_fields == before_fields:
+                        observed_before = True
+                    else:
+                        raise RuntimeError(
+                            "恢复写入结果不确定且状态出现其他变化；禁止重试，请人工核对"
+                        ) from put_exc
+                if attempt < 4:
+                    await asyncio.sleep(0.5)
+            else:
+                if observed_before and not last_read_error:
+                    raise RuntimeError(
+                        "恢复写入未生效；禁止自动重试，请先人工核对状态台"
+                    ) from put_exc
+                raise RuntimeError(
+                    "恢复写入结果不确定；禁止重试，请先人工核对状态台"
+                    + (f"（回读错误：{last_read_error}）" if last_read_error else "")
+                ) from put_exc
+
+        if not after:
+            for attempt in range(5):
+                after = await _get_identity_recovery_status(tok)
+                after_fields = after.get("fields") or {}
+                if (
+                    _text(after_fields.get("状态")) == "待运营确认"
+                    and not _text(after_fields.get("运营确认人"))
+                    and not after_fields.get("运营确认时间")
+                ):
+                    break
+                if attempt < 4:
+                    await asyncio.sleep(0.5)
+            else:
+                raise RuntimeError(
+                    "恢复写入已提交但回读未确认；禁止重试，请先人工核对状态台"
+                )
+
+        after_unchanged = {
+            key: value for key, value in after_fields.items() if key not in allowed
+        }
+        if before_unchanged != after_unchanged:
+            raise RuntimeError(
+                "恢复后发现非授权字段变化；禁止重试，请按证据核查状态台"
+            )
+        if after.get("table_id") != IDENTITY_RECOVERY_STATUS_TABLE_ID or after.get(
+            "record_id"
+        ) != IDENTITY_RECOVERY_STATUS_RECORD_ID:
+            raise RuntimeError("恢复后状态记录身份不一致；禁止重试")
+        after_report_hash = await _current_report_hash(period, tok)
+        if after_report_hash != current_report_hash:
+            raise RuntimeError("恢复期间报表数据发生变化；禁止重试")
+        if await _open_ad_failures(period, after_fields):
+            raise RuntimeError("恢复后出现广告抓取失败；禁止继续流转")
+        assets_after = await verify_unchanged_assets()
+        if assets_after != assets_before:
+            raise RuntimeError("恢复期间 V4 或公司汇总资产发生变化；禁止重试")
+        release_flags = _identity_recovery_release_flags(
+            after_fields, after_report_hash
+        )
+        if any(release_flags.values()):
+            raise RuntimeError("恢复后仍存在下游放行标记；禁止继续流转")
+
+        return {
+            "status": "ok",
+            "incident_id": incident_id,
+            "period": period,
+            "state": "待运营确认",
+            "record_id": IDENTITY_RECOVERY_STATUS_RECORD_ID,
+            "changed_fields": ["状态", "运营确认人", "运营确认时间"],
+            "report_hash": current_report_hash,
+            "review_report_url": IDENTITY_RECOVERY_REVIEW_URL,
+            **assets_after,
+            "preflight_hash": preflight_hash,
+            "put_outcome": put_outcome,
+            "release_flags": release_flags,
+            "release_flags_closed": not any(release_flags.values()),
+        }
 
 
 async def recalc_cost(

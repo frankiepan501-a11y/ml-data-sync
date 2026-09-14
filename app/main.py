@@ -116,6 +116,7 @@ def health():
         "ml_feishu_numeric_readback_v4_20260914": True,
         "ml_feishu_column_append_v4_20260914": True,
         "ml_confirmation_identity_gate_v1_20260914": True,
+        "ml_identity_recovery_guard_v1_20260914": True,
     }
 
 
@@ -1380,6 +1381,38 @@ async def ml_close_status(month: str | None = None, period: str | None = None):
         return await ml_close.status_endpoint(month=month, period=period)
     except Exception as e:
         return {"status": "error", "exc": type(e).__name__, "msg": str(e), "traceback": traceback.format_exc()[:3000]}
+
+
+@app.post(
+    "/report/ml-close/recover-identity-incident",
+    dependencies=[Depends(require_service_token)],
+)
+async def ml_close_recover_identity_incident(
+    incident_id: str,
+    commit: bool = False,
+    expected_preflight_hash: str | None = None,
+):
+    """Conditionally undo the single known 2026-09-14 wrong-operator event."""
+    import traceback
+    from app import ml_close
+
+    try:
+        return await ml_close.recover_identity_incident(
+            incident_id,
+            commit=commit,
+            expected_preflight_hash=expected_preflight_hash,
+        )
+    except Exception as e:
+        status_code = 409 if isinstance(e, ValueError) else 500
+        raise HTTPException(
+            status_code=status_code,
+            detail={
+                "status": "error",
+                "exc": type(e).__name__,
+                "msg": str(e),
+                "traceback": traceback.format_exc()[:3000],
+            },
+        ) from e
 
 
 @app.post("/report/ml-close/confirm", dependencies=[Depends(require_service_token)])
