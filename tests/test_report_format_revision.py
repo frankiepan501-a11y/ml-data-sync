@@ -176,7 +176,7 @@ class ReportFormatRevisionTests(unittest.IsolatedAsyncioTestCase):
                     "action": "ml_profit_finance_operating_confirm",
                     "period": PERIOD,
                     "message_id": "om-current",
-                    "operator_name": "财务",
+                    "operator_name": "财务", "operator_id": ml_close.ML_CLOSE_FINANCE_APPROVER_OPEN_ID,
                     "patch_message": False,
                 }
             )
@@ -242,7 +242,7 @@ class ReportFormatRevisionTests(unittest.IsolatedAsyncioTestCase):
                     "action": "ml_profit_ops_confirm",
                     "period": PERIOD,
                     "message_id": "om-current",
-                    "operator_name": "运营",
+                    "operator_name": "运营", "operator_id": ml_close.ML_CLOSE_OPS_APPROVER_OPEN_ID,
                     "patch_message": False,
                 }
             )
@@ -326,7 +326,7 @@ class ReportFormatRevisionTests(unittest.IsolatedAsyncioTestCase):
                     "action": "ml_profit_ops_confirm",
                     "period": PERIOD,
                     "message_id": "om-current",
-                    "operator_name": "运营",
+                    "operator_name": "运营", "operator_id": ml_close.ML_CLOSE_OPS_APPROVER_OPEN_ID,
                     "patch_message": False,
                 }
             )
@@ -471,7 +471,7 @@ class ReportFormatRevisionTests(unittest.IsolatedAsyncioTestCase):
                     "action": "ml_profit_ops_reject",
                     "period": PERIOD,
                     "message_id": "om-current",
-                    "operator_name": "运营",
+                    "operator_name": "运营", "operator_id": ml_close.ML_CLOSE_OPS_APPROVER_OPEN_ID,
                     "patch_message": False,
                 }
             )

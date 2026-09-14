@@ -1270,7 +1270,7 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
                     patch.object(ml_close, "patch_or_fallback", AsyncMock(return_value={})),
                     patch.object(unified_report, "generate", generator),
                 ):
-                    result = await ml_close.confirm_action({"action": "ml_profit_finance_operating_confirm", "period": "month_2026-08", "message_id": "om-old", "operator_name": "财务"})
+                    result = await ml_close.confirm_action({"action": "ml_profit_finance_operating_confirm", "period": "month_2026-08", "message_id": "om-old", "operator_name": "财务", "operator_id": ml_close.ML_CLOSE_FINANCE_APPROVER_OPEN_ID})
                 self.assertEqual("blocked", result["status"])
                 generator.assert_not_awaited()
 
@@ -1377,7 +1377,7 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
                 "period": "month_2026-08",
                 "message_id": "om-finance-operating",
                 "review_source_hash": "v1",
-                "operator_name": "财务",
+                "operator_name": "财务", "operator_id": ml_close.ML_CLOSE_FINANCE_APPROVER_OPEN_ID,
             })
 
         self.assertEqual("财务已确认暂结", result["state"])
@@ -1428,7 +1428,7 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
                 "action": "ml_profit_finance_operating_confirm",
                 "period": "month_2026-08",
                 "message_id": "om-current",
-                "operator_name": "财务",
+                "operator_name": "财务", "operator_id": ml_close.ML_CLOSE_FINANCE_APPROVER_OPEN_ID,
             })
 
         self.assertEqual("ok", result["status"])
@@ -1461,7 +1461,7 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
                 "action": "ml_profit_finance_confirm",
                 "period": "month_2026-08",
                 "message_id": "om-final-ops",
-                "operator_name": "财务",
+                "operator_name": "财务", "operator_id": ml_close.ML_CLOSE_FINANCE_APPROVER_OPEN_ID,
             })
 
         self.assertEqual("blocked", result["status"])
@@ -1499,7 +1499,7 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
                 "action": "ml_profit_ops_confirm",
                 "period": "month_2026-08",
                 "message_id": "om-ops-operating",
-                "operator_name": "运营",
+                "operator_name": "运营", "operator_id": ml_close.ML_CLOSE_OPS_APPROVER_OPEN_ID,
             })
 
         self.assertEqual("运营已确认", result["state"])
@@ -1525,7 +1525,7 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
                 "action": "ml_profit_finance_confirm",
                 "period": "month_2026-08",
                 "message_id": "om-finance",
-                "operator_name": "财务",
+                "operator_name": "财务", "operator_id": ml_close.ML_CLOSE_FINANCE_APPROVER_OPEN_ID,
             })
 
         self.assertEqual("blocked", result["status"])
@@ -1554,7 +1554,7 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
                 "action": "ml_profit_ops_confirm",
                 "period": "month_2026-08",
                 "message_id": "om-ops-live-hash",
-                "operator_name": "运营",
+                "operator_name": "运营", "operator_id": ml_close.ML_CLOSE_OPS_APPROVER_OPEN_ID,
             })
 
         self.assertEqual("blocked", result["status"])
@@ -1586,7 +1586,7 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
                 "action": "ml_profit_finance_confirm",
                 "period": "month_2026-08",
                 "message_id": "om-finance-live-hash",
-                "operator_name": "财务",
+                "operator_name": "财务", "operator_id": ml_close.ML_CLOSE_FINANCE_APPROVER_OPEN_ID,
             })
 
         self.assertEqual("blocked", result["status"])
@@ -1625,7 +1625,7 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
                 "action": "ml_profit_finance_confirm",
                 "period": "month_2026-08",
                 "message_id": "om-finance",
-                "operator_name": "财务",
+                "operator_name": "财务", "operator_id": ml_close.ML_CLOSE_FINANCE_APPROVER_OPEN_ID,
             })
 
         self.assertEqual("财务已确认终稿", result["state"])
@@ -1665,7 +1665,7 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
                 "action": "ml_profit_finance_confirm",
                 "period": "month_2026-08",
                 "message_id": "om-finance-race",
-                "operator_name": "财务",
+                "operator_name": "财务", "operator_id": ml_close.ML_CLOSE_FINANCE_APPROVER_OPEN_ID,
             })
 
         self.assertEqual("blocked", result["status"])
@@ -1679,7 +1679,7 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
             "action": "ml_profit_finance_confirm",
             "period": period,
             "message_id": "om-duplicate-finance",
-            "operator_name": "财务",
+            "operator_name": "财务", "operator_id": ml_close.ML_CLOSE_FINANCE_APPROVER_OPEN_ID,
         }
         mutable_fields = {"状态": "运营已确认", "最后结果JSON": '{"ab_verified": true, "report_hash": "v1", "ab_report_hash": "v1"}'}
         entered = asyncio.Event()
@@ -1764,7 +1764,7 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
                 "action": "ml_profit_ops_confirm",
                 "period": "month_2026-08",
                 "message_id": "om-old-ops",
-                "operator_name": "运营",
+                "operator_name": "运营", "operator_id": ml_close.ML_CLOSE_OPS_APPROVER_OPEN_ID,
             })
 
         self.assertEqual("blocked", result["status"])
@@ -1779,7 +1779,7 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
             "action": "ml_profit_finance_confirm",
             "period": period,
             "message_id": "om-finance-retry",
-            "operator_name": "财务",
+            "operator_name": "财务", "operator_id": ml_close.ML_CLOSE_FINANCE_APPROVER_OPEN_ID,
         }
         fields = {"状态": "运营已确认", "最后结果JSON": '{"ab_verified": true, "report_hash": "v1", "ab_report_hash": "v1"}'}
         ledger: dict[str, str] = {}
@@ -1850,7 +1850,7 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
             "action": "ml_profit_finance_confirm",
             "period": period,
             "message_id": "om-audit-retry",
-            "operator_name": "财务",
+            "operator_name": "财务", "operator_id": ml_close.ML_CLOSE_FINANCE_APPROVER_OPEN_ID,
         }
         fields = {"状态": "运营已确认", "最后结果JSON": '{"ab_verified": true, "report_hash": "v1", "ab_report_hash": "v1"}'}
         ledger: dict[str, str] = {}
@@ -1985,14 +1985,14 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
                 "action": "ml_profit_ops_confirm",
                 "period": period,
                 "message_id": message_id,
-                "operator_name": "运营",
+                "operator_name": "运营", "operator_id": ml_close.ML_CLOSE_OPS_APPROVER_OPEN_ID,
             }))
             await audit_entered.wait()
             reject = await ml_close.confirm_action({
                 "action": "ml_profit_ops_reject",
                 "period": period,
                 "message_id": message_id,
-                "operator_name": "运营",
+                "operator_name": "运营", "operator_id": ml_close.ML_CLOSE_OPS_APPROVER_OPEN_ID,
             })
             release_confirm_audit.set()
             confirm = await confirm_task
@@ -2079,14 +2079,14 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
                 "action": "ml_profit_ops_confirm",
                 "period": period,
                 "message_id": current_message_id,
-                "operator_name": "运营",
+                "operator_name": "运营", "operator_id": ml_close.ML_CLOSE_OPS_APPROVER_OPEN_ID,
             }))
             await audit_entered.wait()
             stale_reject = await ml_close.confirm_action({
                 "action": "ml_profit_ops_reject",
                 "period": period,
                 "message_id": stale_message_id,
-                "operator_name": "运营",
+                "operator_name": "运营", "operator_id": ml_close.ML_CLOSE_OPS_APPROVER_OPEN_ID,
             })
             release_audit.set()
             confirm = await confirm_task
@@ -2181,14 +2181,14 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
                 "action": "ml_profit_recalc_cost",
                 "period": period,
                 "message_id": message_id,
-                "operator_name": "运营",
+                "operator_name": "运营", "operator_id": ml_close.ML_CLOSE_OPS_APPROVER_OPEN_ID,
             }))
             await recalc_audit_entered.wait()
             reject = await ml_close.confirm_action({
                 "action": "ml_profit_ops_reject",
                 "period": period,
                 "message_id": message_id,
-                "operator_name": "运营",
+                "operator_name": "运营", "operator_id": ml_close.ML_CLOSE_OPS_APPROVER_OPEN_ID,
             })
             release_recalc_audit.set()
             recalc = await recalc_task
@@ -2214,7 +2214,7 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
                 "action": "ml_profit_finance_confirm",
                 "period": "month_2026-08",
                 "message_id": "om-stale-finance",
-                "operator_name": "财务",
+                "operator_name": "财务", "operator_id": ml_close.ML_CLOSE_FINANCE_APPROVER_OPEN_ID,
             })
 
         self.assertEqual("blocked", result["status"])
@@ -2238,7 +2238,7 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
                 "action": "ml_profit_finance_confirm",
                 "period": "month_2026-08",
                 "message_id": "om-finance-during-recalc",
-                "operator_name": "财务",
+                "operator_name": "财务", "operator_id": ml_close.ML_CLOSE_FINANCE_APPROVER_OPEN_ID,
             })
 
         self.assertEqual("blocked", result["status"])

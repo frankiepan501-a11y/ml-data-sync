@@ -1099,7 +1099,7 @@ class MonthlyCloseAdvertisingFailureTests(unittest.IsolatedAsyncioTestCase):
                 "action": "ml_profit_ops_confirm",
                 "period": "month_2026-07",
                 "message_id": "om-old",
-                "operator_name": "运营",
+                "operator_name": "运营", "operator_id": ml_close.ML_CLOSE_OPS_APPROVER_OPEN_ID,
             })
 
         self.assertEqual("blocked", result["status"])
@@ -1375,7 +1375,7 @@ class MonthlyCloseAdvertisingFailureTests(unittest.IsolatedAsyncioTestCase):
                 "action": "ml_profit_ops_confirm",
                 "period": "month_2026-07",
                 "message_id": "om-old-green-card",
-                "operator_name": "运营",
+                "operator_name": "运营", "operator_id": ml_close.ML_CLOSE_OPS_APPROVER_OPEN_ID,
             })
 
         self.assertEqual("blocked", result["status"])
@@ -1416,7 +1416,7 @@ class MonthlyCloseAdvertisingFailureTests(unittest.IsolatedAsyncioTestCase):
                 "action": "ml_profit_ops_confirm",
                 "period": "month_2026-07",
                 "message_id": "om-old-green-card",
-                "operator_name": "运营",
+                "operator_name": "运营", "operator_id": ml_close.ML_CLOSE_OPS_APPROVER_OPEN_ID,
             })
 
         self.assertEqual("blocked", result["status"])

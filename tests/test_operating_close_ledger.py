@@ -33,7 +33,7 @@ class OperatingLedgerTests(unittest.IsolatedAsyncioTestCase):
                         patch.object(ml_close, 'patch_or_fallback', AsyncMock(return_value={})),
                         patch.object(unified_report, 'generate', generate),
                     ):
-                        result = await ml_close.confirm_action({'action': 'ml_profit_finance_operating_confirm', 'period': 'month_2026-08', 'message_id': 'card', 'operator_id': 'finance-test', 'review_source_hash': 'v3'})
+                        result = await ml_close.confirm_action({'action': 'ml_profit_finance_operating_confirm', 'period': 'month_2026-08', 'message_id': 'card', 'operator_id': ml_close.ML_CLOSE_FINANCE_APPROVER_OPEN_ID, 'review_source_hash': 'v3'})
                     self.assertEqual(result['status'], expected, result.get('reason'))
                     writes = [x.args[1] for x in writer.await_args_list if x.args[1].get('状态') == '财务已确认暂结']
                     self.assertEqual(len(writes), int(expected == 'ok'))

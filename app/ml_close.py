@@ -34,6 +34,14 @@ ML_GROUP_ID = os.getenv("ML_CLOSE_GROUP_ID", "oc_cd007a8f1dbb4a78943625e5432a4cd
 FINANCE_GROUP_ID = os.getenv("ML_CLOSE_FINANCE_GROUP_ID", "oc_6b2da626d80eb6284bbe9dcf895030b9")
 CARD_APP_ID = os.getenv("FEISHU_CARD_APP_ID", "cli_a9457898bd78dccc")
 CARD_APP_SECRET = os.getenv("FEISHU_CARD_APP_SECRET", "")
+ML_CLOSE_OPS_APPROVER_OPEN_ID = os.getenv(
+    "ML_CLOSE_OPS_APPROVER_OPEN_ID",
+    "ou_1ad46c8394e00b1b3fd41bcb19bc1dba",
+).strip()
+ML_CLOSE_FINANCE_APPROVER_OPEN_ID = os.getenv(
+    "ML_CLOSE_FINANCE_APPROVER_OPEN_ID",
+    "ou_2ced41d585239cb0e8aebd9b5b7b28f0",
+).strip()
 
 _STATUS_LOCKS_BY_LOOP: weakref.WeakKeyDictionary[
     asyncio.AbstractEventLoop, dict[str, asyncio.Lock]
@@ -1665,7 +1673,8 @@ async def _confirm_action_impl(
 ) -> dict[str, Any]:
     action = payload.get("action") or payload.get("value", {}).get("action")
     period, month = normalize_period(payload.get("month"), payload.get("period") or payload.get("value", {}).get("period"))
-    actor = _text(payload.get("operator_name") or payload.get("operator_id") or payload.get("open_id") or payload.get("user_id"))
+    operator_open_id = _text(payload.get("operator_id") or payload.get("open_id"))
+    actor = _text(payload.get("operator_name") or operator_open_id or payload.get("user_id"))
     context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
     message_id = (
         payload.get("message_id")
@@ -1694,6 +1703,43 @@ async def _confirm_action_impl(
         "ml_profit_finance_operating_confirm",
         "ml_profit_finance_confirm",
     }
+    confirmation_approvers = {
+        "ml_profit_ops_confirm": (ML_CLOSE_OPS_APPROVER_OPEN_ID, "梁俊辉"),
+        "ml_profit_ops_waive_gap": (ML_CLOSE_OPS_APPROVER_OPEN_ID, "梁俊辉"),
+        "ml_profit_finance_operating_confirm": (
+            ML_CLOSE_FINANCE_APPROVER_OPEN_ID,
+            "林纯子",
+        ),
+        "ml_profit_finance_confirm": (
+            ML_CLOSE_FINANCE_APPROVER_OPEN_ID,
+            "林纯子",
+        ),
+    }
+
+    required_approver = confirmation_approvers.get(action)
+    if required_approver:
+        required_open_id, required_name = required_approver
+        if not required_open_id:
+            reason = (
+                f"身份校验未通过：{required_name}的同应用身份配置缺失；"
+                "本次未改任何状态，请联系系统管理员。"
+            )
+        elif operator_open_id != required_open_id:
+            reason = (
+                f"身份校验未通过：此步骤仅限指定负责人{required_name}本人操作；"
+                "本次未改任何状态，原卡仍可由本人继续确认。"
+            )
+        else:
+            reason = ""
+        if reason:
+            return {
+                "status": "blocked",
+                "action": action,
+                "period": period,
+                "state": "未变更",
+                "reason": reason,
+                "feedback": {},
+            }
     final_ab_actions = {
         "ml_profit_ops_waive_gap",
         "ml_profit_finance_confirm",
