@@ -144,6 +144,11 @@ class MlConfirmationIdentityGateTests(unittest.IsolatedAsyncioTestCase):
 
 
 class MlUnauthorizedConfirmationRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    LATEST_WRONG_FINANCE_CARD = "om_x100b65b6cba7e0a0c3146c522e11021"
+    KNOWN_WRONG_FINANCE_CARDS = (
+        "om_x100b654fc0e4a900c4ae6f9e57c710a",
+        "om_x100b65b6cba7e0a0c3146c522e11021",
+    )
     V3_CONFIRMER = "ou_2ced41d585239cb0e8aebd9b5b7b28f0"
     V3_CONFIRM_TIME = 1789029064885
     V3_REPORT_URL = (
@@ -158,7 +163,7 @@ class MlUnauthorizedConfirmationRecoveryTests(unittest.IsolatedAsyncioTestCase):
             "经营暂结确认人": self.V3_CONFIRMER,
             "经营暂结确认时间": self.V3_CONFIRM_TIME,
             "经营暂结报表链接": self.V3_REPORT_URL,
-            "最后卡片 message_id": ml_close.IDENTITY_RECOVERY_WRONG_FINANCE_CARD,
+            "最后卡片 message_id": self.LATEST_WRONG_FINANCE_CARD,
             "最后按钮动作Key": "old-action-key",
             "最后按钮动作时间": 1789376638046,
             "最后结果JSON": json.dumps(
@@ -238,7 +243,10 @@ class MlUnauthorizedConfirmationRecoveryTests(unittest.IsolatedAsyncioTestCase):
         return ml_close._identity_recovery_preflight_hash(
             status["fields"],
             ml_close.IDENTITY_RECOVERY_REPORT_HASH,
-            card_document,
+            {
+                card_id: card_document
+                for card_id in self.KNOWN_WRONG_FINANCE_CARDS
+            },
             ml_close.IDENTITY_RECOVERY_REVIEW_MARKER,
             ml_close.IDENTITY_RECOVERY_COMPANY_MONTH,
             ml_close.IDENTITY_RECOVERY_COMPANY_V3_URL,
@@ -257,6 +265,18 @@ class MlUnauthorizedConfirmationRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self.V3_REPORT_URL,
             ml_close.IDENTITY_RECOVERY_V3_REPORT_URL,
+        )
+        self.assertEqual(
+            self.LATEST_WRONG_FINANCE_CARD,
+            ml_close.IDENTITY_RECOVERY_LATEST_WRONG_FINANCE_CARD,
+        )
+        self.assertEqual(
+            self.KNOWN_WRONG_FINANCE_CARDS,
+            ml_close.IDENTITY_RECOVERY_WRONG_FINANCE_CARDS,
+        )
+        self.assertEqual(
+            self.KNOWN_WRONG_FINANCE_CARDS[0],
+            ml_close.IDENTITY_RECOVERY_WRONG_FINANCE_CARD,
         )
 
         class LockProbe:
@@ -347,6 +367,10 @@ class MlUnauthorizedConfirmationRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("preflight_ok", preflight["status"])
             self.assertFalse(preflight["commit"])
             self.assertEqual(64, len(preflight["preflight_hash"]))
+            self.assertEqual(
+                list(self.KNOWN_WRONG_FINANCE_CARDS),
+                preflight["revoked_finance_cards"],
+            )
             self.assertFalse(
                 any(
                     call.args[0] == "PUT"
@@ -422,6 +446,19 @@ class MlUnauthorizedConfirmationRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.V3_CONFIRM_TIME, after["fields"]["经营暂结确认时间"]
         )
         self.assertEqual(self.V3_REPORT_URL, after["fields"]["经营暂结报表链接"])
+        card_read_urls = [
+            call.args[1]
+            for call in feishu.await_args_list
+            if call.args[0] == "GET" and "/im/v1/messages/" in call.args[1]
+        ]
+        for card_id in self.KNOWN_WRONG_FINANCE_CARDS:
+            self.assertTrue(
+                any(
+                    url.endswith(f"/im/v1/messages/{card_id}")
+                    for url in card_read_urls
+                ),
+                f"恢复前必须核验错误财务卡 {card_id}",
+            )
 
     async def test_recovery_rejects_changed_v3_history_before_card_or_put(self):
         for field_name, changed_value in (
@@ -556,6 +593,37 @@ class MlUnauthorizedConfirmationRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, feishu.await_count)
         self.assertEqual("GET", feishu.await_args.args[0])
 
+    async def test_recovery_requires_exact_latest_wrong_finance_card_before_reads(self):
+        for changed_message_id in (
+            self.KNOWN_WRONG_FINANCE_CARDS[0],
+            "om_unknown_finance_card",
+        ):
+            with self.subTest(changed_message_id=changed_message_id):
+                changed = self._status()
+                changed["fields"]["最后卡片 message_id"] = changed_message_id
+                feishu = AsyncMock(return_value=self._status_record(changed))
+                with (
+                    patch.object(
+                        ml_close,
+                        "_tenant_token",
+                        AsyncMock(return_value="base-token"),
+                    ),
+                    patch.object(ml_close, "_fs_json", feishu),
+                ):
+                    with self.assertRaisesRegex(ValueError, "最新卡片已变化"):
+                        await ml_close.recover_identity_incident(
+                            ml_close.IDENTITY_RECOVERY_INCIDENT_ID
+                        )
+                self.assertEqual(1, feishu.await_count)
+                self.assertFalse(
+                    any(
+                        "/im/v1/messages/" in call.args[1]
+                        or call.args[0] == "PUT"
+                        for call in feishu.await_args_list
+                        if call.args
+                    )
+                )
+
     async def test_recovery_rejects_repeated_call_before_put(self):
         restored = self._status(restored=True)
         feishu = AsyncMock(return_value=self._status_record(restored))
@@ -571,17 +639,82 @@ class MlUnauthorizedConfirmationRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("GET", feishu.await_args.args[0])
 
     async def test_recovery_requires_revoked_finance_card_before_put(self):
-        for unsafe_marker in (
-            "ml_profit_finance_operating_confirm",
-            "ml_profit_finance_reject",
-            "退回运营复核",
-        ):
-            with self.subTest(unsafe_marker=unsafe_marker):
+        for unsafe_card_id in self.KNOWN_WRONG_FINANCE_CARDS:
+            for unsafe_marker in (
+                "ml_profit_finance_operating_confirm",
+                "ml_profit_finance_reject",
+                "退回运营复核",
+            ):
+                with self.subTest(
+                    unsafe_card_id=unsafe_card_id,
+                    unsafe_marker=unsafe_marker,
+                ):
+                    before = self._status()
+                    active_card = self._revoked_card()
+                    active_card["data"]["items"][0]["body"]["content"] += (
+                        " " + unsafe_marker
+                    )
+
+                    async def fs_json(method, url, tok, payload=None, **kwargs):
+                        if (
+                            method == "GET"
+                            and ml_close.IDENTITY_RECOVERY_STATUS_RECORD_ID in url
+                        ):
+                            return self._status_record(before)
+                        if method == "GET" and "/im/v1/messages/" in url:
+                            return (
+                                active_card
+                                if url.endswith("/" + unsafe_card_id)
+                                else self._revoked_card()
+                            )
+                        self.fail(f"unexpected Feishu request: {method} {url}")
+
+                    feishu = AsyncMock(side_effect=fs_json)
+                    with (
+                        patch.object(
+                            ml_close,
+                            "_tenant_token",
+                            AsyncMock(side_effect=["base-token", "card-token"]),
+                        ),
+                        patch.object(
+                            ml_close,
+                            "_get_status",
+                            AsyncMock(
+                                side_effect=AssertionError(
+                                    "generic status read is forbidden"
+                                )
+                            ),
+                        ),
+                        patch.object(
+                            ml_close,
+                            "_current_report_hash",
+                            AsyncMock(
+                                return_value=ml_close.IDENTITY_RECOVERY_REPORT_HASH
+                            ),
+                        ),
+                        patch.object(
+                            ml_close,
+                            "_open_ad_failures",
+                            AsyncMock(return_value=[]),
+                        ),
+                        patch.object(ml_close, "_fs_json", feishu),
+                    ):
+                        with self.assertRaisesRegex(ValueError, "财务卡仍可操作"):
+                            await ml_close.recover_identity_incident(
+                                ml_close.IDENTITY_RECOVERY_INCIDENT_ID
+                            )
+                    self.assertFalse(
+                        any(
+                            call.args[0] == "PUT"
+                            for call in feishu.await_args_list
+                            if call.args
+                        )
+                    )
+
+    async def test_recovery_requires_every_known_finance_card_to_exist_once(self):
+        for missing_card_id in self.KNOWN_WRONG_FINANCE_CARDS:
+            with self.subTest(missing_card_id=missing_card_id):
                 before = self._status()
-                active_card = self._revoked_card()
-                active_card["data"]["items"][0]["body"]["content"] += (
-                    " " + unsafe_marker
-                )
 
                 async def fs_json(method, url, tok, payload=None, **kwargs):
                     if (
@@ -590,7 +723,11 @@ class MlUnauthorizedConfirmationRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     ):
                         return self._status_record(before)
                     if method == "GET" and "/im/v1/messages/" in url:
-                        return active_card
+                        return (
+                            {"data": {"items": []}}
+                            if url.endswith("/" + missing_card_id)
+                            else self._revoked_card()
+                        )
                     self.fail(f"unexpected Feishu request: {method} {url}")
 
                 feishu = AsyncMock(side_effect=fs_json)
@@ -602,26 +739,19 @@ class MlUnauthorizedConfirmationRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     ),
                     patch.object(
                         ml_close,
-                        "_get_status",
-                        AsyncMock(
-                            side_effect=AssertionError(
-                                "generic status read is forbidden"
-                            )
-                        ),
-                    ),
-                    patch.object(
-                        ml_close,
                         "_current_report_hash",
                         AsyncMock(
                             return_value=ml_close.IDENTITY_RECOVERY_REPORT_HASH
                         ),
                     ),
                     patch.object(
-                        ml_close, "_open_ad_failures", AsyncMock(return_value=[])
+                        ml_close,
+                        "_open_ad_failures",
+                        AsyncMock(return_value=[]),
                     ),
                     patch.object(ml_close, "_fs_json", feishu),
                 ):
-                    with self.assertRaisesRegex(ValueError, "财务卡仍可操作"):
+                    with self.assertRaisesRegex(ValueError, "无法唯一读取错误财务卡"):
                         await ml_close.recover_identity_incident(
                             ml_close.IDENTITY_RECOVERY_INCIDENT_ID
                         )
@@ -632,6 +762,39 @@ class MlUnauthorizedConfirmationRecoveryTests(unittest.IsolatedAsyncioTestCase):
                         if call.args
                     )
                 )
+
+    def test_recovery_preflight_hash_binds_each_wrong_finance_card(self):
+        status = self._status()
+        card_document = json.loads(
+            self._revoked_card()["data"]["items"][0]["body"]["content"]
+        )
+        documents = {
+            card_id: json.loads(json.dumps(card_document, ensure_ascii=False))
+            for card_id in self.KNOWN_WRONG_FINANCE_CARDS
+        }
+        baseline = ml_close._identity_recovery_preflight_hash(
+            status["fields"],
+            ml_close.IDENTITY_RECOVERY_REPORT_HASH,
+            documents,
+            ml_close.IDENTITY_RECOVERY_REVIEW_MARKER,
+            ml_close.IDENTITY_RECOVERY_COMPANY_MONTH,
+            ml_close.IDENTITY_RECOVERY_COMPANY_V3_URL,
+            self._planned_update(),
+        )
+        for card_id in self.KNOWN_WRONG_FINANCE_CARDS:
+            with self.subTest(card_id=card_id):
+                changed = json.loads(json.dumps(documents, ensure_ascii=False))
+                changed[card_id]["elements"][0]["content"] += " changed"
+                changed_hash = ml_close._identity_recovery_preflight_hash(
+                    status["fields"],
+                    ml_close.IDENTITY_RECOVERY_REPORT_HASH,
+                    changed,
+                    ml_close.IDENTITY_RECOVERY_REVIEW_MARKER,
+                    ml_close.IDENTITY_RECOVERY_COMPANY_MONTH,
+                    ml_close.IDENTITY_RECOVERY_COMPANY_V3_URL,
+                    self._planned_update(),
+                )
+                self.assertNotEqual(baseline, changed_hash)
 
     async def test_recovery_rejects_changed_company_month_before_put(self):
         before = self._status()

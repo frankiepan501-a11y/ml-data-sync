@@ -50,6 +50,13 @@ IDENTITY_RECOVERY_INCIDENT_ID = "ml-2026-08-wrong-ops-confirmation-20260914"
 IDENTITY_RECOVERY_PERIOD = "month_2026-08"
 IDENTITY_RECOVERY_WRONG_OPERATOR = "ou_8bdf206fafc9086a3e6f2742bb54ccb3"
 IDENTITY_RECOVERY_WRONG_FINANCE_CARD = "om_x100b654fc0e4a900c4ae6f9e57c710a"
+IDENTITY_RECOVERY_LATEST_WRONG_FINANCE_CARD = (
+    "om_x100b65b6cba7e0a0c3146c522e11021"
+)
+IDENTITY_RECOVERY_WRONG_FINANCE_CARDS = (
+    IDENTITY_RECOVERY_WRONG_FINANCE_CARD,
+    IDENTITY_RECOVERY_LATEST_WRONG_FINANCE_CARD,
+)
 IDENTITY_RECOVERY_REPORT_HASH = (
     "cb516d71671754a19c5f4e079335fb43f320b74534c0b4fb62d6f1d2d31669de"
 )
@@ -300,7 +307,7 @@ def _identity_recovery_card_document(raw_content: Any) -> dict[str, Any]:
 def _identity_recovery_preflight_hash(
     fields: dict[str, Any],
     report_hash: str,
-    card_document: dict[str, Any],
+    card_documents: dict[str, dict[str, Any]],
     marker: str,
     company_month: str,
     company_link: str,
@@ -314,8 +321,8 @@ def _identity_recovery_preflight_hash(
             "status_record_id": IDENTITY_RECOVERY_STATUS_RECORD_ID,
             "status_fields": fields,
             "report_hash": report_hash,
-            "wrong_finance_card": IDENTITY_RECOVERY_WRONG_FINANCE_CARD,
-            "wrong_finance_card_document": card_document,
+            "wrong_finance_cards": IDENTITY_RECOVERY_WRONG_FINANCE_CARDS,
+            "wrong_finance_card_documents": card_documents,
             "review_marker": marker,
             "company_record_id": IDENTITY_RECOVERY_COMPANY_RECORD_ID,
             "company_month": company_month,
@@ -1836,7 +1843,7 @@ async def recover_identity_incident(
             raise ValueError("错误运营确认时间缺失，未执行恢复")
         if (
             _text(fields.get("最后卡片 message_id"))
-            != IDENTITY_RECOVERY_WRONG_FINANCE_CARD
+            != IDENTITY_RECOVERY_LATEST_WRONG_FINANCE_CARD
         ):
             raise ValueError("最新卡片已变化，未执行恢复")
         if _text(fields.get("最后错误")):
@@ -1879,27 +1886,35 @@ async def recover_identity_incident(
             raise ValueError("当前存在广告抓取失败，未执行恢复")
 
         card_tok = await _tenant_token(CARD_APP_ID, CARD_APP_SECRET)
-        card_payload = await _fs_json(
-            "GET",
-            f"{FEISHU}/im/v1/messages/{IDENTITY_RECOVERY_WRONG_FINANCE_CARD}",
-            card_tok,
-        )
-        items = (card_payload.get("data") or {}).get("items") or []
-        if len(items) != 1:
-            raise ValueError("无法唯一读取错误财务卡，未执行恢复")
-        card_item = items[0]
-        card_content = _text((card_item.get("body") or {}).get("content"))
-        if not card_item.get("updated") or card_item.get("deleted"):
-            raise ValueError("错误财务卡未处于已撤销状态，未执行恢复")
-        if (
-            "美客多财务卡已撤销" not in card_content
-            or "放行经营暂结" in card_content
-            or "退回运营复核" in card_content
-            or "ml_profit_finance_operating_confirm" in card_content
-            or "ml_profit_finance_reject" in card_content
-        ):
-            raise ValueError("错误财务卡仍可操作，未执行恢复")
-        card_document = _identity_recovery_card_document(card_content)
+        card_documents: dict[str, dict[str, Any]] = {}
+        for card_id in IDENTITY_RECOVERY_WRONG_FINANCE_CARDS:
+            card_payload = await _fs_json(
+                "GET",
+                f"{FEISHU}/im/v1/messages/{card_id}",
+                card_tok,
+            )
+            items = (card_payload.get("data") or {}).get("items") or []
+            if len(items) != 1:
+                raise ValueError(
+                    f"无法唯一读取错误财务卡 {card_id}，未执行恢复"
+                )
+            card_item = items[0]
+            card_content = _text((card_item.get("body") or {}).get("content"))
+            if not card_item.get("updated") or card_item.get("deleted"):
+                raise ValueError(
+                    f"错误财务卡 {card_id} 未处于已撤销状态，未执行恢复"
+                )
+            if (
+                "美客多财务卡已撤销" not in card_content
+                or "放行经营暂结" in card_content
+                or "退回运营复核" in card_content
+                or "ml_profit_finance_operating_confirm" in card_content
+                or "ml_profit_finance_reject" in card_content
+            ):
+                raise ValueError(f"错误财务卡仍可操作（{card_id}），未执行恢复")
+            card_documents[card_id] = _identity_recovery_card_document(
+                card_content
+            )
 
         from app import unified_report
 
@@ -1955,7 +1970,7 @@ async def recover_identity_incident(
         preflight_hash = _identity_recovery_preflight_hash(
             before_fields,
             current_report_hash,
-            card_document,
+            card_documents,
             assets_before["review_marker"],
             assets_before["company_month"],
             assets_before["company_summary_link"],
@@ -1981,6 +1996,7 @@ async def recover_identity_incident(
             "preflight_hash": preflight_hash,
             "report_hash": current_report_hash,
             "review_report_url": IDENTITY_RECOVERY_REVIEW_URL,
+            "revoked_finance_cards": list(IDENTITY_RECOVERY_WRONG_FINANCE_CARDS),
             **assets_before,
             "release_flags": preflight_release_flags,
             "release_flags_closed": not any(preflight_release_flags.values()),
@@ -2102,6 +2118,7 @@ async def recover_identity_incident(
             "changed_fields": ["状态", "运营确认人", "运营确认时间"],
             "report_hash": current_report_hash,
             "review_report_url": IDENTITY_RECOVERY_REVIEW_URL,
+            "revoked_finance_cards": list(IDENTITY_RECOVERY_WRONG_FINANCE_CARDS),
             **assets_after,
             "preflight_hash": preflight_hash,
             "put_outcome": put_outcome,
