@@ -144,11 +144,20 @@ class MlConfirmationIdentityGateTests(unittest.IsolatedAsyncioTestCase):
 
 
 class MlUnauthorizedConfirmationRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    V3_CONFIRMER = "ou_2ced41d585239cb0e8aebd9b5b7b28f0"
+    V3_CONFIRM_TIME = 1789029064885
+    V3_REPORT_URL = (
+        "https://u1wpma3xuhr.feishu.cn/wiki/VINMwgK9yinxMVkc2H1cmsGBnLe"
+    )
+
     def _status(self, *, restored: bool = False) -> dict:
         fields = {
             "周期": "month_2026-08",
             "状态": "待运营确认" if restored else "运营已确认",
             "运营确认人": "" if restored else ml_close.IDENTITY_RECOVERY_WRONG_OPERATOR,
+            "经营暂结确认人": self.V3_CONFIRMER,
+            "经营暂结确认时间": self.V3_CONFIRM_TIME,
+            "经营暂结报表链接": self.V3_REPORT_URL,
             "最后卡片 message_id": ml_close.IDENTITY_RECOVERY_WRONG_FINANCE_CARD,
             "最后按钮动作Key": "old-action-key",
             "最后按钮动作时间": 1789376638046,
@@ -237,6 +246,19 @@ class MlUnauthorizedConfirmationRecoveryTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_recovery_uses_lock_and_writes_exactly_three_fields(self):
+        self.assertEqual(
+            self.V3_CONFIRMER,
+            ml_close.IDENTITY_RECOVERY_V3_CONFIRMER_OPEN_ID,
+        )
+        self.assertEqual(
+            self.V3_CONFIRM_TIME,
+            ml_close.IDENTITY_RECOVERY_V3_CONFIRM_TIME_MS,
+        )
+        self.assertEqual(
+            self.V3_REPORT_URL,
+            ml_close.IDENTITY_RECOVERY_V3_REPORT_URL,
+        )
+
         class LockProbe:
             entered = False
             exited = False
@@ -395,6 +417,50 @@ class MlUnauthorizedConfirmationRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 if call.args
             )
         )
+        self.assertEqual(self.V3_CONFIRMER, after["fields"]["经营暂结确认人"])
+        self.assertEqual(
+            self.V3_CONFIRM_TIME, after["fields"]["经营暂结确认时间"]
+        )
+        self.assertEqual(self.V3_REPORT_URL, after["fields"]["经营暂结报表链接"])
+
+    async def test_recovery_rejects_changed_v3_history_before_card_or_put(self):
+        for field_name, changed_value in (
+            ("经营暂结确认人", "ou_wrong_v3_confirmer"),
+            ("经营暂结确认时间", self.V3_CONFIRM_TIME + 1),
+            ("经营暂结报表链接", "https://example.invalid/wrong-v3"),
+        ):
+            with self.subTest(field_name=field_name):
+                changed = self._status()
+                changed["fields"][field_name] = changed_value
+                feishu = AsyncMock(return_value=self._status_record(changed))
+                token = AsyncMock(return_value="base-token")
+                with (
+                    patch.object(ml_close, "_tenant_token", token),
+                    patch.object(
+                        ml_close,
+                        "_current_report_hash",
+                        AsyncMock(
+                            return_value=ml_close.IDENTITY_RECOVERY_REPORT_HASH
+                        ),
+                    ),
+                    patch.object(
+                        ml_close, "_open_ad_failures", AsyncMock(return_value=[])
+                    ),
+                    patch.object(ml_close, "_fs_json", feishu),
+                ):
+                    with self.assertRaisesRegex(ValueError, field_name):
+                        await ml_close.recover_identity_incident(
+                            ml_close.IDENTITY_RECOVERY_INCIDENT_ID
+                        )
+                token.assert_awaited_once()
+                self.assertFalse(
+                    any(
+                        call.args[0] in {"PUT", "POST", "PATCH", "DELETE"}
+                        or "/im/v1/messages/" in call.args[1]
+                        for call in feishu.await_args_list
+                        if call.args
+                    )
+                )
 
     async def test_recovery_rejects_wrong_incident_before_any_io(self):
         token = AsyncMock()

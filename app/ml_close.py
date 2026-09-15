@@ -72,6 +72,11 @@ IDENTITY_RECOVERY_COMPANY_MONTH = "2026/08"
 IDENTITY_RECOVERY_COMPANY_V3_URL = (
     "https://u1wpma3xuhr.feishu.cn/wiki/VINMwgK9yinxMVkc2H1cmsGBnLe"
 )
+IDENTITY_RECOVERY_V3_CONFIRMER_OPEN_ID = (
+    "ou_2ced41d585239cb0e8aebd9b5b7b28f0"
+)
+IDENTITY_RECOVERY_V3_CONFIRM_TIME_MS = 1789029064885
+IDENTITY_RECOVERY_V3_REPORT_URL = IDENTITY_RECOVERY_COMPANY_V3_URL
 
 _STATUS_LOCKS_BY_LOOP: weakref.WeakKeyDictionary[
     asyncio.AbstractEventLoop, dict[str, asyncio.Lock]
@@ -1859,15 +1864,17 @@ async def recover_identity_incident(
         ):
             if _text(result.get(result_key)):
                 raise ValueError(f"{result_key} 已有值，未执行恢复")
-        for field_name in (
-            "财务确认人",
-            "财务确认时间",
-            "经营暂结确认人",
-            "经营暂结确认时间",
-            "经营暂结报表链接",
-        ):
+        for field_name in ("财务确认人", "财务确认时间"):
             if fields.get(field_name):
                 raise ValueError(f"{field_name} 已有值，未执行恢复")
+        expected_v3_history = {
+            "经营暂结确认人": IDENTITY_RECOVERY_V3_CONFIRMER_OPEN_ID,
+            "经营暂结确认时间": IDENTITY_RECOVERY_V3_CONFIRM_TIME_MS,
+            "经营暂结报表链接": IDENTITY_RECOVERY_V3_REPORT_URL,
+        }
+        for field_name, expected_value in expected_v3_history.items():
+            if fields.get(field_name) != expected_value:
+                raise ValueError(f"{field_name} 已变化，未执行恢复")
         if await _open_ad_failures(period, fields):
             raise ValueError("当前存在广告抓取失败，未执行恢复")
 
