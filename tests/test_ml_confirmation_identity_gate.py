@@ -151,6 +151,7 @@ class MlUnauthorizedConfirmationRecoveryTests(unittest.IsolatedAsyncioTestCase):
     )
     V3_CONFIRMER = "ou_2ced41d585239cb0e8aebd9b5b7b28f0"
     V3_CONFIRM_TIME = 1789029064885
+    WRONG_CONFIRM_TIME = 1789376638046
     V3_REPORT_URL = (
         "https://u1wpma3xuhr.feishu.cn/wiki/VINMwgK9yinxMVkc2H1cmsGBnLe"
     )
@@ -177,7 +178,7 @@ class MlUnauthorizedConfirmationRecoveryTests(unittest.IsolatedAsyncioTestCase):
             ),
         }
         if not restored:
-            fields["运营确认时间"] = 1789376638046
+            fields["运营确认时间"] = self.WRONG_CONFIRM_TIME
         return {
             "record_id": ml_close.IDENTITY_RECOVERY_STATUS_RECORD_ID,
             "table_id": ml_close.IDENTITY_RECOVERY_STATUS_TABLE_ID,
@@ -265,6 +266,10 @@ class MlUnauthorizedConfirmationRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self.V3_REPORT_URL,
             ml_close.IDENTITY_RECOVERY_V3_REPORT_URL,
+        )
+        self.assertEqual(
+            self.WRONG_CONFIRM_TIME,
+            ml_close.IDENTITY_RECOVERY_WRONG_CONFIRM_TIME_MS,
         )
         self.assertEqual(
             self.LATEST_WRONG_FINANCE_CARD,
@@ -498,6 +503,34 @@ class MlUnauthorizedConfirmationRecoveryTests(unittest.IsolatedAsyncioTestCase):
                         if call.args
                     )
                 )
+
+    async def test_recovery_rejects_changed_wrong_confirmation_time_before_card_or_put(self):
+        changed = self._status()
+        changed["fields"]["运营确认时间"] = self.WRONG_CONFIRM_TIME + 1
+        feishu = AsyncMock(return_value=self._status_record(changed))
+        with (
+            patch.object(ml_close, "_tenant_token", AsyncMock(return_value="base-token")),
+            patch.object(ml_close, "_fs_json", feishu),
+        ):
+            with self.assertRaisesRegex(ValueError, "错误运营确认时间已变化"):
+                await ml_close.recover_identity_incident(
+                    ml_close.IDENTITY_RECOVERY_INCIDENT_ID
+                )
+        self.assertEqual(1, feishu.await_count)
+        self.assertFalse(
+            any(
+                call.args[0] in {"PUT", "POST", "PATCH", "DELETE"}
+                or "/im/v1/messages/" in call.args[1]
+                for call in feishu.await_args_list
+                if call.args
+            )
+        )
+
+    def test_health_exposes_exact_wrong_confirmation_time_build(self):
+        self.assertIs(
+            True,
+            main.health()["ml_identity_recovery_exact_time_v1_20260915"],
+        )
 
     async def test_recovery_rejects_wrong_incident_before_any_io(self):
         token = AsyncMock()

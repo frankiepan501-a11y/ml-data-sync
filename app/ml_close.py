@@ -84,6 +84,7 @@ IDENTITY_RECOVERY_V3_CONFIRMER_OPEN_ID = (
 )
 IDENTITY_RECOVERY_V3_CONFIRM_TIME_MS = 1789029064885
 IDENTITY_RECOVERY_V3_REPORT_URL = IDENTITY_RECOVERY_COMPANY_V3_URL
+IDENTITY_RECOVERY_WRONG_CONFIRM_TIME_MS = 1789376638046
 
 _STATUS_LOCKS_BY_LOOP: weakref.WeakKeyDictionary[
     asyncio.AbstractEventLoop, dict[str, asyncio.Lock]
@@ -1839,8 +1840,8 @@ async def recover_identity_incident(
             raise ValueError("月结状态已变化，未执行恢复")
         if _text(fields.get("运营确认人")) != IDENTITY_RECOVERY_WRONG_OPERATOR:
             raise ValueError("运营确认人已变化，未执行恢复")
-        if not fields.get("运营确认时间"):
-            raise ValueError("错误运营确认时间缺失，未执行恢复")
+        if fields.get("运营确认时间") != IDENTITY_RECOVERY_WRONG_CONFIRM_TIME_MS:
+            raise ValueError("错误运营确认时间已变化，未执行恢复")
         if (
             _text(fields.get("最后卡片 message_id"))
             != IDENTITY_RECOVERY_LATEST_WRONG_FINANCE_CARD
