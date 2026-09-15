@@ -1321,6 +1321,9 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
         self.month_work_finish_patcher = patch.object(
             db, "finish_ml_close_month_work", AsyncMock()
         )
+        self.current_report_hash_patcher = patch.object(
+            ml_close, "_current_report_hash", AsyncMock(return_value="v1")
+        )
         self.action_claim = self.action_claim_patcher.start()
         self.action_complete = self.action_complete_patcher.start()
         self.action_fail = self.action_fail_patcher.start()
@@ -1329,6 +1332,7 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
         self.month_work_get = self.month_work_get_patcher.start()
         self.month_work_claim = self.month_work_claim_patcher.start()
         self.month_work_finish = self.month_work_finish_patcher.start()
+        self.current_report_hash_patcher.start()
 
     def tearDown(self):
         self.action_claim_patcher.stop()
@@ -1339,6 +1343,7 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
         self.month_work_get_patcher.stop()
         self.month_work_claim_patcher.stop()
         self.month_work_finish_patcher.stop()
+        self.current_report_hash_patcher.stop()
 
     async def test_finance_can_freeze_operating_close_without_final_ab(self):
         current = {
@@ -1498,6 +1503,7 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
             result = await ml_close.confirm_action({
                 "action": "ml_profit_ops_confirm",
                 "period": "month_2026-08",
+                "report_hash": "v1",
                 "message_id": "om-ops-operating",
                 "operator_name": "运营", "operator_id": ml_close.ML_CLOSE_OPS_APPROVER_OPEN_ID,
             })
@@ -1553,6 +1559,7 @@ class FinanceConfirmationGeneratorGateTests(unittest.IsolatedAsyncioTestCase):
             result = await ml_close.confirm_action({
                 "action": "ml_profit_ops_confirm",
                 "period": "month_2026-08",
+                "report_hash": "v1",
                 "message_id": "om-ops-live-hash",
                 "operator_name": "运营", "operator_id": ml_close.ML_CLOSE_OPS_APPROVER_OPEN_ID,
             })

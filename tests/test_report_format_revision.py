@@ -241,6 +241,7 @@ class ReportFormatRevisionTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "action": "ml_profit_ops_confirm",
                     "period": PERIOD,
+                    "report_hash": "current-v4-hash",
                     "message_id": "om-current",
                     "operator_name": "运营", "operator_id": ml_close.ML_CLOSE_OPS_APPROVER_OPEN_ID,
                     "patch_message": False,
@@ -325,6 +326,7 @@ class ReportFormatRevisionTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "action": "ml_profit_ops_confirm",
                     "period": PERIOD,
+                    "report_hash": "current-v4-hash",
                     "message_id": "om-current",
                     "operator_name": "运营", "operator_id": ml_close.ML_CLOSE_OPS_APPROVER_OPEN_ID,
                     "patch_message": False,
@@ -447,6 +449,11 @@ class ReportFormatRevisionTests(unittest.IsolatedAsyncioTestCase):
             patch.object(db, "ml_close_action_finalization_guard", _ready_action_guard),
             patch.object(ml_close, "_tenant_token", AsyncMock(return_value="token")),
             patch.object(ml_close, "_get_status", AsyncMock(return_value=status)),
+            patch.object(
+                ml_close,
+                "_current_report_hash",
+                AsyncMock(return_value="current-v4-hash"),
+            ),
             patch.object(ml_close, "_open_ad_failures", AsyncMock(return_value=[])),
             patch.object(ml_close, "_upsert_status", AsyncMock(return_value={})),
             patch.object(
@@ -470,6 +477,7 @@ class ReportFormatRevisionTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "action": "ml_profit_ops_reject",
                     "period": PERIOD,
+                    "report_hash": "current-v4-hash",
                     "message_id": "om-current",
                     "operator_name": "运营", "operator_id": ml_close.ML_CLOSE_OPS_APPROVER_OPEN_ID,
                     "patch_message": False,

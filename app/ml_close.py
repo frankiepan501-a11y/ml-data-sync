@@ -1222,9 +1222,31 @@ def build_card(kind: str, summary: dict[str, Any], status_fields: dict[str, Any]
             )
             confirm_label = "确认最终核销数据"
         els.append({"tag": "div", "text": _md(explanation)})
+        ops_report_hash = _text(summary.get("report_hash"))
+        if not ops_report_hash:
+            els.append({
+                "tag": "div",
+                "text": _md(
+                    "**操作已暂停**：当前报表缺少版本指纹，系统未生成确认或退回按钮。"
+                ),
+            })
+            return card
+        ops_action_context = {"report_hash": ops_report_hash}
         els.append({"tag": "action", "actions": [
-            _button(confirm_label, action="ml_profit_ops_confirm", period=period, btn_type="primary"),
-            _button("发现问题，退回重算", action="ml_profit_ops_reject", period=period, btn_type="danger"),
+            _button(
+                confirm_label,
+                action="ml_profit_ops_confirm",
+                period=period,
+                btn_type="primary",
+                extra=ops_action_context,
+            ),
+            _button(
+                "发现问题，退回重算",
+                action="ml_profit_ops_reject",
+                period=period,
+                btn_type="danger",
+                extra=ops_action_context,
+            ),
         ]})
         return card
 
@@ -2250,6 +2272,8 @@ async def _confirm_action_impl(
     persistent_processing = False
     persistent_superseded = False
     tok: str | None = None
+    ops_card_report_hash = ""
+    ops_card_hash_enforced = False
 
     async def _blocked_confirmation(
         reason: str,
@@ -2392,6 +2416,27 @@ async def _confirm_action_impl(
             return await _blocked_confirmation(
                 "A/B 对账尚未完成，本次确认已拦截。"
             )
+        if action in {"ml_profit_ops_confirm", "ml_profit_ops_reject"}:
+            card_report_hash = _text(
+                payload.get("report_hash")
+                or (payload.get("value") or {}).get("report_hash")
+            )
+            ops_card_hash_enforced = bool(card_report_hash) or (
+                period == IDENTITY_RECOVERY_PERIOD
+            )
+            if ops_card_hash_enforced:
+                try:
+                    current_report_hash = await _current_report_hash(period, tok)
+                except Exception as exc:
+                    return await _blocked_confirmation(
+                        f"运营卡报表版本预检失败：{type(exc).__name__}"
+                    )
+                if not card_report_hash or card_report_hash != current_report_hash:
+                    return await _blocked_confirmation(
+                        "报表版本已变化或卡片未绑定当前版本；"
+                        "本次未改任何业务状态，请打开最新运营卡后再操作。"
+                    )
+                ops_card_report_hash = card_report_hash
         try:
             action_claim = await db.claim_ml_close_action(
                 period, action_key, action_owner
@@ -2476,6 +2521,20 @@ async def _confirm_action_impl(
                 "本月已由财务确认终稿，旧卡片不能取消或退回终稿。",
                 discard_claim=True,
             )
+        if action == "ml_profit_ops_reject" and ops_card_hash_enforced:
+            try:
+                reject_report_hash = await _current_report_hash(period, tok)
+            except Exception as exc:
+                return await _blocked_confirmation(
+                    f"运营退回版本复检失败：{type(exc).__name__}",
+                    discard_claim=True,
+                )
+            if reject_report_hash != ops_card_report_hash:
+                return await _blocked_confirmation(
+                    "退回前报表版本已变化，本次未取消或改写任何业务状态；"
+                    "请打开最新运营卡后再操作。",
+                    discard_claim=True,
+                )
         try:
             from app import unified_report
 
@@ -2665,6 +2724,20 @@ async def _confirm_action_impl(
         reason = _text(summary.get("last_error")) or "月结存在未解决异常，确认已拦截。"
         return await _blocked_confirmation(reason)
     approved_report_hash = _text(summary.get("report_hash"))
+    if (
+        action in {"ml_profit_ops_confirm", "ml_profit_ops_reject"}
+        and ops_card_hash_enforced
+        and approved_report_hash != ops_card_report_hash
+    ):
+        return await _blocked_confirmation(
+            "操作前报表内容已变化，当前卡片版本已失效；"
+            "本次未改任何业务状态，请打开最新运营卡后再操作。"
+        )
+    if (
+        action in {"ml_profit_ops_confirm", "ml_profit_ops_reject"}
+        and ops_card_hash_enforced
+    ):
+        approved_report_hash = ops_card_report_hash
     if action == "ml_profit_finance_operating_confirm":
         reviewed_hash = payload.get("review_source_hash") or (payload.get("value") or {}).get("review_source_hash")
         published_review = _last_result((await _get_status(period, tok) or {}).get("fields") or {})
@@ -2792,7 +2865,25 @@ async def _confirm_action_impl(
                         guard_fields = guard_status.get("fields") or {}
                         if _text(guard_fields.get("状态")) == "财务已确认终稿":
                             block_reason = "本月已由财务确认终稿，旧运营卡片不能退回终稿。"
-                        else:
+                        if not block_reason and ops_card_hash_enforced:
+                            try:
+                                reject_report_hash = await _current_report_hash(
+                                    period, tok
+                                )
+                            except Exception as exc:
+                                block_reason = (
+                                    "运营退回写入前版本复检失败："
+                                    f"{type(exc).__name__}"
+                                )
+                            if (
+                                not block_reason
+                                and reject_report_hash != ops_card_report_hash
+                            ):
+                                block_reason = (
+                                    "退回写入前报表版本已变化，"
+                                    "本次未改写业务状态；请打开最新运营卡后再操作。"
+                                )
+                        if not block_reason:
                             await _upsert_status(
                                 period,
                                 {

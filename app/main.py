@@ -120,6 +120,7 @@ def health():
         "ml_identity_recovery_preserves_v3_v1_20260915": True,
         "ml_identity_recovery_card_set_v1_20260915": True,
         "ml_identity_recovery_exact_time_v1_20260915": True,
+        "ml_ops_card_report_hash_binding_v1_20260915": True,
     }
 
 
