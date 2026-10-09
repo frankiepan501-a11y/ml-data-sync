@@ -137,6 +137,31 @@ def _file(name, token, modified_time):
 
 
 class CbtIngestPeriodSafetyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_full_fee_parser_includes_september_invoice_categories(self):
+        workbook = openpyxl.load_workbook(io.BytesIO(_bill_file("2026-09")))
+        sheet = workbook["REPORT"]
+        for detail, amount in (
+            ("Charge for exceeding space in Full", 1.76),
+            ("Refund for stock retrieval at Full", 0.47),
+            ("Charge for exceeding space in Full", -0.50),
+        ):
+            row = [None] * 31
+            row[3] = detail
+            row[7] = amount
+            sheet.append(row)
+
+        self.assertAlmostEqual(cbt_ingest._parse_storage(_xlsx_bytes(workbook)), 4.73)
+
+    async def test_full_fee_parser_blocks_unknown_full_charge(self):
+        workbook = openpyxl.load_workbook(io.BytesIO(_bill_file("2026-09")))
+        row = [None] * 31
+        row[3] = "New Full handling charge"
+        row[7] = 1.25
+        workbook["REPORT"].append(row)
+
+        with self.assertRaisesRegex(RuntimeError, "未知 Full 费用类型"):
+            cbt_ingest._parse_storage(_xlsx_bytes(workbook))
+
     async def test_bitable_read_failure_is_not_treated_as_an_empty_table(self):
         with patch.object(cbt_ingest.httpx, "AsyncClient", return_value=_ReadFailureClient()):
             with self.assertRaisesRegex(RuntimeError, "报表读取失败"):
