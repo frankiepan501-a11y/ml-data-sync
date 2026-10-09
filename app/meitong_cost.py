@@ -84,8 +84,10 @@ def _fs(url, data=None, method=None):
             _FS_TOK = _http("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
                             {"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET}, None, "POST").get("tenant_access_token")
             time.sleep(1); continue
+        if j.get('code') != 0:
+            raise RuntimeError(f"Feishu cost API failed code={j.get('code')} method={method or 'GET'}")
         return j
-    return j
+    raise RuntimeError('Feishu cost API token refresh failed')
 
 
 def _sheet(sid, rng):
@@ -121,14 +123,23 @@ def meitong_orders():
     if not tok:
         raise RuntimeError("美通登录失败")
     hdr = {"authorization": "Bearer " + tok, "api-key": "Bearer " + tok}
-    out, page = [], 1
+    out, page, expected = [], 1, None
     while True:
-        d = _http(MEITONG_BASE + "/v1/order/aafOrder/queryOrderByPage",
-                  {"orderType": "1", "pageNum": page, "pageSize": 100}, hdr, "POST").get("data", {})
-        out.extend(d.get("records", []))
-        if page >= d.get("pages", 1) or not d.get("records"):
+        response = _http(MEITONG_BASE + "/v1/order/aafOrder/queryOrderByPage",
+                  {"orderType": "1", "pageNum": page, "pageSize": 100}, hdr, "POST")
+        d = response.get('data')
+        if not isinstance(d, dict) or not isinstance(d.get('records'), list) or 'total' not in d or 'pages' not in d:
+            raise RuntimeError(f'美通订单响应失败或不完整 page={page}')
+        if expected is None:
+            expected = int(d['total'])
+        if int(d['total']) != expected or (not d['records'] and len(out) < expected):
+            raise RuntimeError(f'美通订单分页不完整 page={page}')
+        out.extend(d['records'])
+        if page >= int(d['pages']):
             break
         page += 1
+    if len(out) != expected:
+        raise RuntimeError(f'美通订单数量不一致 expected={expected} actual={len(out)}')
     return out
 
 
@@ -179,10 +190,19 @@ def _lx(path, biz):
 def load_erp():
     """领星 productList → (name2erp dict, sku_set)。"""
     name2erp, sku_set = {}, set()
-    off = 0
+    off, count, expected = 0, 0, None
     while True:
         r = _lx("/erp/sc/routing/data/local_inventory/productList", {"offset": off, "length": 200})
-        data = r.get("data") or []
+        if r.get('code') not in (0, '0') or not isinstance(r.get('data'), list) or 'total' not in r:
+            raise RuntimeError(f'领星产品成本源返回失败 code={r.get("code")} offset={off}')
+        data = r['data']
+        if expected is None:
+            expected = int(r['total'])
+        count += len(data)
+        if int(r['total']) != expected:
+            raise RuntimeError('领星产品分页总数发生变化')
+        if not data and off < int(r['total']):
+            raise RuntimeError(f'领星产品分页不完整 offset={off}')
         for p in data:
             sku = p.get("sku"); nm = (p.get("product_name") or "").strip()
             if sku:
@@ -193,6 +213,8 @@ def load_erp():
         if off + 200 >= tot or not data:
             break
         off += 200
+    if count != expected:
+        raise RuntimeError(f'领星产品数量不完整 expected={expected} actual={count}')
     return name2erp, sku_set
 
 
@@ -644,7 +666,7 @@ def diag(period="month_2026-05", months=12):
 
     unit = build_unit(months)
     # ML 期间行 (LIST API, 同 run: search 会丢行)
-    recs, pt = [], None
+    recs, pt, seen_pages = [], None, set()
     while True:
         url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{ML_APP}/tables/{ML_T}/records?page_size=500" + (f"&page_token={pt}" if pt else "")
         dd = _fs(url, None, "GET").get("data", {})
@@ -685,7 +707,7 @@ def run(period, months=12, commit=False):
     """灌 period(如 month_2026-04) 的美通中转 头程/海外仓成本。commit=False 只预览。"""
     unit = build_unit(months)
     # 🚨 用 LIST API 不用 search: search 无排序分页会丢行/封顶(铁律, 实测漏 TZ03 巴西行致未灌成本)。
-    recs, pt = [], None
+    recs, pt, seen_pages = [], None, set()
     while True:
         url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{ML_APP}/tables/{ML_T}/records?page_size=500" + (f"&page_token={pt}" if pt else "")
         d = _fs(url, None, "GET").get("data", {})
@@ -693,7 +715,18 @@ def run(period, months=12, commit=False):
         pt = d.get("page_token")
         if not d.get("has_more"):
             break
+        if not pt or pt in seen_pages:
+            raise RuntimeError('成本源表分页重复或缺少下一页')
+        seen_pages.add(pt)
     rows = [r for r in recs if _txt(r["fields"].get("周期")) == period]
+    backup = None
+    if commit:
+        from pathlib import Path
+        from app import db
+        import uuid
+        backup = Path(db.DB_PATH).parent / 'cost-backups' / f'{uuid.uuid4().hex}.json'
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        backup.write_text(json.dumps({'period': period, 'rows': rows}, ensure_ascii=False), encoding='utf-8')
     # ML 后台 seller_sku → 领星 ERP SKU(俊辉确认的 CBT 定制 listing 别名, 如 MXCFFLFFSCP-TOTK→FF01A-04),
     # 与主 sync 同源, 否则 unit 按 ERP 键、ML 行按 seller_sku 键, 永远匹配不上。
     try:
@@ -701,6 +734,7 @@ def run(period, months=12, commit=False):
     except Exception:
         _ml_alias = lambda s: s
     written, blank, mh, mo, detail, fb_cache, fb_written = 0, 0, 0.0, 0.0, [], {}, 0
+    expected = {}
     for r in rows:
         f = r["fields"]
         # 🚨 按店铺路由平台: 墨西哥美客多(CBT/本土)→"美客多"(美通+墨客多); 巴西店(AIRSOFT)→"美客多巴西"(三沐)。
@@ -717,13 +751,40 @@ def run(period, months=12, commit=False):
         mh += hc; mo += oc
         if used_months != months:
             fb_written += 1
-        detail.append({"sku": sku, "qty": qty, "head": hc, "ovs": oc, "cost_window_months": used_months})
+        detail.append({"record_id": r['record_id'], "store": store, "sku": sku, "qty": qty, "head": hc, "ovs": oc, "cost_window_months": used_months})
         if commit:
             _fs(f"https://open.feishu.cn/open-apis/bitable/v1/apps/{ML_APP}/tables/{ML_T}/records/{r['record_id']}",
                 {"fields": {F_HEAD: hc, F_OVS: oc}}, "PUT")
+            expected[r['record_id']] = (hc, oc)
         written += 1
     unit_keys = set(unit.keys()) | set((fb_cache.get("unit") or {}).keys())
+    verified = 0
+    if commit:
+        pt, seen = None, set()
+        while True:
+            url = f'https://open.feishu.cn/open-apis/bitable/v1/apps/{ML_APP}/tables/{ML_T}/records?page_size=500'
+            if pt:
+                url += '&page_token=' + pt
+            payload = _fs(url, None, 'GET')['data']
+            for record in payload.get('items', []):
+                rid = record['record_id']
+                if rid not in expected:
+                    continue
+                f = record['fields']
+                actual = (_num(f.get(F_HEAD)), _num(f.get(F_OVS)))
+                if _txt(f.get('周期')) != period or any(abs(a-b)>0.01 for a,b in zip(actual, expected[rid])):
+                    raise RuntimeError(f'Cost readback mismatch record_id={rid}')
+                verified += 1
+            if not payload.get('has_more'):
+                break
+            pt = payload.get('page_token')
+            if not pt or pt in seen:
+                raise RuntimeError('Cost readback pagination failed')
+            seen.add(pt)
+        if verified != written:
+            raise RuntimeError(f'Cost readback missing rows expected={written} actual={verified}')
     return {"period": period, "months": months, "committed": commit, "rows_in_period": len(rows),
+            "rows_verified": verified, "backup_file": str(backup) if backup else None,
             "meitong_skus": len(unit_keys), "fallback_months": fb_cache.get("months"), "fallback_written": fb_written,
             "written": written, "blank_non_meitong": blank,
             "head_total": round(mh, 2), "ovs_total": round(mo, 2), "detail": detail}

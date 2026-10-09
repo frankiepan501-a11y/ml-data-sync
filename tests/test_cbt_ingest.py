@@ -137,6 +137,23 @@ def _file(name, token, modified_time):
 
 
 class CbtIngestPeriodSafetyTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        import tempfile
+        from pathlib import Path
+        from app import db
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        p=patch.object(db,'DB_PATH',str(Path(self.temp.name)/'test.db'))
+        p.start(); self.addCleanup(p.stop)
+        await db.init_db()
+
+    def setUp(self):
+        self.fx_patch = patch.object(cbt_ingest.lingxing, 'fetch_fx_rate', AsyncMock(return_value={'USD': 6.8628}))
+        self.fx_patch.start()
+        self.addCleanup(self.fx_patch.stop)
+        self.invalidate_patch = patch.object(ml_close, 'invalidate_ab_verification', AsyncMock())
+        self.invalidate_patch.start()
+        self.addCleanup(self.invalidate_patch.stop)
     async def test_full_fee_parser_includes_september_invoice_categories(self):
         workbook = openpyxl.load_workbook(io.BytesIO(_bill_file("2026-09")))
         sheet = workbook["REPORT"]
@@ -277,7 +294,7 @@ class CbtIngestPeriodSafetyTests(unittest.IsolatedAsyncioTestCase):
                 await main.cbt_ingest(month="2026-08", commit=True)
 
         self.assertEqual(raised.exception.status_code, 422)
-        invalidate.assert_awaited_once_with("month_2026-08", "cbt_ingest")
+        invalidate.assert_not_awaited()
         self.assertIn("wrong month", str(raised.exception.detail))
 
     async def test_commit_archives_entire_old_scope_and_preserves_stale_skus(self):

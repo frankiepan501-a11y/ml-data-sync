@@ -96,6 +96,7 @@ def health():
         "ml_month_shipping_complete_20260908": True,
         "ml_shipping_fixed_site_currency_20260908": True,
         "ml_month_billing_adjustments_20260908": True,
+        "ml_september_monthly_receipts_20261009": True,
         "ml_billing_first_page_cursor_20260908": True,
         "ml_billing_remaining_total_20260908": True,
         "ml_billing_failure_cause_visible_20260908": True,
@@ -730,10 +731,26 @@ async def cbt_pnl_api(seller_id: int, month: str, parent_user_id: int = 15025208
 
 
 @app.post("/report/cbt-ingest", dependencies=[Depends(require_service_token)])
-async def cbt_ingest(month: str, commit: bool = False, fx: float = 6.8628,
+async def cbt_ingest(month: str, commit: bool = False, fx: float | None = None,
                      folder_token: str | None = None,
                      preserve_existing_as: str | None = None,
-                     finalize: bool = False):
+                     finalize: bool = False, nowait: bool = False,
+                     automatic: bool = False, background_tasks: BackgroundTasks = None):
+    from app import monthly_jobs
+    if automatic and not nowait:
+        raise HTTPException(400, '自动写入必须使用 nowait=true 并核验最终结果')
+    runner = lambda: _cbt_ingest_impl(month, commit, fx, folder_token, preserve_existing_as, finalize)
+    if nowait:
+        if finalize:
+            raise HTTPException(400, '后台导入不允许自动确认 A/B 或放行')
+        return await monthly_jobs.start(background_tasks, f'month_{month}', 'cbt_ingest', commit, automatic, runner)
+    if commit:
+        return await monthly_jobs.inline(f'month_{month}', 'cbt_ingest', runner)
+    return await runner()
+
+
+async def _cbt_ingest_impl(month, commit=False, fx=None, folder_token=None,
+                         preserve_existing_as=None, finalize=False):
     """CBT-FULL 官方导出(B)解析 → 按SKU update 飞书报表(task3云化, 2026-06-18).
     俊辉每月把3导出(Orders+账单+广告)传飞书云盘文件夹(env CBT_EXPORT_FOLDER_TOKEN), 本端点下载解析.
     month 必须显式传入. 默认 commit=false dry-run; commit=true 才写飞书。
@@ -742,9 +759,6 @@ async def cbt_ingest(month: str, commit: bool = False, fx: float = 6.8628,
     import traceback
     from app import cbt_ingest as _ci
     try:
-        if commit:
-            from app import ml_close
-            await ml_close.invalidate_ab_verification(f"month_{month}", "cbt_ingest")
         result = await _ci.run(
             month,
             commit=commit,
@@ -1301,7 +1315,21 @@ async def procurement_ml_stock(skus: str):
 
 
 @app.post("/report/sync-meitong-cost", dependencies=[Depends(require_service_token)])
-async def sync_meitong_cost(period: str, months: int = 12, commit: bool = False):
+async def sync_meitong_cost(period: str, months: int = 12, commit: bool = False,
+                            nowait: bool = False, automatic: bool = False,
+                            background_tasks: BackgroundTasks = None):
+    from app import monthly_jobs
+    if automatic and not nowait:
+        raise HTTPException(400, '自动成本写入必须使用 nowait=true 并核验最终结果')
+    runner = lambda: _sync_meitong_cost_impl(period, months, commit)
+    if nowait:
+        return await monthly_jobs.start(background_tasks, period, 'cost', commit, automatic, runner)
+    if commit:
+        return await monthly_jobs.inline(period, 'cost', runner)
+    return await runner()
+
+
+async def _sync_meitong_cost_impl(period, months=12, commit=False):
     """美通中转 头程/海外仓成本 → ML报表两列(方案A: 只灌经美通中转SKU, 其余留空)。
     源: 美通订单API(头程=收费重×费率快照) + 指令明细(海外仓=换标箱数×单箱费快照), 不碰美通账单。
     period 如 month_2026-04; months=单价滚动窗口(默认12); commit=False 只预览不写。
@@ -1314,7 +1342,7 @@ async def sync_meitong_cost(period: str, months: int = 12, commit: bool = False)
         result = await run_in_threadpool(meitong_cost.run, period, months, commit)
         if result.get("status") == "error":
             raise HTTPException(status_code=502, detail=result)
-        return result
+        return {"status": "ok", **result}
     except HTTPException:
         raise
     except Exception as e:
@@ -1346,11 +1374,27 @@ async def ml_close_audit(month: str | None = None, period: str | None = None,
 
 @app.post("/report/ml-close/recalc-cost", dependencies=[Depends(require_service_token)])
 async def ml_close_recalc_cost(month: str | None = None, period: str | None = None,
-                               commit: bool = True, ab_verified: bool | None = None):
+                               commit: bool = True, ab_verified: bool | None = None,
+                               nowait: bool = False, automatic: bool = False,
+                               background_tasks: BackgroundTasks = None):
     """Recalculate Meitong/Mokeduo/Sanmu cost, then run close audit."""
     import traceback
     from app import ml_close
     try:
+        if automatic and not nowait:
+            raise HTTPException(400, '自动重算必须使用 nowait=true 并核验最终结果')
+        if nowait:
+            from app import monthly_jobs
+            normalized_period, _ = ml_close.normalize_period(month, period)
+            return await monthly_jobs.start(background_tasks, normalized_period, 'cost', commit, automatic,
+                lambda: ml_close.recalc_cost(month=month, period=period, commit=commit,
+                                             audit_commit=commit, ab_verified=ab_verified))
+        if commit:
+            from app import monthly_jobs
+            normalized_period, _ = ml_close.normalize_period(month, period)
+            return await monthly_jobs.inline(normalized_period, 'cost',
+                lambda: ml_close.recalc_cost(month=month, period=period, commit=True,
+                                             ab_verified=ab_verified))
         return await ml_close.recalc_cost(
             month=month,
             period=period,
@@ -1452,7 +1496,8 @@ async def ml_close_confirm(req: Request, action: str | None = None, month: str |
 
 @app.post("/report/ml-unified-monthly", dependencies=[Depends(require_service_token)])
 async def ml_unified_monthly(month: str | None = None, period: str | None = None,
-                             commit: bool = False, close_mode: str = "final"):
+                             commit: bool = False, close_mode: str = "final",
+                             nowait: bool = False, background_tasks: BackgroundTasks = None):
     """Preview or replay the finance-approved 47-column ML monthly report.
 
     Preview is read-only. Direct commit is allowed only for an already finance-confirmed
@@ -1461,8 +1506,14 @@ async def ml_unified_monthly(month: str | None = None, period: str | None = None
     from app import ml_close, unified_report
 
     normalized_period, _ = ml_close.normalize_period(month, period)
-    if close_mode not in ("final", "operating"):
-        raise HTTPException(400, "close_mode 只支持 final 或 operating")
+    if close_mode not in ("final", "operating", "review"):
+        raise HTTPException(400, "close_mode 只支持 final、operating 或 review")
+    if nowait:
+        if close_mode != 'review':
+            raise HTTPException(400, '后台生成只支持未放行审核版')
+        from app import monthly_jobs
+        return await monthly_jobs.start(background_tasks, normalized_period, 'review', commit, False,
+            lambda: ml_unified_monthly(month, period, commit, close_mode))
     approved_report_hash = ""
     if commit:
         # Recompute the report hash from the live Base.  The status row alone
@@ -1481,7 +1532,7 @@ async def ml_unified_monthly(month: str | None = None, period: str | None = None
                     409,
                     f"{normalized_period} 尚未完成当前报表版本的 A/B 与财务终稿确认；只允许 commit=false 预览。",
                 )
-        else:
+        elif close_mode == 'operating':
             gate = await ml_close.status_endpoint(period=normalized_period)
             operating_hash = str(gate.get("operating_report_hash") or "")
             if (
@@ -1493,6 +1544,8 @@ async def ml_unified_monthly(month: str | None = None, period: str | None = None
                     409,
                     f"{normalized_period} 尚未冻结当前版本的经营暂结；只允许 commit=false 预览。",
                 )
+        elif not close_status.get('operating_ready'):
+            raise HTTPException(409, '三店来源或成本仍有硬缺口，不能生成审核版')
         approved_report_hash = str(close_status.get("report_hash") or "")
     try:
         generate_kwargs = {
@@ -1962,26 +2015,27 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, background_task
                                      period_label: str = "", nowait: bool = False,
                                      commit: bool = True,
                                      preserve_existing_as: str = "",
-                                     logistics_source_period: str = ""):
+                                     logistics_source_period: str = "", automatic: bool = False):
     """Dispatcher. nowait=true → schedule aggregation in background, return 202 immediately
     (avoids Zeabur gateway ~150s connection reset on heavy sellers like CBT-FULL 1502236229,
     which made the monthly cron 9ZvARULB0wIp19yp false-alarm even though data lands fine).
     Default nowait=false → synchronous; behavior unchanged for every existing caller."""
     if seller_id not in SHOP_LABEL:
         raise HTTPException(400, f"unknown seller_id {seller_id}; allowed: {list(SHOP_LABEL.keys())}")
+    if automatic and not nowait:
+        raise HTTPException(400, '自动源数据写入必须使用 nowait=true 并核验最终结果')
     if nowait:
-        background_tasks.add_task(
-            _logged_monthly_background_sync,
-            seller_id,
-            month,
-            period_label,
-            commit,
-            preserve_existing_as,
-            logistics_source_period,
+        from app import monthly_jobs
+        return await monthly_jobs.start(
+            background_tasks, period_label or f'month_{month}', 'local_sync', commit, automatic,
+            lambda: _sync_feishu_monthly_impl(seller_id, month, period_label, commit,
+                                            preserve_existing_as, logistics_source_period),
         )
-        return {"status": "accepted", "mode": "background", "seller_id": seller_id, "month": month,
-                "commit": commit,
-                "note": "Aggregation runs in background; verify via Feishu 数据拉取时间 in ~3-5min."}
+    if commit:
+        from app import monthly_jobs
+        return await monthly_jobs.inline(period_label or f'month_{month}', 'local_sync',
+            lambda: _sync_feishu_monthly_impl(seller_id, month, period_label, commit,
+                                            preserve_existing_as, logistics_source_period))
     result = await _sync_feishu_monthly_impl(
         seller_id, month, period_label, commit, preserve_existing_as,
         logistics_source_period,
@@ -1992,6 +2046,15 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, background_task
             f"monthly sync blocked seller={seller_id} month={month} status={result.get('status')}",
         )
     return result
+
+
+@app.get('/report/monthly-result/{job_id}', dependencies=[Depends(require_service_token)])
+async def monthly_result(job_id: str):
+    from app import monthly_jobs
+    try:
+        return monthly_jobs.read(job_id)
+    except (ValueError, FileNotFoundError):
+        raise HTTPException(404, 'monthly job not found')
 
 
 async def _logged_monthly_background_sync(*args: object) -> None:
@@ -2100,7 +2163,7 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
         o_paid = float(od.get("paid_amount") or 0)
         o_total = float(od.get("total_amount") or 0)
         buyer_to_seller_ratio = 1.0
-        if o_total > 0 and o_paid > 0 and abs(o_paid - o_total) / o_total > 0.05:
+        if seller_id == 1502236229 and o_total > 0 and o_paid > 0 and abs(o_paid - o_total) / o_total > 0.05:
             buyer_to_seller_ratio = o_paid / o_total
         for item in (od.get("order_items") or []):
             it = item.get("item") or {}
@@ -2146,6 +2209,9 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
             if dc:
                 cell["first_seen"] = min(cell["first_seen"] or dc, dc)
                 cell["last_seen"] = max(cell["last_seen"] or dc, dc)
+        # Refund allocation is independent of whether ML supplies a shipment.
+        if order_id:
+            order_to_sku[order_id] = order_items_skus
         # Shipment id (for shipping cost lookup)
         ship = od.get("shipping") or {}
         sid = ship.get("id")
@@ -2157,6 +2223,8 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
         # Refund total (sum across payments)
         refunded = 0.0
         for p in (od.get("payments") or []):
+            if float(p.get("transaction_amount_refunded") or 0) and p.get("currency_id") != od.get("currency_id"):
+                raise HTTPException(422, f"退款币种与订单不一致或缺失 order={order_id}；未写入")
             refunded += float(p.get("transaction_amount_refunded") or 0)
         if refunded > 0 and order_id:
             refunds_by_order[order_id] = refunded
@@ -2166,9 +2234,9 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
             # (MXN), NOT seller USD — biggest deduction risk ~17x. Observed count is
             # currently 0; warn loudly so we catch the first one and add FX conversion
             # before trusting refund_total. (Frankie decision: keep formula as-is + warn)
-            print(f"[WARN] P2.4 non-cancelled refund: order={order_id} seller={seller_id} "
+            print(f"[INFO] verified native refund currency: order={order_id} seller={seller_id} "
                   f"status={od.get('status')} refunded={refunded} order_cur={od.get('currency_id')} "
-                  f"— verify currency (CBT refunded=MXN buyer ccy) before trusting refund_total")
+                  f"payment currency matched; physical return quantity not inferred")
 
     order_shipments = list(shipment_keys.values())
     rows = sorted(by_sku.values(), key=lambda x: x["revenue_total"], reverse=True)
@@ -2241,7 +2309,7 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
     # from the orders and Product Ads occurrence APIs. Pull them separately and
     # fail closed: treating a temporary billing failure as zero overstates profit.
     try:
-        billing_adjustments = await billing.fetch_month_adjustments(seller_id, month)
+        billing_adjustments = await billing.fetch_month_adjustments(seller_id, month, cache=True)
     except Exception as e:
         print(
             f"[ERROR] billing adjustments fetch failed: seller_id={seller_id} month={month} "
@@ -2339,7 +2407,7 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
             share = refund_amt * (u / total_units)
             if sku in by_sku:
                 by_sku[sku]["refund_total"] = by_sku[sku].get("refund_total", 0) + share
-                by_sku[sku]["refund_units"] = by_sku[sku].get("refund_units", 0) + u  # treat fully refunded as fully returned units
+                # A monetary refund does not establish a physical return.
 
     # VAT rate by site_id (from any cached order's currency context: MLM/MLB/CBT)
     # Use first cached row to infer site_id; CBT uses USD revenue but seller site is CBT
@@ -2377,7 +2445,7 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
         # P2.5: seller-funded discount (already converted to seller currency in order loop)
         discount_local = r.get("discount_total") or 0
         refund_units = int(r.get("refund_units") or 0)
-        refund_rate = (refund_units / r["units"]) if r["units"] else 0
+        refund_rate = (refund_local / rev) if rev else 0
         # Phase B1.3: pull full ad metrics dict for this SKU
         ad_m = ad_sku_metrics.get(r["sku"], {})
         ad_cost_local = ad_m.get("cost", 0.0)
@@ -2571,6 +2639,11 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
             "VAT估算(原币)",
             "VAT估算(RMB)",
             float(billing_adjustments.get("tax_adjustments") or 0),
+        ),
+        "_shipping_adjustments": (
+            "已核实原费的跨月运费返还（原账单70083277162）",
+            "物流费(原币)", "物流费(RMB)",
+            float(billing_adjustments.get('shipping_adjustments') or 0),
         ),
     }
     for synthetic_sku, (title, local_field, rmb_field, local_value) in billing_values.items():
@@ -2891,6 +2964,10 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
                 ("退款金额(原币)", refund_total_local_value),
                 ("退款金额(RMB)", refund_total_rmb_value),
             ]
+            if abs(float(billing_adjustments.get('shipping_adjustments') or 0)) > 0.000001:
+                for field in ('物流费(原币)', '物流费(RMB)'):
+                    financial_expectations.append((field, round(sum(
+                        float((record.get('fields') or {}).get(field) or 0) for record in records),2)))
             if abs(float(billing_adjustments.get("other_platform_fees") or 0)) > 0.000001:
                 financial_expectations.extend([
                     ("ML佣金(原币)", commission_total_local_value),

@@ -1,14 +1,23 @@
 import copy
 import unittest
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from fastapi import BackgroundTasks, HTTPException
 
-from app import main, ml_close
+from app import main, ml_close, db
 
 
 class MonthBackfillTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        p=patch.object(db,'DB_PATH',str(Path(self.temp.name)/'test.db'))
+        p.start(); self.addCleanup(p.stop)
+        await db.init_db()
+
     def test_sales_date_uses_site_local_date_closed(self):
         order = {"id": 101, "date_closed": "2026-08-31T23:31:40.000-04:00"}
 

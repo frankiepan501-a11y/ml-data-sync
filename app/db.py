@@ -559,7 +559,8 @@ async def claim_ml_close_month_work(
         active = bool(
             current
             and current["status"] == "processing"
-            and int(current["updated_at"] or 0) > now - stale_after_seconds
+            and (str(current['kind']).startswith('monthly_')
+                 or int(current["updated_at"] or 0) > now - stale_after_seconds)
         )
         if active:
             await conn.commit()
@@ -608,7 +609,8 @@ async def get_active_ml_close_month_work(
         current = dict(row)
         if (
             current["status"] == "processing"
-            and int(current["updated_at"] or 0) > now - stale_after_seconds
+            and (str(current['kind']).startswith('monthly_')
+                 or int(current["updated_at"] or 0) > now - stale_after_seconds)
         ):
             return current
         return None

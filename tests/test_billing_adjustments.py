@@ -5,7 +5,7 @@ from app import billing
 
 
 class BillingAdjustmentTests(unittest.TestCase):
-    def test_september_brazil_tax_is_classified_but_prior_month_shipping_bonus_stays_blocked(self):
+    def test_september_brazil_tax_and_verified_prior_shipping_credit(self):
         def row(detail_id, created, subtype, amount, detail_type, **extra):
             return {
                 "charge_info": {
@@ -36,10 +36,9 @@ class BillingAdjustmentTests(unittest.TestCase):
 
         result = billing.summarize_month_details(details, "2026-09", default_currency="BRL")
 
-        self.assertEqual(1, result["unclassified_count"])
+        self.assertEqual(0, result["unclassified_count"])
         self.assertEqual(8.46, result["tax_adjustments"])
-        self.assertEqual(-14.45, result["unclassified_amount"])
-        self.assertEqual(70838835146, result["unclassified"][0]["detail_id"])
+        self.assertEqual(-14.45, result['shipping_adjustments'])
 
     def test_unlinked_shipping_bonus_stays_blocked(self):
         detail = {
@@ -244,7 +243,8 @@ class BillingAdjustmentTests(unittest.TestCase):
         result = billing.summarize_month_details(details, "2026-08")
 
         self.assertEqual(0, result["unclassified_count"])
-        self.assertEqual(14.7, result["other_platform_fees"])
+        self.assertEqual(13.0, result["other_platform_fees"])
+        self.assertEqual(1.7, result['order_payment_fees_ignored'])
         self.assertEqual(3.0, result["return_fees"])
         self.assertEqual(12.0, result["full_fees"])
 
@@ -291,6 +291,8 @@ class BillingFetchTests(unittest.IsolatedAsyncioTestCase):
             }]},
             {"total": 0, "results": []},
             {"total": 1, "results": [full_row], "last_id": 21},
+            {"total": 0, "results": []},
+            {"total": 0, "results": []},
         ]
         getter = AsyncMock(side_effect=responses)
 
@@ -330,6 +332,8 @@ class BillingFetchTests(unittest.IsolatedAsyncioTestCase):
             {"total": 3, "results": [row(1), row(2)], "last_id": 2},
             {"total": 1, "results": [row(3)], "last_id": 3},
             {"total": 0, "results": []},
+            {"total": 0, "results": []},
+            {"total": 0, "results": []},
         ])
 
         with (
@@ -360,6 +364,8 @@ class BillingFetchTests(unittest.IsolatedAsyncioTestCase):
             {"total": 3, "results": [row(1), row(2)], "last_id": 2},
             {"total": 200, "results": [row(3)], "last_id": 3},
             {"total": 1, "results": [row(3)], "last_id": 3},
+            {"total": 0, "results": []},
+            {"total": 0, "results": []},
             {"total": 0, "results": []},
         ])
         with (

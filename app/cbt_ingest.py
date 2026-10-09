@@ -325,7 +325,7 @@ async def _ensure_full_field(tok: str):
             raise RuntimeError(f"CBT 飞书缺少必需字段 {F_FULL}；未写入数据")
 
 
-async def run(month: str, commit: bool = False, fx: float = 6.8628,
+async def run(month: str, commit: bool = False, fx: float | None = None,
               folder_token: str | None = None,
               preserve_existing_as: str | None = None) -> dict:
     folder_token = folder_token or os.getenv("CBT_EXPORT_FOLDER_TOKEN", "")
@@ -354,6 +354,11 @@ async def run(month: str, commit: bool = False, fx: float = 6.8628,
             "file_validations": validations,
         }
 
+    if fx is None:
+        fx = (await lingxing.fetch_fx_rate(month)).get("USD")
+    if fx is None or not math.isfinite(float(fx)) or float(fx) <= 0:
+        raise RuntimeError(f"CBT {month} USD 月汇率缺失或无效；未写入")
+    fx = float(fx)
     agg, l2s = _parse_orders(ord_data, month)
     ad_sku, ad_total, ad_unmatched = _parse_ads(ad_data, l2s)
     storage_total = _parse_storage(bill_data)
@@ -536,6 +541,8 @@ async def run(month: str, commit: bool = False, fx: float = 6.8628,
         if _scope(all_items, preserve_existing_as):
             raise RuntimeError(f"CBT 旧版证据周期已存在：{preserve_existing_as}；未修改任何数据")
 
+    from app import ml_close
+    await ml_close.invalidate_ab_verification(period, "cbt_ingest")
     async with httpx.AsyncClient(timeout=60) as c:
         H = {"Authorization": f"Bearer {tok}", "Content-Type": "application/json"}
         create_url = f"{FEISHU}/bitable/v1/apps/{APP_TOKEN}/tables/{TABLE_ID}/records/batch_create"

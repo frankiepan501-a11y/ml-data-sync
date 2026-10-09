@@ -11,6 +11,11 @@ from __future__ import annotations
 import asyncio
 from datetime import date
 import math
+import json
+import os
+import time
+import uuid
+from pathlib import Path
 import unicodedata
 
 import httpx
@@ -79,7 +84,10 @@ def summarize_month_details(
         "return_fees": 0.0,
         "other_platform_fees": 0.0,
         "tax_adjustments": 0.0,
+        "shipping_adjustments": 0.0,
         "product_ads_ignored": 0.0,
+        "order_payment_fees_ignored": 0.0,
+        "buyer_financing_ignored": 0.0,
     }
     currencies: set[str] = set()
     relevant_count = 0
@@ -130,7 +138,13 @@ def summarize_month_details(
             )
         ):
             continue
-        if subtype == "PADS" or "product ads" in label:
+        if (default_currency == 'BRL' or (detail.get('currency_info') or {}).get('currency_id') == 'BRL') and subtype in {'CVVPRC','BVVPRC','CVVFNU','BVVFNU'}:
+            # Native /orders.sale_fee already contains these payment components.
+            bucket = 'order_payment_fees_ignored'
+        elif (default_currency == 'BRL' or (detail.get('currency_info') or {}).get('currency_id') == 'BRL') and subtype in {'CFONPN','BFONPN'}:
+            # Buyer-financed price addition and its reversal are not seller cost.
+            bucket = 'buyer_financing_ignored'
+        elif subtype == "PADS" or "product ads" in label:
             bucket = "product_ads_ignored"
         elif subtype == "CDIFAL" and str(charge.get("detail_type") or "").upper() == "CHARGE" and (
             str(charge.get("debited_from_operation") or "").upper() == "NO"
@@ -139,9 +153,16 @@ def summarize_month_details(
             # Separate ICMS-DIFAL bill: not debited from an order and not present
             # in order/shipment detail. Keep it in a tax field, not commission.
             bucket = "tax_adjustments"
-        # A BFFI credit reversing a prior CFFI charge is not enough evidence
-        # to book September profit: the original may never have entered August.
-        # Keep the credit unclassified until the prior report is reconciled.
+        elif (month == '2026-09' and detail_id == 70838835146 and subtype == 'BFFI'
+              and str(charge.get('detail_type')).upper() == 'BONUS'
+              and str(charge.get('charge_bonified_id')) == '70083277162'
+              and str((detail.get('shipping_info') or {}).get('shipping_id')) == '47877948646'
+              and str((detail.get('shipping_info') or {}).get('pack_id')) == '2000014751989369'
+              and ((detail.get('currency_info') or {}).get('currency_id') or default_currency) == 'BRL'
+              and math.isclose(abs(amount), 14.45, abs_tol=0.001)):
+            # Single verified replay, not a blanket BFFI rule. Prior expense
+            # evidence and retained August scope: docs/repairs/2026-10-09-september-system.md.
+            bucket = 'shipping_adjustments'
         elif subtype in {"CDLIT", "BDLIT"} or "display ads" in label:
             bucket = "display_ads"
         elif subtype == "CFRS" and (
@@ -188,7 +209,7 @@ def summarize_month_details(
             raise ValueError(f"billing detail missing currency detail_id={detail_id}")
         currencies.add(currency)
         totals[bucket] += signed_amount
-        if bucket != "product_ads_ignored":
+        if bucket not in {'product_ads_ignored','order_payment_fees_ignored','buyer_financing_ignored'}:
             relevant_count += 1
 
     if len(currencies) > 1:
@@ -225,7 +246,8 @@ async def _get_json(client: httpx.AsyncClient, url: str, headers: dict, params: 
                 retry_after = float(raw_retry_after) if raw_retry_after else retry_delays[attempt]
             except ValueError:
                 retry_after = retry_delays[attempt]
-            await asyncio.sleep(max(retry_after, retry_delays[attempt] if not raw_retry_after else 0.0))
+            floor = 60.0 if response.status_code == 429 and not raw_retry_after else 0.0
+            await asyncio.sleep(max(retry_after, floor, retry_delays[attempt] if not raw_retry_after else 0.0))
             continue
         try:
             error_payload = response.json()
@@ -270,7 +292,37 @@ def _periods_cover_month(periods: list[dict], month: str) -> list[dict]:
     return overlapping
 
 
-async def fetch_month_adjustments(seller_id: int, month: str) -> dict:
+async def fetch_month_adjustments(seller_id: int, month: str, cache: bool = False) -> dict:
+    _month_bounds(month)
+    if not cache:
+        return await _fetch_month_adjustments(seller_id, month)
+    path = Path(db.DB_PATH).parent / 'billing-month-cache' / f'{int(seller_id)}-{month}.json'
+    if path.exists() and time.time() - path.stat().st_mtime < 3600:
+        payload = json.loads(path.read_text(encoding='utf-8'))
+        result = summarize_month_details(payload['details'], month, payload['currency'])
+        return {**result, **payload['metadata'], 'cache_hit': True, 'captured_at': payload['captured_at']}
+    for attempt in range(2):
+        try:
+            result = await _fetch_month_adjustments(seller_id, month, retain_details=True, request_gap=25)
+            break
+        except RuntimeError as exc:
+            if attempt or 'remaining total mismatch' not in str(exc):
+                raise
+            # Discard the entire inconsistent read; never join two snapshots.
+            await asyncio.sleep(10)
+    details = result.pop('_details')
+    captured = int(time.time())
+    payload = {'details': details, 'currency': result['currency'], 'captured_at': captured,
+               'metadata': {k:result[k] for k in ('seller_id','month','period_keys','raw_details','raw_full_details')}}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(f'.{uuid.uuid4().hex}.tmp')
+    temp.write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
+    os.replace(temp, path)
+    return {**result, 'cache_hit': False, 'captured_at': captured}
+
+
+async def _fetch_month_adjustments(seller_id: int, month: str, retain_details: bool = False,
+                                  request_gap: float = 0) -> dict:
     """Fetch current billing pages and return classified natural-month charges."""
     token = await db.get_token(seller_id)
     if not token or not token.get("access_token"):
@@ -293,13 +345,17 @@ async def fetch_month_adjustments(seller_id: int, month: str) -> dict:
             if not key:
                 raise RuntimeError("billing period missing key")
             period_keys.append(key)
-            for endpoint_suffix in ("details", "full/details"):
+            for document_type, endpoint_suffix in (
+                ('BILL','details'), ('BILL','full/details'),
+                ('CREDIT_NOTE','details'), ('CREDIT_NOTE','full/details'),
+            ):
                 from_id = 0
                 fetched = 0
                 expected_total = None
+                seen_ids = set()
                 while True:
                     page_params = {
-                        "document_type": "BILL",
+                        "document_type": document_type,
                         "limit": 1000,
                         "sort_by": "ID",
                         "order_by": "ASC",
@@ -313,6 +369,8 @@ async def fetch_month_adjustments(seller_id: int, month: str) -> dict:
                     # count snapshot. Retry the SAME cursor before treating the
                     # report as incomplete; never consume a mismatched page.
                     for consistency_attempt in range(3):
+                        if request_gap:
+                            await asyncio.sleep(request_gap)
                         payload = await _get_json(
                             client,
                             f"{base}/billing/integration/periods/key/{key}/group/ML/{endpoint_suffix}",
@@ -336,6 +394,12 @@ async def fetch_month_adjustments(seller_id: int, month: str) -> dict:
                     page = payload.get("results") or []
                     if expected_total is None:
                         expected_total = total
+                    ids = [int((row.get('charge_info') or {}).get('detail_id')) for row in page]
+                    if len(ids) != len(set(ids)) or seen_ids.intersection(ids):
+                        raise RuntimeError(f'billing duplicate detail ids key={key}')
+                    if fetched + len(page) > expected_total:
+                        raise RuntimeError(f'billing over-count key={key}')
+                    seen_ids.update(ids)
                     all_details.extend(page)
                     if endpoint_suffix == "full/details":
                         raw_full_details += len(page)
@@ -363,4 +427,6 @@ async def fetch_month_adjustments(seller_id: int, month: str) -> dict:
         "raw_details": len(all_details),
         "raw_full_details": raw_full_details,
     })
+    if retain_details:
+        result['_details'] = all_details
     return result
