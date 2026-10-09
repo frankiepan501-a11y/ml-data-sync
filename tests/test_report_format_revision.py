@@ -67,6 +67,34 @@ def _stale_final_status():
 
 
 class ReportFormatRevisionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_september_partial_store_rows_cannot_start_operating_review(self):
+        row = {
+            "record_id": "rec-sep-cbt",
+            "fields": {
+                "周期": "month_2026-09",
+                "店铺": "ML CBT-FULL (1502236229)",
+                "SKU": "TZ17",
+                "订单数": 1,
+                "件数": 1,
+                "营收(RMB)": 100.0,
+                "采购成本(RMB)": 20.0,
+                "头程成本(RMB)": 5.0,
+                "全额毛利(RMB)": 75.0,
+            },
+        }
+        with (
+            patch.object(ml_close, "_tenant_token", AsyncMock(return_value="token")),
+            patch.object(ml_close, "_get_status", AsyncMock(return_value=None)),
+            patch.object(ml_close, "_open_ad_failures", AsyncMock(return_value=[])),
+            patch.object(ml_close, "_list_records", AsyncMock(return_value=[row])),
+        ):
+            result = await ml_close.audit(period="month_2026-09", run_cost_preview=False)
+
+        self.assertEqual("待数据同步", result["state"])
+        self.assertEqual("instruction", result["next_card"])
+        self.assertFalse(result["operating_ready"])
+        self.assertEqual(2, len(result["missing_stores"]))
+
     def test_v4_revision_is_part_of_identity_title_and_source_approval_hash(self):
         rows = [_report_row()]
         with patch.object(

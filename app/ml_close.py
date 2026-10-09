@@ -30,6 +30,11 @@ REPORT_TABLE_ID = os.getenv("FEISHU_BASE_TABLE_ID", "tbl09sRPkX35PDfU")
 BASE_URL = f"https://u1wpma3xuhr.feishu.cn/base/{APP_TOKEN}"
 STATUS_TABLE_NAME = os.getenv("ML_CLOSE_STATUS_TABLE_NAME", "美客多毛利月结状态台")
 STATUS_TABLE_ID_ENV = os.getenv("ML_CLOSE_STATUS_TABLE_ID", "")
+SEPTEMBER_REQUIRED_STORES = frozenset({
+    "ML CBT-FULL (1502236229)",
+    "ML 巴西本土店 AIRSOFT COMERCIAL",
+    "ML 本土3店 DISTRIBUIDOR VALMIGOZ",
+})
 
 ML_GROUP_ID = os.getenv("ML_CLOSE_GROUP_ID", "oc_cd007a8f1dbb4a78943625e5432a4cd7")
 FINANCE_GROUP_ID = os.getenv("ML_CLOSE_FINANCE_GROUP_ID", "oc_6b2da626d80eb6284bbe9dcf895030b9")
@@ -968,6 +973,7 @@ async def audit(
             gap_map.setdefault(r["record_id"], {"record_id": r["record_id"], "store": store, "sku": sku, "orders": orders, "units": units, "revenue": rev, "gap_types": []})["gap_types"].append("头程/海外仓")
 
     gap_rows = list(gap_map.values())
+    missing_stores = sorted(SEPTEMBER_REQUIRED_STORES - stores) if period == "month_2026-09" else []
     cbt_rows = [r for r in rows if "CBT" in _text(r.get("fields", {}).get("店铺"))]
     cbt_state = "已解析" if cbt_rows else "未发现CBT行"
 
@@ -989,7 +995,7 @@ async def audit(
         base_error = f"{base_error}；{cost_failure}" if base_error else cost_failure
     last_error = _with_ad_failure(base_error, prior_failed_ad_shops)
     state, next_card = _close_state(
-        bool(rows),
+        bool(rows) and not missing_stores,
         bool(purchase_gaps or freight_gaps),
         effective_prior_state,
         last_error,
@@ -1007,6 +1013,7 @@ async def audit(
         "report_rows": len(rows),
         "store_count": len(stores),
         "stores": sorted(stores),
+        "missing_stores": missing_stores,
         "order_count": order_count,
         "unit_count": unit_count,
         "revenue_rmb": round(revenue, 2),
@@ -1042,7 +1049,7 @@ async def audit(
         "failed_ad_shops": prior_failed_ad_shops,
         "ab_verified": effective_ab_verified,
         "report_hash": report_hash,
-        "operating_ready": bool(rows) and not bool(purchase_gaps or freight_gaps) and not bool(last_error),
+        "operating_ready": bool(rows) and not missing_stores and not bool(purchase_gaps or freight_gaps) and not bool(last_error),
         "operating_close_confirmed": operating_snapshot_current,
         "operating_snapshot_current": operating_snapshot_current,
         "operating_report_hash": (
