@@ -2017,6 +2017,15 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
         return {"status": "skipped_cbt", "seller_id": seller_id, "month": month,
                 "note": "CBT-FULL 走官方导出解析(cbt_export_ingest.py), 不走主sync(缓存仅85%不全)."}
     period = period_label or f"month_{month}"
+    sync_started = time.monotonic()
+
+    def sync_stage(stage: str) -> None:
+        print(
+            f"[INFO] monthly sync stage seller_id={seller_id} month={month} "
+            f"stage={stage} elapsed_s={time.monotonic() - sync_started:.1f}",
+            flush=True,
+        )
+
     if preserve_existing_as and (
         preserve_existing_as == period
         or not re.fullmatch(r"month_\d{4}-\d{2}_[A-Za-z0-9_-]+", preserve_existing_as)
@@ -2036,6 +2045,7 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
     sync_started_at = time.time_ns()
 
     cached_rows = await db.cache_list_orders_for_scope(seller_id, month)
+    sync_stage("orders_cache_loaded")
     if not cached_rows:
         return {"status": "no_cache", "seller_id": seller_id, "month": month,
                 "hint": "Run /admin/backfill-orders to fill cache, or wait for webhook to populate."}
@@ -2157,6 +2167,7 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
         lingxing_error = str(e)[:200]
     else:
         lingxing_error = None
+    sync_stage("lingxing_loaded")
 
     # Phase B1.3: pull advertising at ITEM-level with full metrics dict
     ad_sku_metrics: dict[str, dict[str, float]] = {}
@@ -2205,6 +2216,7 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
             ) from e
     ad_sku_cost: dict[str, float] = {k: v.get("cost", 0.0) for k, v in ad_sku_metrics.items()}
     ad_unallocated_cost = ad_unallocated_metrics.get("cost", 0.0)
+    sync_stage("advertising_attributed")
 
     # Billing-period exports contain several non-order charges that are absent
     # from the orders and Product Ads occurrence APIs. Pull them separately and
@@ -2225,6 +2237,7 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
             ),
         ) from e
     billing_currency = str(billing_adjustments.get("currency") or rows[0].get("currency") or "?")
+    sync_stage("billing_loaded")
     if int(billing_adjustments.get("unclassified_count") or 0):
         raise HTTPException(
             502,
@@ -2239,6 +2252,7 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
     # Phase B1.4: pull shop-level visits (per ML user/items_visits endpoint).
     # CBT sellers return 403 → None. Used to compute 整店 CVR = sum(件数) / 访客.
     shop_visits = await advertising.fetch_shop_visits_for_month(seller_id, month)
+    sync_stage("visits_loaded")
     total_units_in_shop = sum(r["units"] for r in rows)
     shop_cvr = (total_units_in_shop / shop_visits) if (shop_visits and shop_visits > 0) else 0
 
@@ -2290,6 +2304,7 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
                 share = sender_cost * (u / total_units)
                 if sku in by_sku:
                     by_sku[sku]["shipping_total"] = by_sku[sku].get("shipping_total", 0) + share
+    sync_stage("shipping_loaded")
 
     # Phase B2: allocate refunds per order to SKUs (by revenue share)
     for oid, refund_amt in refunds_by_order.items():
@@ -2603,6 +2618,7 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
         2,
     )
     if not commit:
+        sync_stage("preview_ready")
         return {
             "status": "preview",
             "commit": False,
