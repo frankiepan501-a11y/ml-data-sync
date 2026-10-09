@@ -255,23 +255,29 @@ def _parse_ads(data: bytes, listing2sku: dict):
 def _parse_storage(data: bytes) -> float:
     wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     ws = wb["REPORT"]
-    KW = [
+    recognized_details = [
         "仓陈旧", "Long-term storage", "存储服务费", "入库货件违约",
         "Storage service fee", "almacenamiento",
         "Charge for exceeding space in Full", "Refund for stock retrieval at Full",
     ]
     total = 0.0
-    for r in ws.iter_rows(min_row=9, max_row=ws.max_row, values_only=True):
-        d = r[3] if len(r) > 3 else None
-        v = r[7] if (len(r) > 7 and isinstance(r[7], (int, float))) else 0.0
-        if d is None or not v:
-            continue
-        description = str(d)
-        if any(k in description for k in KW):
+    try:
+        for r in ws.iter_rows(min_row=9, max_row=ws.max_row, values_only=True):
+            d = r[3] if len(r) > 3 else None
+            if d is None:
+                continue
+            description = str(d)
+            recognized = any(k in description for k in recognized_details)
+            if not recognized and "full" in description.casefold():
+                raise RuntimeError(f"未知 Full 费用类型：{description}；未写入数据")
+            if not recognized:
+                continue
+            v = r[7] if len(r) > 7 else None
+            if not isinstance(v, (int, float)):
+                raise RuntimeError(f"Full 费用金额不是数字：{description}；未写入数据")
             total += v
-        elif "full" in description.casefold():
-            raise RuntimeError(f"未知 Full 费用类型：{description}；未写入数据")
-    wb.close()
+    finally:
+        wb.close()
     return total
 
 

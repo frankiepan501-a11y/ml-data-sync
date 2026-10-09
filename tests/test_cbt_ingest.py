@@ -162,6 +162,16 @@ class CbtIngestPeriodSafetyTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "未知 Full 费用类型"):
             cbt_ingest._parse_storage(_xlsx_bytes(workbook))
 
+    async def test_full_fee_parser_blocks_non_numeric_full_charge(self):
+        workbook = openpyxl.load_workbook(io.BytesIO(_bill_file("2026-09")))
+        row = [None] * 31
+        row[3] = "New Full handling charge"
+        row[7] = "1.25"
+        workbook["REPORT"].append(row)
+
+        with self.assertRaisesRegex(RuntimeError, "未知 Full 费用类型"):
+            cbt_ingest._parse_storage(_xlsx_bytes(workbook))
+
     async def test_bitable_read_failure_is_not_treated_as_an_empty_table(self):
         with patch.object(cbt_ingest.httpx, "AsyncClient", return_value=_ReadFailureClient()):
             with self.assertRaisesRegex(RuntimeError, "报表读取失败"):
