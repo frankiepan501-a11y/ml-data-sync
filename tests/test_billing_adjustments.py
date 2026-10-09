@@ -83,6 +83,43 @@ class BillingAdjustmentTests(unittest.TestCase):
         mismatch = billing.summarize_month_details([detail], "2026-09", default_currency="MXN")
         self.assertEqual(1, mismatch["unclassified_count"])
 
+    def test_mexico_full_detail_merges_with_same_id_generic_billing_detail(self):
+        generic = {
+            "charge_info": {
+                "detail_id": 72308065403,
+                "creation_date_time": "2026-09-29T19:27:26",
+                "transaction_detail": "Cargo por retiro de stock Full",
+                "detail_sub_type": "CFRS",
+                "detail_type": "CHARGE",
+                "detail_amount": 6.8,
+                "debited_from_operation": "NO",
+            },
+            "items_info": [{"item_id": "MLM2944081177"}],
+            "currency_info": {"currency_id": "MXN"},
+        }
+        full = {
+            "charge_info": {
+                "detail_id": 72308065403,
+                "creation_date_time": "2026-09-29T19:27:26",
+                "transaction_detail": "Cargo por retiro de stock Full",
+                "detail_sub_type": "CFRS",
+                "detail_type": "CHARGE",
+                "detail_amount": 6.8,
+                "concept_type": "FULFILLMENT",
+            },
+            "fulfillment_info": {"type": "WITHDRAWAL", "amount": 6.8},
+        }
+        for rows in ([generic, full], [full, generic]):
+            with self.subTest(first="generic" if rows[0] is generic else "full"):
+                result = billing.summarize_month_details(rows, "2026-09", default_currency="MXN")
+                self.assertEqual(0, result["unclassified_count"])
+                self.assertEqual(1, result["detail_count"])
+                self.assertEqual(6.8, result["full_fees"])
+
+        conflicting = {**full, "charge_info": {**full["charge_info"], "detail_amount": 7.8}}
+        with self.assertRaisesRegex(ValueError, "billing detail conflict"):
+            billing.summarize_month_details([generic, conflicting], "2026-09", default_currency="MXN")
+
     def test_split_billing_periods_must_cover_every_day_of_natural_month(self):
         periods = [
             {"key": "2026-07-18", "period": {"date_from": "2026-07-18", "date_to": "2026-08-17"}},

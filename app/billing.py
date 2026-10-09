@@ -41,6 +41,38 @@ def summarize_month_details(
 ) -> dict:
     """Classify non-order billing charges by charge date for one natural month."""
     month_start, next_month = _month_bounds(month)
+    # /details has the currency and order metadata while /full/details has the
+    # Fulfillment type. Both can describe the same detail_id. Merge their
+    # nonempty fields before deduplication so neither half is discarded.
+    merged_details: dict[int, dict] = {}
+    for detail in details:
+        charge = detail.get("charge_info") or {}
+        detail_id = charge.get("detail_id")
+        if detail_id in (None, ""):
+            raise ValueError("billing detail missing charge_info.detail_id")
+        detail_id = int(detail_id)
+        if detail_id not in merged_details:
+            merged_details[detail_id] = detail.copy()
+            continue
+        merged = merged_details[detail_id]
+        previous_charge = merged.get("charge_info") or {}
+        if (
+            str(previous_charge.get("detail_sub_type") or "") != str(charge.get("detail_sub_type") or "")
+            or str(previous_charge.get("detail_type") or "") != str(charge.get("detail_type") or "")
+            or not math.isclose(
+                float(previous_charge.get("detail_amount")),
+                float(charge.get("detail_amount")),
+                abs_tol=0.001,
+            )
+        ):
+            raise ValueError(f"billing detail conflict detail_id={detail_id}")
+        for key, value in detail.items():
+            if not value:
+                continue
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                merged[key] = {**merged[key], **{k: v for k, v in value.items() if v is not None}}
+            else:
+                merged[key] = value
     totals = {
         "display_ads": 0.0,
         "full_fees": 0.0,
@@ -51,22 +83,18 @@ def summarize_month_details(
     }
     currencies: set[str] = set()
     relevant_count = 0
-    seen_detail_ids: set[int] = set()
     unclassified: list[dict] = []
     known_order_derived_subtypes = {
         "CV", "BV", "CFF", "BFF",  # Mexico sale/shipping
         "CVVML", "BVVML", "CFFE", "BFFE",  # Brazil sale/shipping
         "CFFI",  # Brazil municipal shipping (already covered per order)
     }
-    for detail in details:
+    for detail in merged_details.values():
         charge = detail.get("charge_info") or {}
         detail_id = charge.get("detail_id")
         if detail_id in (None, ""):
             raise ValueError("billing detail missing charge_info.detail_id")
         detail_id = int(detail_id)
-        if detail_id in seen_detail_ids:
-            continue
-        seen_detail_ids.add(detail_id)
 
         raw_created = str(charge.get("creation_date_time") or "")
         try:
