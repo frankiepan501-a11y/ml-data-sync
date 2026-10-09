@@ -199,7 +199,17 @@ async def _get_json(client: httpx.AsyncClient, url: str, headers: dict, params: 
                 retry_after = retry_delays[attempt]
             await asyncio.sleep(max(retry_after, retry_delays[attempt] if not raw_retry_after else 0.0))
             continue
-        raise RuntimeError(f"billing API failed status={response.status_code} url={url}")
+        try:
+            error_payload = response.json()
+        except ValueError:
+            error_payload = {}
+        error_code = error_payload.get("error") if isinstance(error_payload, dict) else None
+        error_message = error_payload.get("message") if isinstance(error_payload, dict) else None
+        raise RuntimeError(
+            f"billing API failed status={response.status_code} url={url} "
+            f"params={params} error={str(error_code or '')[:120]} "
+            f"message={str(error_message or '')[:120]}"
+        )
     raise RuntimeError(f"billing API retry loop exhausted url={url}")
 
 

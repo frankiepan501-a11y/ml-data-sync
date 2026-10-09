@@ -213,6 +213,15 @@ class BillingAdjustmentTests(unittest.TestCase):
 
 
 class BillingFetchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_bad_request_reports_safe_cursor_for_diagnosis(self):
+        bad = MagicMock(status_code=400, headers={})
+        bad.json.return_value = {"error": "invalid_from_id"}
+        client = MagicMock()
+        client.get = AsyncMock(return_value=bad)
+
+        with self.assertRaisesRegex(RuntimeError, "from_id.*123.*invalid_from_id"):
+            await billing._get_json(client, "https://example.test", {}, {"from_id": 123})
+
     async def test_get_json_retries_rate_limit_before_returning_complete_page(self):
         limited = MagicMock(status_code=429, headers={"retry-after": "1"})
         ok = MagicMock(status_code=200, headers={})
