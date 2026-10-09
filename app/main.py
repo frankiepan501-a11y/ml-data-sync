@@ -1971,7 +1971,7 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, background_task
         raise HTTPException(400, f"unknown seller_id {seller_id}; allowed: {list(SHOP_LABEL.keys())}")
     if nowait:
         background_tasks.add_task(
-            _sync_feishu_monthly_impl,
+            _logged_monthly_background_sync,
             seller_id,
             month,
             period_label,
@@ -1992,6 +1992,25 @@ async def report_sync_feishu_monthly(seller_id: int, month: str, background_task
             f"monthly sync blocked seller={seller_id} month={month} status={result.get('status')}",
         )
     return result
+
+
+async def _logged_monthly_background_sync(*args: object) -> None:
+    seller_id, month = args[:2]
+    try:
+        result = await _sync_feishu_monthly_impl(*args)
+    except Exception as exc:
+        detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+        print(
+            f"[ERROR] monthly background sync failed seller_id={seller_id} month={month} "
+            f"error={type(exc).__name__} detail={str(detail)[:500]}",
+            flush=True,
+        )
+    else:
+        print(
+            f"[INFO] monthly background sync finished seller_id={seller_id} month={month} "
+            f"status={result.get('status')} rows={result.get('rows_previewed', result.get('rows_written', 0))}",
+            flush=True,
+        )
 
 
 async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: str = "",
