@@ -8,7 +8,7 @@
 密钥全走 env(无硬编, 适配公开仓): FEISHU_APP_ID/SECRET, LINGXING_APP_ID/SECRET, MEITONG_USER/PASS。
 本地脚本权威源: ~/scripts/meitong/ (meitong_ml_pipeline.py + meitong_ml_write.py)。
 """
-import os, json, time, hashlib, base64, urllib.request, urllib.parse, urllib.error, datetime
+import os, json, time, hashlib, base64, urllib.request, urllib.parse, urllib.error, datetime, math
 from collections import defaultdict
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding as sym_padding
@@ -426,6 +426,54 @@ def _plat_of(store, country=""):
 
 
 # ============ 通用 Z 列(单个产品头程): 物流手工算好的 per件头程, 直读 ============
+def _confirmed_br_invoice_z(rows, hdr):
+    """Read-side repair of shipment 10006769; preserve the logistics sheet's USD values.
+
+    Junhui confirmed invoice 202607300078 on 2026-10-09: USD 2619,
+    CNY 18087.34 at 6.9062. The 24 carton rows already allocate the full
+    invoice by chargeable volume. Validate that allocation before conversion;
+    accept an already-converted source without applying FX twice.
+    """
+    required = ('送往中转仓的货件号', '物流商', '国家', '店铺', 'ERP-SKU', '数量', '单个产品头程')
+    if not all(k in hdr for k in required):
+        if any('10006769' in _txt(cell) for row in rows[1:] for cell in row):
+            raise RuntimeError('10006769 cost evidence: required source column missing')
+        return {}
+    batch = []
+    for n, r in enumerate(rows[1:], 2):
+        g = lambda key: r[hdr[key]] if len(r) > hdr[key] else None
+        wb = _txt(g('送往中转仓的货件号')).strip()
+        if not wb.startswith('10006769'):
+            continue
+        if _txt(g('物流商')) != '神龙行' or _plat_of(g('店铺'), g('国家')) != '美客多巴西':
+            raise RuntimeError('10006769 cost evidence: carrier/platform changed')
+        batch.append((n, wb, _txt(g('ERP-SKU')), _num(g('数量')), _num(g('单个产品头程'))))
+    if not batch:
+        return {}
+    if len(batch) != 24 or {b[1] for b in batch} != {f'10006769U{i:03}' for i in range(1, 25)}:
+        raise RuntimeError('10006769 cost evidence: expected 24 unique cartons')
+    expected = {i: ('FF05A-01', 30) if i >= 20 else ('TZ06', 24) if i >= 8 else ('TZ07', 24)
+                for i in range(1, 25)}
+    for _, wb, sku, qty, z in batch:
+        if (sku, qty) != expected[int(wb[-3:])] or not math.isfinite(z) or z <= 0:
+            raise RuntimeError('10006769 cost evidence: SKU/quantity/allocation changed')
+    total = sum(qty * z for _, _, _, qty, z in batch)
+    if abs(total - 18087.34) <= 0.02:
+        return {}  # Logistics has already converted this invoice to CNY.
+    if abs(total - 2619.0) > 0.02:
+        raise RuntimeError('10006769 cost evidence: neither confirmed USD nor CNY total')
+    # Use the rounded invoice total, not the September sales exchange rate.
+    return {n: z * (18087.34 / total) for n, _, _, _, z in batch}
+
+
+def _report_cost_erp(raw_sku, platform):
+    # Live sheet row 1414 ties BR label FF05-2 to ERP FF05A-01.
+    # Mexico's same label retains its existing cost mapping.
+    if platform == '美客多巴西' and raw_sku == 'FF05-2':
+        return 'FF05A-01'
+    return _direct_erp(raw_sku)
+
+
 def zcol_rows(cut=None):
     """gGxKHQ 任何货代行, 若「单个产品头程」(Z列) 已填 → 直接用作 per件头程(俊辉为三沐/万国手工算的,
     建议 AI 直接抓 Z 列)。head_row = Z × 数量。美通/墨客多 Z 列空(走各自逻辑)→不进此 pass 不双算。"""
@@ -434,16 +482,17 @@ def zcol_rows(cut=None):
     if not rows:
         return out
     hdr = {str(h).strip(): i for i, h in enumerate(rows[0])}
+    confirmed_z = _confirmed_br_invoice_z(rows, hdr)
     c_z = hdr.get("单个产品头程")
     if c_z is None:
         return out
     c_qty = hdr.get("数量", 12); c_store = hdr.get("店铺", 9); c_country = hdr.get("国家", 7)
     c_erp = hdr.get("ERP-SKU"); c_pname = hdr.get("产品名", 11); c_label = hdr.get("国内所贴产品标签", 15)
     c_ship = hdr.get("实际发货时间", 2)
-    for r in rows[1:]:
+    for row_number, r in enumerate(rows[1:], 2):
         g = lambda i: (r[i] if (i is not None and len(r) > i) else None)
         try:
-            z = float(g(c_z)) if g(c_z) not in (None, "") else 0.0
+            z = confirmed_z.get(row_number, float(g(c_z)) if g(c_z) not in (None, "") else 0.0)
         except (TypeError, ValueError):
             z = 0.0
         try:
@@ -673,17 +722,14 @@ def diag(period="month_2026-05", months=12):
         recs += dd.get("items", []); pt = dd.get("page_token")
         if not dd.get("has_more"):
             break
-    try:
-        from app.lingxing import resolve_erp_sku as _ml_alias
-    except Exception:
-        _ml_alias = lambda s: s
     ml, fb_cache = [], {}
     for r in recs:
         f = r["fields"]
         if _txt(f.get("周期")) != period:
             continue
-        raw_sku = _txt(f.get("SKU")); sku = _ml_alias(raw_sku); store = _txt(f.get("店铺"))
+        raw_sku = _txt(f.get("SKU")); store = _txt(f.get("店铺"))
         tp = "美客多巴西" if ("巴西" in store or "AIRSOFT" in store.upper()) else "美客多"
+        sku = _report_cost_erp(raw_sku, tp)
         u, used_months = _lookup_unit_with_fallback(unit, (sku, tp), months, fb_cache)
         ml.append({"sku": raw_sku, "erp_sku": sku, "qty": _num(f.get("件数")), "in_unit": bool(u),
                    "cost_window_months": used_months,
@@ -729,10 +775,6 @@ def run(period, months=12, commit=False):
         backup.write_text(json.dumps({'period': period, 'rows': rows}, ensure_ascii=False), encoding='utf-8')
     # ML 后台 seller_sku → 领星 ERP SKU(俊辉确认的 CBT 定制 listing 别名, 如 MXCFFLFFSCP-TOTK→FF01A-04),
     # 与主 sync 同源, 否则 unit 按 ERP 键、ML 行按 seller_sku 键, 永远匹配不上。
-    try:
-        from app.lingxing import resolve_erp_sku as _ml_alias
-    except Exception:
-        _ml_alias = lambda s: s
     written, blank, mh, mo, detail, fb_cache, fb_written = 0, 0, 0.0, 0.0, [], {}, 0
     expected = {}
     for r in rows:
@@ -741,7 +783,7 @@ def run(period, months=12, commit=False):
         #   防 FB07-7/KS35-19 等同 SKU 跨国把墨西哥成本误算到巴西(反之亦然)。
         store = _txt(f.get("店铺"))
         target_plat = "美客多巴西" if ("巴西" in store or "AIRSOFT" in store.upper()) else "美客多"
-        sku = _ml_alias(_txt(f.get("SKU")))
+        sku = _report_cost_erp(_txt(f.get("SKU")), target_plat)
         key = (sku, target_plat)
         u, used_months = _lookup_unit_with_fallback(unit, key, months, fb_cache)
         if not u:
