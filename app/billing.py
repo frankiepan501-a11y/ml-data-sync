@@ -239,22 +239,26 @@ async def _get_json(client: httpx.AsyncClient, url: str, headers: dict, params: 
             if payload.get("errors"):
                 raise RuntimeError(f"billing API returned errors url={url}")
             return payload
-        retryable = response.status_code == 429 or 500 <= response.status_code < 600
-        if retryable and attempt < len(retry_delays):
-            raw_retry_after = response.headers.get("retry-after")
-            try:
-                retry_after = float(raw_retry_after) if raw_retry_after else retry_delays[attempt]
-            except ValueError:
-                retry_after = retry_delays[attempt]
-            floor = 60.0 if response.status_code == 429 and not raw_retry_after else 0.0
-            await asyncio.sleep(max(retry_after, floor, retry_delays[attempt] if not raw_retry_after else 0.0))
-            continue
         try:
             error_payload = response.json()
         except ValueError:
             error_payload = {}
         error_code = error_payload.get("error") if isinstance(error_payload, dict) else None
         error_message = error_payload.get("message") if isinstance(error_payload, dict) else None
+        # The identical BR Full request returned this generic upstream error,
+        # then 672 rows on retry. Do not retry explicit invalid-parameter errors.
+        transient_400 = (response.status_code == 400 and not error_code
+                         and error_message == "Http status error with code 400")
+        retryable = transient_400 or response.status_code == 429 or 500 <= response.status_code < 600
+        if retryable and attempt < len(retry_delays):
+            raw_retry_after = response.headers.get("retry-after")
+            try:
+                retry_after = float(raw_retry_after) if raw_retry_after else retry_delays[attempt]
+            except ValueError:
+                retry_after = retry_delays[attempt]
+            floor = 60.0 if response.status_code == 429 and not raw_retry_after else (25.0 if transient_400 else 0.0)
+            await asyncio.sleep(max(retry_after, floor, retry_delays[attempt] if not raw_retry_after else 0.0))
+            continue
         raise RuntimeError(
             f"billing API failed status={response.status_code} url={url} "
             f"params={params} error={str(error_code or '')[:120]} "

@@ -250,6 +250,23 @@ class BillingAdjustmentTests(unittest.TestCase):
 
 
 class BillingFetchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_generic_upstream_400_retries_same_request_but_stays_bounded(self):
+        bad = MagicMock(status_code=400, headers={})
+        bad.json.return_value = {"message": "Http status error with code 400"}
+        ok = MagicMock(status_code=200, headers={})
+        ok.json.return_value = {"total": 672, "results": []}
+        client = MagicMock()
+        client.get = AsyncMock(side_effect=[bad, ok])
+        with patch.object(billing.asyncio, "sleep", AsyncMock()) as sleeper:
+            self.assertEqual(672, (await billing._get_json(client, "https://example.test", {}, {"limit":1000}))["total"])
+        self.assertEqual(client.get.await_args_list[0], client.get.await_args_list[1])
+        sleeper.assert_awaited_once_with(25.0)
+        client.get = AsyncMock(return_value=bad)
+        with patch.object(billing.asyncio, "sleep", AsyncMock()):
+            with self.assertRaisesRegex(RuntimeError, "status=400"):
+                await billing._get_json(client, "https://example.test", {}, {})
+        self.assertEqual(4, client.get.await_count)
+
     async def test_bad_request_reports_safe_cursor_for_diagnosis(self):
         bad = MagicMock(status_code=400, headers={})
         bad.json.return_value = {"error": "invalid_from_id"}
