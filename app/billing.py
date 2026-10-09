@@ -2,7 +2,8 @@
 
 Order and Product Ads occurrence-month values come from their dedicated APIs.
 This adapter adds only charges that those APIs do not cover: Display Ads,
-Fulfillment fees, return handling, standalone tax, and linked shipping credits.
+Fulfillment fees, return handling, and standalone tax. Shipping credits require
+proof that the original charge was included in a previous report.
 """
 
 from __future__ import annotations
@@ -46,7 +47,6 @@ def summarize_month_details(
         "return_fees": 0.0,
         "other_platform_fees": 0.0,
         "tax_adjustments": 0.0,
-        "shipping_adjustments": 0.0,
         "product_ads_ignored": 0.0,
     }
     currencies: set[str] = set()
@@ -58,12 +58,6 @@ def summarize_month_details(
         "CVVML", "BVVML", "CFFE", "BFFE",  # Brazil sale/shipping
         "CFFI",  # Brazil municipal shipping (already covered per order)
     }
-    details_by_id = {
-        int((detail.get("charge_info") or {}).get("detail_id")): detail
-        for detail in details
-        if (detail.get("charge_info") or {}).get("detail_id") not in (None, "")
-    }
-
     for detail in details:
         charge = detail.get("charge_info") or {}
         detail_id = charge.get("detail_id")
@@ -117,27 +111,9 @@ def summarize_month_details(
             # Separate ICMS-DIFAL bill: not debited from an order and not present
             # in order/shipment detail. Keep it in a tax field, not commission.
             bucket = "tax_adjustments"
-        elif subtype == "BFFI" and str(charge.get("detail_type") or "").upper() == "BONUS":
-            try:
-                linked_id = int(charge.get("charge_bonified_id"))
-            except (TypeError, ValueError):
-                linked_id = 0
-            original = details_by_id.get(linked_id) or {}
-            original_charge = original.get("charge_info") or {}
-            shipping_id = str((detail.get("shipping_info") or {}).get("shipping_id") or "")
-            original_shipping_id = str((original.get("shipping_info") or {}).get("shipping_id") or "")
-            try:
-                original_amount = float(original_charge.get("detail_amount"))
-            except (TypeError, ValueError):
-                original_amount = float("nan")
-            if (
-                original_charge.get("detail_sub_type") == "CFFI"
-                and str(original_charge.get("detail_type") or "").upper() == "CHARGE"
-                and math.isfinite(original_amount)
-                and math.isclose(abs(original_amount), abs(amount), abs_tol=0.001)
-                and shipping_id and shipping_id == original_shipping_id
-            ):
-                bucket = "shipping_adjustments"
+        # A BFFI credit reversing a prior CFFI charge is not enough evidence
+        # to book September profit: the original may never have entered August.
+        # Keep the credit unclassified until the prior report is reconciled.
         elif subtype in {"CDLIT", "BDLIT"} or "display ads" in label:
             bucket = "display_ads"
         elif subtype == "CFRS" and (

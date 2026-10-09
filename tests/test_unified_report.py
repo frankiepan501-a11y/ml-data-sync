@@ -31,7 +31,7 @@ async def _ready_action_guard(
 
 class FinanceReviewTests(unittest.IsolatedAsyncioTestCase):
     def test_known_fee_rows_are_preserved_without_fake_erp_products(self):
-        for sku in ('_full_fees', '_other_platform_fees', '_display_ads', '_return_fees', '_unallocated_ads', '_tax_adjustments', '_shipping_adjustments'):
+        for sku in ('_full_fees', '_other_platform_fees', '_display_ads', '_return_fees', '_unallocated_ads', '_tax_adjustments'):
             source = _record(SKU=sku, 周期='month_2026-08', 店铺='ML 巴西本土店 AIRSOFT COMERCIAL', 币种='BRL', 件数=0, 订单数=0, **{'营收(RMB)':0, '我的汇率':1, '广告费(原币)':10, '广告费(RMB)':10, '全额毛利(RMB)':-10})
             result = unified_report.prepare_report('month_2026-08', [source], [], [], close_mode='review')
             self.assertEqual(47, len(result['main_values'][1]))

@@ -2572,12 +2572,6 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
             "VAT估算(RMB)",
             float(billing_adjustments.get("tax_adjustments") or 0),
         ),
-        "_shipping_adjustments": (
-            "运费账单返还（费用日期口径）",
-            "物流费(原币)",
-            "物流费(RMB)",
-            float(billing_adjustments.get("shipping_adjustments") or 0),
-        ),
     }
     for synthetic_sku, (title, local_field, rmb_field, local_value) in billing_values.items():
         if abs(local_value) <= 0.000001:
@@ -2690,7 +2684,6 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
                 float(billing_adjustments.get("other_platform_fees") or 0), 2
             ),
             "billing_tax_adjustments_local": round(float(billing_adjustments.get("tax_adjustments") or 0), 2),
-            "billing_shipping_adjustments_local": round(float(billing_adjustments.get("shipping_adjustments") or 0), 2),
             "billing_product_ads_ignored": round(float(billing_adjustments.get("product_ads_ignored") or 0), 2),
             "ad_rows": [
                 {
@@ -2908,11 +2901,6 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
                     ("VAT估算(原币)", vat_local_total_value),
                     ("VAT估算(RMB)", round(sum(float((record.get("fields") or {}).get("VAT估算(RMB)") or 0) for record in records), 2)),
                 ])
-            if abs(float(billing_adjustments.get("shipping_adjustments") or 0)) > 0.000001:
-                financial_expectations.extend([
-                    ("物流费(原币)", shipping_local_total_value),
-                    ("物流费(RMB)", round(sum(float((record.get("fields") or {}).get("物流费(RMB)") or 0) for record in records), 2)),
-                ])
             for preserved_field in ("头程成本(RMB)", "海外仓成本(RMB)"):
                 financial_expectations.append((
                     preserved_field,
@@ -3049,7 +3037,6 @@ async def _sync_feishu_monthly_impl(seller_id: int, month: str, period_label: st
                 float(billing_adjustments.get("other_platform_fees") or 0), 2
             ),
             "billing_tax_adjustments_local": round(float(billing_adjustments.get("tax_adjustments") or 0), 2),
-            "billing_shipping_adjustments_local": round(float(billing_adjustments.get("shipping_adjustments") or 0), 2),
             "billing_product_ads_ignored": round(float(billing_adjustments.get("product_ads_ignored") or 0), 2),
             "vat_rate": vat_rate,
             "site_id_inferred": site_id_for_vat,

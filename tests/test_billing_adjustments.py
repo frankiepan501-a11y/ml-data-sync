@@ -5,7 +5,7 @@ from app import billing
 
 
 class BillingAdjustmentTests(unittest.TestCase):
-    def test_september_brazil_tax_and_linked_prior_month_shipping_bonus(self):
+    def test_september_brazil_tax_is_classified_but_prior_month_shipping_bonus_stays_blocked(self):
         def row(detail_id, created, subtype, amount, detail_type, **extra):
             return {
                 "charge_info": {
@@ -36,9 +36,10 @@ class BillingAdjustmentTests(unittest.TestCase):
 
         result = billing.summarize_month_details(details, "2026-09", default_currency="BRL")
 
-        self.assertEqual(0, result["unclassified_count"])
+        self.assertEqual(1, result["unclassified_count"])
         self.assertEqual(8.46, result["tax_adjustments"])
-        self.assertEqual(-14.45, result["shipping_adjustments"])
+        self.assertEqual(-14.45, result["unclassified_amount"])
+        self.assertEqual(70838835146, result["unclassified"][0]["detail_id"])
 
     def test_unlinked_shipping_bonus_stays_blocked(self):
         detail = {

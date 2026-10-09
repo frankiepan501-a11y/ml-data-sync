@@ -396,7 +396,6 @@ def prepare_report(
         "_return_fees": "退货处理费",
         "_unallocated_ads": "未归因广告花费（无商品SKU）",
         "_tax_adjustments": "巴西 ICMS-DIFAL 账单税费",
-        "_shipping_adjustments": "运费账单返还",
     }
     for record in rows:
         fields = _record_fields(record)
