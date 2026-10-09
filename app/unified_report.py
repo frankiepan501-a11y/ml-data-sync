@@ -62,7 +62,7 @@ _TEXT_SOURCE_FIELDS = {
     "SKU", "商品标题", "首次销售日", "父记录", "店铺", "周期", "数据拉取时间",
     "平台", "币种", "最后销售日", "财务修订版本",
 }
-_NUMERIC_SOURCE_FIELDS = set(SOURCE_HEADERS) - _TEXT_SOURCE_FIELDS
+_NUMERIC_SOURCE_FIELDS = (set(SOURCE_HEADERS) - _TEXT_SOURCE_FIELDS) | {"净销量", "退货数量"}
 
 # J is the calculated sales quantity; every cell from L through AU is a
 # numeric amount, exchange rate, cost, profit or ratio.  The UnformattedValue
@@ -357,8 +357,13 @@ def revision_cost_rounding_delta(fields: dict[str, Any]) -> float:
         if _number(fields.get("调整(原币)")) or _number(fields.get("调整(RMB)")):
             raise ReportGenerationError("调整金额缺少财务修订版本，禁止生成确认报表")
         return 0.0
-    if (_text(fields.get("财务修订版本")) != FINANCE_REVISION_VERSION
-            or _text(fields.get("周期")) != "month_2026-08"):
+    from app.cbt_reconcile import VERSION as CBT_VERSION, PERIOD as CBT_PERIOD, SHOP as CBT_SHOP
+    august = (_text(fields.get("财务修订版本")) == FINANCE_REVISION_VERSION
+              and _text(fields.get("周期")) == "month_2026-08")
+    september_cbt = (_text(fields.get("财务修订版本")) == CBT_VERSION
+                     and _text(fields.get("周期")) == CBT_PERIOD
+                     and _text(fields.get("店铺")) == CBT_SHOP)
+    if not (august or september_cbt):
         raise ReportGenerationError("财务修订版本与授权月份不匹配，禁止生成确认报表")
     fx = Decimal(str(_number(fields.get("我的汇率"))))
     if fx <= 0:
@@ -368,6 +373,28 @@ def revision_cost_rounding_delta(fields: dict[str, Any]) -> float:
     def displayed(cost: Decimal) -> Decimal:
         return ((cost / fx).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP) * fx).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
     return float(procurement + freight - displayed(procurement) - displayed(freight))
+
+
+def september_cbt_evidence(rows: list[dict[str, Any]]) -> dict[str, float] | None:
+    """Check the actual source before displaying the locked September findings."""
+    from app.cbt_reconcile import VERSION, SHOP, PERIOD
+    fields = [_record_fields(r) for r in rows if _text(_record_fields(r).get("店铺")) == SHOP]
+    if not fields:
+        return None
+    if (len(fields) != 17 or len({_text(f.get("SKU")) for f in fields}) != 17
+            or any(_text(f.get("周期")) != PERIOD or _text(f.get("财务修订版本")) != VERSION for f in fields)):
+        raise ReportGenerationError("9月CBT缺少完整17 SKU或核实版本；禁止显示已核实结论")
+    expected = {"件数": 459, "净销量": 436, "退货数量": 7,
+                "营收(原币)": 13711.69, "ML佣金(原币)": 2046.33, "物流费(原币)": 1617.71,
+                "VAT估算(原币)": 1890.17, "退款金额(原币)": 602.09, "调整(原币)": 161.29}
+    actual = {k: round(sum(_number(f.get(k)) for f in fields), 2) for k in expected}
+    if any(abs(actual[k]-v) > 0.011 for k, v in expected.items()):
+        raise ReportGenerationError("9月CBT实际源字段与逐订单核实证据不一致，禁止生成候选")
+    actual["settlement"] = round(actual["营收(原币)"] - actual["ML佣金(原币)"] - actual["物流费(原币)"]
+        - actual["VAT估算(原币)"] - actual["退款金额(原币)"] + actual["调整(原币)"] + 11.79, 2)
+    if abs(actual["settlement"] - 7728.47) > 0.011:
+        raise ReportGenerationError("9月CBT结算桥未通过")
+    return actual
 
 
 def prepare_report(
@@ -387,6 +414,7 @@ def prepare_report(
     rows.sort(key=_sort_key)
     if not rows:
         raise ReportGenerationError(f"{month} 没有可生成的美客多月报数据")
+    cbt_evidence = september_cbt_evidence(rows) if period == "month_2026-09" else None
 
     skus = [_text(_record_fields(row).get("SKU")) for row in rows]
     fee_names = {
@@ -410,12 +438,14 @@ def prepare_report(
         mappings[sku] = {"product_name": fee_names[sku], "category": "店铺公共费用（非商品）",
                          "source": "系统费用分类", "record_ids": []}
 
-    source_headers = SOURCE_HEADERS + ["record_id"]
+    # Historical sheets/approval hashes retain their existing layout.
+    source_fields = SOURCE_HEADERS + (["净销量", "退货数量"] if period == "month_2026-09" else [])
+    source_headers = source_fields + ["record_id"]
     source_values: list[list[Any]] = [source_headers]
     for record in rows:
         fields = _record_fields(record)
         source_values.append(
-            [_source_sheet_value(name, fields.get(name)) for name in SOURCE_HEADERS]
+            [_source_sheet_value(name, fields.get(name)) for name in source_fields]
             + [record.get("record_id") or ""]
         )
     source_columns = {name: _column_letter(index + 1) for index, name in enumerate(source_headers)}
@@ -445,6 +475,10 @@ def prepare_report(
         row[4] = _formula(f'={ref("SKU")}')
         row[8] = _formula(f'={ref("币种")}')
         row[9] = _formula(f'={ref("件数")}')
+        if period == "month_2026-09" and fields.get("净销量") is not None:
+            row[9] = _formula(f'={ref("净销量")}')
+        if period == "month_2026-09" and fields.get("退货数量") is not None:
+            row[10] = _formula(f'={ref("退货数量")}')
         row[11] = _formula(f'={ref("营收(原币)")}')
         row[12] = _formula(f'=-{ref("退款金额(原币)")}')
         row[13] = _formula(f'=-{ref("ML佣金(原币)")}')
@@ -565,7 +599,8 @@ def prepare_report(
         ["ERP映射", "通过", "商品SKU精确匹配；系统费用行单独分类，不伪造ERP产品", "", ""],
         ["店铺数", summary["store_count"], "生产表汇总", "", ""],
         ["订单数", summary["orders"], "生产表汇总", "", ""],
-        ["销量", summary["units"], "生产表汇总", "", ""],
+        ["成本计量件数" if period == "month_2026-09" else "销量", summary["units"],
+         "CBT净销量另列；采购和头程仍用原件数" if period == "month_2026-09" else "生产表汇总", "", ""],
         ["营收(RMB)", summary["revenue_rmb"], "生产表汇总", "", ""],
         ["佣金(RMB)", summary["commission_rmb"], "生产表汇总", "", ""],
         ["广告费(RMB)", summary["advertising_rmb"], "生产表汇总", "", ""],
@@ -573,11 +608,20 @@ def prepare_report(
         ["佣金换算", summary["commission_check"], f"佣金原币×精确汇率；最大差额 {max_commission_delta:.4f} 元", "", ""],
         ["汇率显示", "4位小数", "避免截图中的显示精度造成佣金换算误判", "", ""],
         ["毛利公式复核", summary["profit_check"], f"生产表逐行重算；最大差额 {max_profit_delta:.4f} 元", "", ""],
-        ["退货数量", "待补", "生产表无退货件数字段；退货率暂按退款金额÷营收", "", ""],
+        ["退货数量", "CBT已核实；本土待核实" if cbt_evidence else "待补",
+         f"CBT为截至10/5导出时已退回验货{cbt_evidence['退货数量']:g}件，含待提回品；不代表可售库存。退货率按商品退款金额÷营收。" if cbt_evidence else "未核实退货件数；退货率暂按退款金额÷营收", "", ""],
         ["产品中文名/分类", "通过", "ERP SKU精确映射；仅用于展示，不作为采购成本关联键", "", ""],
         ["生成时间", dt.datetime.now(dt.timezone(dt.timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S"), "北京时间", "", ""],
         ["数据来源", f"{REPORT_APP_TOKEN}/{REPORT_TABLE_ID}", "飞书生产表，只读拉取", "", ""],
     ]
+    if cbt_evidence:
+        check_values.extend([
+            ["CBT数量", f"净销量{cbt_evidence['净销量']:g}；成本计量{cbt_evidence['件数']:g}", "14件取消、7件全退、2件平台保障退款；成本不按净销量冲回", "", ""],
+            ["CBT调整(USD)", cbt_evidence["调整(原币)"], "汇差-7.73；退款/退费重分类169.01；源舍入0.01。重分类不是新增收入。", "", ""],
+            ["CBT结算桥(USD)", cbt_evidence["settlement"], "逐订单核回Orders S；商品退款按原销售额计，非API混币支付退款", "", ""],
+            ["CBT配送费", "含退货处理11.79 USD", "9月账单两笔8月单退货费，按Listing归入KS42-01 5.94、YS37-01 5.85；在S桥后另减", "", ""],
+            ["CBT组合包", "只分配给本包两子商品", "销售额/佣金取账单；共享税费和运费按本包收入权重分摊", "", ""],
+        ])
     return {
         "summary": summary,
         "main_values": main_values,
@@ -619,7 +663,10 @@ def approval_source_hash(records: list[dict[str, Any]]) -> str:
     normalized = [
         {
             "record_id": _text(row.get("record_id")),
-            "fields": row.get("fields") or {},
+            "fields": {
+                key: value for key, value in (row.get("fields") or {}).items()
+                if not (period < "month_2026-09" and key in {"净销量", "退货数量"} and value is None)
+            },
         }
         for row in records
     ]
@@ -1015,6 +1062,7 @@ async def _style_report(
     source_id: str,
     check_id: str,
     last_row: int,
+    source_column_count: int = SOURCE_COLUMN_COUNT,
 ) -> None:
     styles = [
         {"ranges": f"{main_id}!A1:AU1", "style": {"bold": True, "fontSize": 10, "hAlign": 1, "vAlign": 1, "foreColor": "#FFFFFF", "backColor": "#0F766E"}},
@@ -1025,8 +1073,8 @@ async def _style_report(
         # rejects custom formatter "0.0000" (90204); values retain full precision.
         {"ranges": f"{main_id}!AM2:AU{last_row}", "style": {"formatter": "0.00%"}},
         {"ranges": f"{main_id}!J2:K{last_row}", "style": {"formatter": "0"}},
-        {"ranges": f"{source_id}!A1:{_column_letter(SOURCE_COLUMN_COUNT)}1", "style": {"bold": True, "fontSize": 10, "hAlign": 1, "vAlign": 1, "foreColor": "#FFFFFF", "backColor": "#0F766E"}},
-        {"ranges": f"{source_id}!A2:{_column_letter(SOURCE_COLUMN_COUNT)}{last_row}", "style": {"fontSize": 9, "vAlign": 1}},
+        {"ranges": f"{source_id}!A1:{_column_letter(source_column_count)}1", "style": {"bold": True, "fontSize": 10, "hAlign": 1, "vAlign": 1, "foreColor": "#FFFFFF", "backColor": "#0F766E"}},
+        {"ranges": f"{source_id}!A2:{_column_letter(source_column_count)}{last_row}", "style": {"fontSize": 9, "vAlign": 1}},
         {"ranges": f"{check_id}!A1:C1", "style": {"bold": True, "fontSize": 10, "hAlign": 1, "vAlign": 1, "backColor": "#D9EAF7"}},
         {"ranges": f"{check_id}!A2:C18", "style": {"fontSize": 10, "vAlign": 1}},
         {"ranges": f"{check_id}!B8:B11", "style": {"formatter": "#,##0.00"}},
@@ -1063,14 +1111,15 @@ async def _write_report(
     main_rows = await _ensure_rows(token, spreadsheet_token, main, needed)
     source_rows = await _ensure_rows(token, spreadsheet_token, source, needed)
     check_rows = await _ensure_rows(token, spreadsheet_token, checks, needed)
-    await _ensure_columns(token, spreadsheet_token, source, SOURCE_COLUMN_COUNT)
+    source_column_count = len(prepared["source_values"][0])
+    await _ensure_columns(token, spreadsheet_token, source, source_column_count)
 
     check_values = [list(row) for row in prepared["check_values"]]
     check_values[0][4] = f"{MARKER_PREFIX}|IN_PROGRESS|{report_identity}"
-    source_last_column = _column_letter(SOURCE_COLUMN_COUNT)
+    source_last_column = _column_letter(source_column_count)
     await _write_range(
         token, spreadsheet_token, f"{source['sheetId']}!A1:{source_last_column}{source_rows}",
-        _pad_matrix(prepared["source_values"], source_rows, SOURCE_COLUMN_COUNT),
+        _pad_matrix(prepared["source_values"], source_rows, source_column_count),
     )
     await _write_range(
         token, spreadsheet_token, f"{main['sheetId']}!A1:AU{main_rows}",
@@ -1082,7 +1131,7 @@ async def _write_report(
     )
     await _style_report(
         token, spreadsheet_token, main["sheetId"], source["sheetId"], checks["sheetId"],
-        len(prepared["main_values"]),
+        len(prepared["main_values"]), source_column_count,
     )
 
     main_last_row = len(prepared["main_values"])
@@ -1159,25 +1208,25 @@ def validate_report_readback(
         more = f"，另有 {len(value_mismatches) - 10} 个" if len(value_mismatches) > 10 else ""
         raise ReportGenerationError(f"统一毛利报表写后回读失败：固定值未正确写入 {preview}{more}")
 
+    source_column_count = len(expected_source_rows[0])
     if (
         len(actual_source_rows) != len(expected_source_rows)
         or not actual_source_rows
-        or actual_source_rows[0][:SOURCE_COLUMN_COUNT]
-        != expected_source_rows[0][:SOURCE_COLUMN_COUNT]
+        or actual_source_rows[0][:source_column_count]
+        != expected_source_rows[0][:source_column_count]
     ):
         raise ReportGenerationError("统一毛利报表写后回读失败：数据源标题或行数不一致")
     for row_number, (actual, expected) in enumerate(
         zip(actual_source_rows[1:], expected_source_rows[1:]), start=2
     ):
-        for column in range(SOURCE_COLUMN_COUNT):
+        for column in range(source_column_count):
             if column >= len(actual):
                 raise ReportGenerationError(
                     f"统一毛利报表写后回读失败：数据源第 {row_number} 行不一致"
                 )
             expected_cell = expected[column]
             if (
-                column < len(SOURCE_HEADERS)
-                and SOURCE_HEADERS[column] in _NUMERIC_SOURCE_FIELDS
+                expected_source_rows[0][column] in _NUMERIC_SOURCE_FIELDS
                 and expected_cell is not None
                 and expected_cell != ""
             ):

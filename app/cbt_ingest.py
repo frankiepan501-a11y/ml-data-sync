@@ -309,7 +309,7 @@ async def _bitable_all(tok: str) -> list[dict]:
     return out
 
 
-async def _ensure_full_field(tok: str):
+async def _ensure_full_field(tok: str, extra_fields=()):
     async with httpx.AsyncClient(timeout=30) as c:
         response = await c.get(
             f"{FEISHU}/bitable/v1/apps/{APP_TOKEN}/tables/{TABLE_ID}/fields?page_size=200",
@@ -321,8 +321,9 @@ async def _ensure_full_field(tok: str):
                 f"CBT 飞书字段读取失败：status={response.status_code} code={payload.get('code')}"
             )
         d = payload.get("data", {})
-        if F_FULL not in {f["field_name"] for f in d.get("items", [])}:
-            raise RuntimeError(f"CBT 飞书缺少必需字段 {F_FULL}；未写入数据")
+        missing = {F_FULL, *extra_fields} - {f["field_name"] for f in d.get("items", [])}
+        if missing:
+            raise RuntimeError(f"CBT 飞书缺少必需字段 {sorted(missing)}；未写入数据")
 
 
 async def run(month: str, commit: bool = False, fx: float | None = None,
@@ -359,7 +360,12 @@ async def run(month: str, commit: bool = False, fx: float | None = None,
     if fx is None or not math.isfinite(float(fx)) or float(fx) <= 0:
         raise RuntimeError(f"CBT {month} USD 月汇率缺失或无效；未写入")
     fx = float(fx)
-    agg, l2s = _parse_orders(ord_data, month)
+    reconciliation = None
+    if month == "2026-09":
+        from app.cbt_reconcile import reconcile
+        agg, l2s, reconciliation = reconcile(ord_data, bill_data, ad_data, month)
+    else:
+        agg, l2s = _parse_orders(ord_data, month)
     ad_sku, ad_total, ad_unmatched = _parse_ads(ad_data, l2s)
     storage_total = _parse_storage(bill_data)
 
@@ -387,13 +393,19 @@ async def run(month: str, commit: bool = False, fx: float | None = None,
     tot_K = sum(a["K"] for a in agg.values()) or 1
     rows_out = []
     for sku, a in agg.items():
-        K, L, Q, R, S = a["K"], -a["L"], -a["Q"], -a["R"], a["S"]
-        O = a["K"] + a["L"] + a["Q"] + a["R"] - a["S"]  # net 物流(反推闭合到S)
+        if reconciliation:
+            K, L, Q, R = (a[k] for k in ("K", "L", "Q", "R"))
+            O = a["O"] + a.get("return_fee", 0)
+        else:
+            K, L, Q, R = a["K"], -a["L"], -a["Q"], -a["R"]
+            O = a["K"] + a["L"] + a["Q"] + a["R"] - a["S"]
         share = K / tot_K
         ad_alloc = ad_sku.get(sku, 0.0) + ad_unmatched * share
         storage_alloc = storage_total * share
         caigou = cg_for(sku) * a["units"]
         rows_out.append(dict(sku=sku, units=a["units"], orders=a["orders"], title=a["title"],
+                             net_units=a.get("net_units"), returned_units=a.get("returned_units"),
+                             adjustment=a.get("adjustment", 0),
                              K=K, L=L, O=O, Q=Q, R=R, ad=ad_alloc, storage=storage_alloc, caigou=caigou,
                              has_cg=(cg_for(sku) > 0)))
 
@@ -404,13 +416,15 @@ async def run(month: str, commit: bool = False, fx: float | None = None,
                "file_validations": validations,
                "sku_count": len(rows_out), "totals": tot,
                "nocg_skus": [r["sku"] for r in rows_out if not r["has_cg"] and r["units"] > 0]}
+    if reconciliation:
+        summary["reconciliation"] = reconciliation
     if not commit:
         summary["note"] = "DRY-RUN 未写飞书; commit=true 才按SKU update"
         return summary
 
     # 安全生成整个 CBT/月快照：新行先创建并逐 SKU 核验；旧行不删除，
     # 而是改到显式指定的历史周期标签，确保修复前后的证据可以并存。
-    await _ensure_full_field(tok)
+    await _ensure_full_field(tok, ("净销量", "退货数量", "财务修订版本", "调整(原币)", "调整(RMB)") if reconciliation else ())
     def _txt(v): return v[0].get("text", "") if isinstance(v, list) and v else (str(v) if v is not None else "")
     def _scope(items, target_period=period):
         return [
@@ -447,6 +461,11 @@ async def run(month: str, commit: bool = False, fx: float | None = None,
             "简易毛利(RMB)": round(r["K"]*fx - r["caigou"], 2),
             "商品标题": r["title"], "数据拉取时间": now_ms,
         }
+        if reconciliation:
+            fld.update({"净销量": int(r["net_units"]), "退货数量": int(r["returned_units"]),
+                        "财务修订版本": reconciliation["version"],
+                        "调整(原币)": round(r["adjustment"], 2),
+                        "调整(RMB)": round(r["adjustment"] * fx, 2)})
         old_fields = (existing_by_sku.get(sku) or {}).get("fields") or {}
         for field_name in preserved_cost_fields:
             if old_fields.get(field_name) is not None:
@@ -458,6 +477,7 @@ async def run(month: str, commit: bool = False, fx: float | None = None,
             "广告费(原币)", "广告费(RMB)", "采购成本(RMB)", F_FULL,
             "卖家折扣(原币)", "卖家折扣(RMB)", "简易毛利(RMB)",
             "头程成本(RMB)", "海外仓成本(RMB)",
+            "净销量", "退货数量", "调整(原币)", "调整(RMB)",
         }
         for field_name in numeric_fields.intersection(fld):
             try:
@@ -482,6 +502,9 @@ async def run(month: str, commit: bool = False, fx: float | None = None,
         "简易毛利(RMB)", F_FULL, "头程成本(RMB)", "海外仓成本(RMB)",
     )
     verify_text_fields = ("SKU", "平台", "店铺", "周期", "币种", "商品标题")
+    if reconciliation:
+        verify_fields += ("净销量", "退货数量", "调整(原币)", "调整(RMB)")
+        verify_text_fields += ("财务修订版本",)
 
     def _verify_items(items, phase):
         if len(items) != len(fresh_records):

@@ -24,6 +24,7 @@ class SeptemberSystemTests(unittest.IsolatedAsyncioTestCase):
             patch.object(cbt_ingest, '_ft', AsyncMock(return_value='t')),
             patch.object(cbt_ingest, '_list_folder', AsyncMock(return_value=files)),
             patch.object(cbt_ingest, '_download', AsyncMock(side_effect=lambda t,k: content[k])),
+            patch('app.cbt_reconcile.reconcile', return_value=({}, {}, {'version': 'test-rate-only'})),
             patch.object(lingxing, 'fetch_all_products', AsyncMock(return_value={})),
             patch.object(lingxing, 'fetch_fx_rate', AsyncMock(return_value={'USD': 6.7809})) as fx,
         ):

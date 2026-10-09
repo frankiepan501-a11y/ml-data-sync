@@ -16,9 +16,23 @@ User authorized September source repair, restoration of the existing automatic m
 
 ## Single-record September BR shipping credit
 
-Credit 70838835146 reverses original charge 70083277162, shipment 47877948646, pack 2000014751989369, amount 14.45 BRL. The September 7 official August sales export row 121 shows this pack delivered and shipping cost 14.45. The August 31 shipment cache independently contains sender cost 14.45. The retained approved August FB07-7 source has 201 units and gross revenue 17625.65, exactly equal to the complete 201-row historical non-cancelled official SKU set that includes this pack. Historical month-scope reconciliation recorded zero missing/extra non-cancelled packs; the aggregation charged each cached shipment once. This proves inclusion in that retained source without rewriting August.
+Credit 70838835146 reverses original charge 70083277162, shipment 47877948646, pack 2000014751989369, amount 14.45 BRL. The September 7 official August export row 121 and the August 31 shipment cache both show 14.45. Replaying all 201 historical non-cancelled FB07-7 rows with the historical production algorithm gives exactly the retained 2867.60 BRL shipping; removing the target gives 2853.15. That historical algorithm charged the full shipment per order. The later shared-package correction was applied to MX3, not this BR snapshot. Five mixed-SKU packages account for a separate historical 52.80 allocation issue; August remains read-only.
 
-Only this exact credit/date/currency/original-charge/shipment/pack/amount combination may reduce September shipping expense. Other unproved BFFI credits remain blocked. Evidence: finance workspace `outputs/mercadolibre-september-system-20261009/BR-prior-charge-proof.json` with source file SHA256 and all 201 financial rows. The SKU's total official-vs-API shipping difference is 10.68 BRL; this record-level correction does not certify whole-month August A/B reconciliation.
+Only this exact credit/date/currency/original-charge/shipment/pack/amount combination may reduce September shipping expense. Other unproved BFFI credits remain blocked. Evidence: finance workspace `outputs/mercadolibre-september-system-20261009/BR-Aug-replay.json`, including historical commits, file hashes, 201 row mappings and cached fee timestamps. This proves the single credit's prior expense, not whole-month August A/B completion.
+
+## September CBT field reconciliation
+
+The September repair is bound to the three audited export hashes in `cbt_reconcile.py`. A changed export stops for renewed evidence; no September claim exception is silently reused for another month. Prior-month parsing and financial revisions are preserved. Further month validation is separate work.
+
+- Four multi-unit rows store per-unit K while another already stores the line total. Each is resolved against Bill quantity and sale amount, not a blanket quantity multiplier.
+- The blank-SKU package is allocated only to its two child orders. Child revenue/commission are observed; shared taxes/shipping use disclosed within-package revenue shares.
+- Original cost quantity stays 459. Commercial net quantity is 436 and platform-inspected returns are 7, including two awaiting retrieval; these are not inventory restock facts.
+- Product-sales refunds and settlement reversals are different measures. The adjustment explicitly bridges FX, refund/fee reclassification and source rounding, preserving every order's seller settlement. Buyer-protection exceptions use verified claim quantities, never mixed-currency payment amounts as USD.
+- September return handling fees for August orders are attributed by listing to the corresponding two SKUs and added after the Orders settlement bridge; August is not rewritten.
+- Existing source schema gains only `净销量` and `退货数量`. The 47-column main report is unchanged; only September's source sheet includes these fields. New null schema keys are ignored in pre-September approval hashes, but non-null changes remain bound. The production profit formula adds an exact month/shop/version branch, keeping the old formula as its fallback.
+- Review generation rejects missing September CBT revision/rows or aggregate discrepancies before presenting verified figures. It never issues human approvals or writes the company index.
+
+Independent verification: 453 orders × 13 fields matched the separately constructed financial bridge with zero differences. Full regression suite: 286 tests passed. Production source/cost/candidate completion is recorded separately in the finance workspace evidence, rather than inferred from these tests.
 
 ## Verification and recovery
 
