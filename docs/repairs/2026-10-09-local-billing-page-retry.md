@@ -6,7 +6,7 @@
 
 ## 最小修复
 
-`app/billing.py` 在页数不一致时对**同一游标**最多重读两次，短暂退避；一致才消费该页。仍不一致则继续报错并禁止写报表，不跳页、不把缺失费用当0。`app/main.py` 为月度同步各关键阶段记录耗时，便于区分订单缓存、领星、广告、账单、访客和运费耗时，不记录令牌或明细。依据[美客多官方账单 API 分页说明](https://developers.mercadolivre.com.br/pt_br/guia-para-imoveis/boas-praticas-para-o-consumo-das-apis-de-relatorios-de-faturamento)，账单详情按`last_id → from_id`顺序分页；本次保留原有计数检查，避免在尚未完成官方原件A/B核对前放宽完整性要求。
+`app/billing.py` 在页数不一致时对**同一游标**最多重读两次，短暂退避；一致才消费该页。仍不一致则继续报错并禁止写报表，不跳页、不把缺失费用当0。`app/main.py` 为月度同步各关键阶段记录耗时，并在后台预览结束时记录成功或失败，便于区分订单缓存、领星、广告、账单、访客和运费耗时；不记录令牌。依据[美客多官方账单 API 分页说明](https://developers.mercadolivre.com.br/pt_br/guia-para-imoveis/boas-praticas-para-o-consumo-das-apis-de-relatorios-de-faturamento)，账单详情按`last_id → from_id`顺序分页；本次保留原有计数检查，避免在尚未完成官方原件A/B核对前放宽完整性要求。
 
 ## 验证与边界
 
