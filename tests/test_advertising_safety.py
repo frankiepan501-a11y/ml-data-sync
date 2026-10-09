@@ -352,6 +352,8 @@ class MonthlySyncSafetyTests(unittest.IsolatedAsyncioTestCase):
             "full_fees": 7.0,
             "return_fees": 3.0,
             "other_platform_fees": 2.0,
+            "tax_adjustments": 8.46,
+            "shipping_adjustments": -14.45,
             "product_ads_ignored": 99.0,
             "unclassified_count": 0,
             "unclassified_amount": 0.0,
@@ -380,9 +382,11 @@ class MonthlySyncSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(7.0, result["billing_full_fees_local"])
         self.assertEqual(3.0, result["billing_return_fees_local"])
         self.assertEqual(2.0, result["billing_other_platform_fees_local"])
+        self.assertEqual(8.46, result["billing_tax_adjustments_local"])
+        self.assertEqual(-14.45, result["billing_shipping_adjustments_local"])
         self.assertEqual(99.0, result["billing_product_ads_ignored"])
         self.assertEqual(4, result["billing_raw_details"])
-        self.assertEqual(5, result["rows_previewed"])
+        self.assertEqual(7, result["rows_previewed"])
 
     async def test_billing_failure_stops_before_feishu_write(self):
         self.billing_fetch.side_effect = RuntimeError("billing API status=429")

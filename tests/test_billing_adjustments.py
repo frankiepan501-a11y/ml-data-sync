@@ -5,6 +5,83 @@ from app import billing
 
 
 class BillingAdjustmentTests(unittest.TestCase):
+    def test_september_brazil_tax_and_linked_prior_month_shipping_bonus(self):
+        def row(detail_id, created, subtype, amount, detail_type, **extra):
+            return {
+                "charge_info": {
+                    "detail_id": detail_id,
+                    "creation_date_time": created,
+                    "transaction_detail": extra.pop("label", subtype),
+                    "detail_sub_type": subtype,
+                    "detail_type": detail_type,
+                    "detail_amount": amount,
+                    **extra.pop("charge", {}),
+                },
+                "shipping_info": extra.pop("shipping", None),
+                "items_info": extra.pop("items", None),
+                "currency_info": {"currency_id": "BRL"},
+            }
+
+        prior_shipping = {"shipping_id": "47877948646", "pack_id": "2000014751989369"}
+        details = [
+            row(70083277162, "2026-08-28T14:28:19", "CFFI", 14.45, "CHARGE",
+                shipping=prior_shipping),
+            row(70524298805, "2026-09-03T20:18:32", "CDIFAL", 8.46, "CHARGE",
+                label="Cobrança do diferencial de alíquota interestadual (ICMS-DIFAL)",
+                charge={"debited_from_operation": "NO"}),
+            row(70838835146, "2026-09-08T12:51:34", "BFFI", 14.45, "BONUS",
+                label="Cancelamento da tarifa por envio interno ao município",
+                charge={"charge_bonified_id": 70083277162}, shipping=prior_shipping),
+        ]
+
+        result = billing.summarize_month_details(details, "2026-09", default_currency="BRL")
+
+        self.assertEqual(0, result["unclassified_count"])
+        self.assertEqual(8.46, result["tax_adjustments"])
+        self.assertEqual(-14.45, result["shipping_adjustments"])
+
+    def test_unlinked_shipping_bonus_stays_blocked(self):
+        detail = {
+            "charge_info": {
+                "detail_id": 70838835146,
+                "creation_date_time": "2026-09-08T12:51:34",
+                "transaction_detail": "Cancelamento da tarifa por envio interno ao município",
+                "detail_sub_type": "BFFI",
+                "detail_type": "BONUS",
+                "detail_amount": 14.45,
+                "charge_bonified_id": 70083277162,
+            },
+            "shipping_info": {"shipping_id": "47877948646"},
+            "currency_info": {"currency_id": "BRL"},
+        }
+
+        result = billing.summarize_month_details([detail], "2026-09", default_currency="BRL")
+
+        self.assertEqual(1, result["unclassified_count"])
+
+    def test_mexico_full_stock_withdrawal_is_full_cost(self):
+        detail = {
+            "charge_info": {
+                "detail_id": 72308065403,
+                "creation_date_time": "2026-09-29T19:27:26",
+                "transaction_detail": "Cargo por retiro de stock Full",
+                "detail_sub_type": "CFRS",
+                "detail_type": "CHARGE",
+                "detail_amount": 6.8,
+                "concept_type": "FULFILLMENT",
+            },
+            "fulfillment_info": {"type": "WITHDRAWAL", "amount": 6.8},
+        }
+
+        result = billing.summarize_month_details([detail], "2026-09", default_currency="MXN")
+
+        self.assertEqual(0, result["unclassified_count"])
+        self.assertEqual(6.8, result["full_fees"])
+
+        detail["fulfillment_info"]["amount"] = 7.8
+        mismatch = billing.summarize_month_details([detail], "2026-09", default_currency="MXN")
+        self.assertEqual(1, mismatch["unclassified_count"])
+
     def test_split_billing_periods_must_cover_every_day_of_natural_month(self):
         periods = [
             {"key": "2026-07-18", "period": {"date_from": "2026-07-18", "date_to": "2026-08-17"}},

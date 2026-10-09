@@ -2,7 +2,7 @@
 
 Order and Product Ads occurrence-month values come from their dedicated APIs.
 This adapter adds only charges that those APIs do not cover: Display Ads,
-Fulfillment storage/violation charges, and return handling charges.
+Fulfillment fees, return handling, standalone tax, and linked shipping credits.
 """
 
 from __future__ import annotations
@@ -45,6 +45,8 @@ def summarize_month_details(
         "full_fees": 0.0,
         "return_fees": 0.0,
         "other_platform_fees": 0.0,
+        "tax_adjustments": 0.0,
+        "shipping_adjustments": 0.0,
         "product_ads_ignored": 0.0,
     }
     currencies: set[str] = set()
@@ -55,6 +57,11 @@ def summarize_month_details(
         "CV", "BV", "CFF", "BFF",  # Mexico sale/shipping
         "CVVML", "BVVML", "CFFE", "BFFE",  # Brazil sale/shipping
         "CFFI",  # Brazil municipal shipping (already covered per order)
+    }
+    details_by_id = {
+        int((detail.get("charge_info") or {}).get("detail_id")): detail
+        for detail in details
+        if (detail.get("charge_info") or {}).get("detail_id") not in (None, "")
     }
 
     for detail in details:
@@ -84,6 +91,11 @@ def summarize_month_details(
         signed_amount = -abs(amount) if str(charge.get("detail_type") or "").upper() == "BONUS" else abs(amount)
         label = _plain(charge.get("transaction_detail"))
         subtype = str(charge.get("detail_sub_type") or "").upper()
+        fulfillment = detail.get("fulfillment_info") or {}
+        try:
+            fulfillment_amount = float(fulfillment.get("amount"))
+        except (TypeError, ValueError):
+            fulfillment_amount = float("nan")
 
         bucket = None
         if subtype in known_order_derived_subtypes or any(
@@ -98,8 +110,44 @@ def summarize_month_details(
             continue
         if subtype == "PADS" or "product ads" in label:
             bucket = "product_ads_ignored"
+        elif subtype == "CDIFAL" and str(charge.get("detail_type") or "").upper() == "CHARGE" and (
+            str(charge.get("debited_from_operation") or "").upper() == "NO"
+            and not detail.get("shipping_info") and not detail.get("items_info")
+        ):
+            # Separate ICMS-DIFAL bill: not debited from an order and not present
+            # in order/shipment detail. Keep it in a tax field, not commission.
+            bucket = "tax_adjustments"
+        elif subtype == "BFFI" and str(charge.get("detail_type") or "").upper() == "BONUS":
+            try:
+                linked_id = int(charge.get("charge_bonified_id"))
+            except (TypeError, ValueError):
+                linked_id = 0
+            original = details_by_id.get(linked_id) or {}
+            original_charge = original.get("charge_info") or {}
+            shipping_id = str((detail.get("shipping_info") or {}).get("shipping_id") or "")
+            original_shipping_id = str((original.get("shipping_info") or {}).get("shipping_id") or "")
+            try:
+                original_amount = float(original_charge.get("detail_amount"))
+            except (TypeError, ValueError):
+                original_amount = float("nan")
+            if (
+                original_charge.get("detail_sub_type") == "CFFI"
+                and str(original_charge.get("detail_type") or "").upper() == "CHARGE"
+                and math.isfinite(original_amount)
+                and math.isclose(abs(original_amount), abs(amount), abs_tol=0.001)
+                and shipping_id and shipping_id == original_shipping_id
+            ):
+                bucket = "shipping_adjustments"
         elif subtype in {"CDLIT", "BDLIT"} or "display ads" in label:
             bucket = "display_ads"
+        elif subtype == "CFRS" and (
+            str(charge.get("detail_type") or "").upper() == "CHARGE"
+            and str(charge.get("concept_type") or "").upper() == "FULFILLMENT"
+            and str(fulfillment.get("type") or "").upper() == "WITHDRAWAL"
+            and math.isfinite(fulfillment_amount)
+            and math.isclose(abs(fulfillment_amount), abs(amount), abs_tol=0.001)
+        ):
+            bucket = "full_fees"
         elif subtype in {"CFWA", "CFPB", "CFCBI"} or (
             "full" in label and ("almacenamiento" in label or "incumplimiento" in label)
         ):
@@ -117,7 +165,7 @@ def summarize_month_details(
             )
         ):
             bucket = "other_platform_fees"
-        else:
+        if bucket is None:
             unclassified.append({
                 "detail_id": detail_id,
                 "subtype": subtype,
