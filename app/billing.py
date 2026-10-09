@@ -247,25 +247,33 @@ async def fetch_month_adjustments(seller_id: int, month: str) -> dict:
                     # real last_id from the preceding page.
                     if from_id:
                         page_params["from_id"] = from_id
-                    payload = await _get_json(
-                        client,
-                        f"{base}/billing/integration/periods/key/{key}/group/ML/{endpoint_suffix}",
-                        headers,
-                        page_params,
-                    )
-                    page = payload.get("results") or []
-                    total = payload.get("total")
-                    if not isinstance(total, int) or total < 0:
-                        raise RuntimeError(
-                            f"billing {endpoint_suffix} missing total key={key}"
+                    # The billing API can briefly return a page from a different
+                    # count snapshot. Retry the SAME cursor before treating the
+                    # report as incomplete; never consume a mismatched page.
+                    for consistency_attempt in range(3):
+                        payload = await _get_json(
+                            client,
+                            f"{base}/billing/integration/periods/key/{key}/group/ML/{endpoint_suffix}",
+                            headers,
+                            page_params,
                         )
+                        total = payload.get("total")
+                        if not isinstance(total, int) or total < 0:
+                            raise RuntimeError(
+                                f"billing {endpoint_suffix} missing total key={key}"
+                            )
+                        if expected_total is None or total == expected_total - fetched:
+                            break
+                        if consistency_attempt == 2:
+                            raise RuntimeError(
+                                f"billing {endpoint_suffix} remaining total mismatch key={key} "
+                                f"expected={expected_total - fetched} actual={total} "
+                                f"fetched={fetched}"
+                            )
+                        await asyncio.sleep(consistency_attempt + 1)
+                    page = payload.get("results") or []
                     if expected_total is None:
                         expected_total = total
-                    elif total != expected_total - fetched:
-                        raise RuntimeError(
-                            f"billing {endpoint_suffix} remaining total mismatch key={key} "
-                            f"expected={expected_total - fetched} actual={total}"
-                        )
                     all_details.extend(page)
                     if endpoint_suffix == "full/details":
                         raw_full_details += len(page)

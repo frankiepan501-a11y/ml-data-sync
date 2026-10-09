@@ -217,6 +217,58 @@ class BillingFetchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(3, result["raw_details"])
         self.assertEqual(2, getter.await_args_list[2].args[3]["from_id"])
 
+    async def test_fetch_retries_transient_remaining_total_mismatch_without_skipping_page(self):
+        def row(detail_id):
+            return {
+                "charge_info": {
+                    "detail_id": detail_id,
+                    "creation_date_time": "2026-08-12T10:00:00",
+                    "transaction_detail": "Cargo por venta",
+                    "detail_sub_type": "CV",
+                    "detail_type": "CHARGE",
+                    "detail_amount": 1,
+                },
+                "currency_info": {"currency_id": "MXN"},
+            }
+
+        getter = AsyncMock(side_effect=[
+            {"results": [{"key": "2026-08-01", "period": {"date_from": "2026-08-01", "date_to": "2026-08-31"}}]},
+            {"total": 3, "results": [row(1), row(2)], "last_id": 2},
+            {"total": 200, "results": [row(3)], "last_id": 3},
+            {"total": 1, "results": [row(3)], "last_id": 3},
+            {"total": 0, "results": []},
+        ])
+        with (
+            patch.object(billing.db, "get_token", AsyncMock(return_value={"access_token": "x"})),
+            patch.object(billing, "_get_json", getter),
+            patch.object(billing.asyncio, "sleep", AsyncMock()),
+        ):
+            result = await billing.fetch_month_adjustments(3383185411, "2026-08")
+
+        self.assertEqual(3, result["raw_details"])
+        self.assertEqual(2, getter.await_args_list[2].args[3]["from_id"])
+        self.assertEqual(2, getter.await_args_list[3].args[3]["from_id"])
+
+    async def test_fetch_still_blocks_persistent_remaining_total_mismatch(self):
+        row = {"charge_info": {"detail_id": 1}}
+        getter = AsyncMock(side_effect=[
+            {"results": [{"key": "2026-08-01", "period": {"date_from": "2026-08-01", "date_to": "2026-08-31"}}]},
+            {"total": 2, "results": [row], "last_id": 1},
+            {"total": 200, "results": [row], "last_id": 2},
+            {"total": 200, "results": [row], "last_id": 2},
+            {"total": 200, "results": [row], "last_id": 2},
+        ])
+        with (
+            patch.object(billing.db, "get_token", AsyncMock(return_value={"access_token": "x"})),
+            patch.object(billing, "_get_json", getter),
+            patch.object(billing.asyncio, "sleep", AsyncMock()),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "remaining total mismatch"):
+                await billing.fetch_month_adjustments(3383185411, "2026-08")
+
+        self.assertEqual(5, getter.await_count)
+        self.assertEqual([1, 1, 1], [call.args[3]["from_id"] for call in getter.await_args_list[2:]])
+
 
 if __name__ == "__main__":
     unittest.main()
