@@ -26,6 +26,23 @@ def _report_row():
     }
 
 
+def _september_cbt_row():
+    return {
+        "record_id": "rec-sep-cbt",
+        "fields": {
+            "周期": "month_2026-09",
+            "店铺": "ML CBT-FULL (1502236229)",
+            "SKU": "TZ17",
+            "订单数": 1,
+            "件数": 1,
+            "营收(RMB)": 100.0,
+            "采购成本(RMB)": 20.0,
+            "头程成本(RMB)": 5.0,
+            "全额毛利(RMB)": 75.0,
+        },
+    }
+
+
 def _stale_operating_status():
     return {
         "record_id": "rec-status",
@@ -68,25 +85,11 @@ def _stale_final_status():
 
 class ReportFormatRevisionTests(unittest.IsolatedAsyncioTestCase):
     async def test_september_partial_store_rows_cannot_start_operating_review(self):
-        row = {
-            "record_id": "rec-sep-cbt",
-            "fields": {
-                "周期": "month_2026-09",
-                "店铺": "ML CBT-FULL (1502236229)",
-                "SKU": "TZ17",
-                "订单数": 1,
-                "件数": 1,
-                "营收(RMB)": 100.0,
-                "采购成本(RMB)": 20.0,
-                "头程成本(RMB)": 5.0,
-                "全额毛利(RMB)": 75.0,
-            },
-        }
         with (
             patch.object(ml_close, "_tenant_token", AsyncMock(return_value="token")),
             patch.object(ml_close, "_get_status", AsyncMock(return_value=None)),
             patch.object(ml_close, "_open_ad_failures", AsyncMock(return_value=[])),
-            patch.object(ml_close, "_list_records", AsyncMock(return_value=[row])),
+            patch.object(ml_close, "_list_records", AsyncMock(return_value=[_september_cbt_row()])),
         ):
             result = await ml_close.audit(period="month_2026-09", run_cost_preview=False)
 
@@ -94,6 +97,80 @@ class ReportFormatRevisionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("instruction", result["next_card"])
         self.assertFalse(result["operating_ready"])
         self.assertEqual(2, len(result["missing_stores"]))
+
+    async def test_september_partial_store_commit_keeps_waiting_for_data(self):
+        writer = AsyncMock(return_value={"record_id": "rec-status"})
+        with (
+            patch.object(ml_close, "_tenant_token", AsyncMock(return_value="token")),
+            patch.object(ml_close, "_get_status", AsyncMock(return_value=None)),
+            patch.object(ml_close, "_open_ad_failures", AsyncMock(return_value=[])),
+            patch.object(ml_close, "_list_records", AsyncMock(return_value=[_september_cbt_row()])),
+            patch.object(ml_close, "_upsert_status", writer),
+        ):
+            result = await ml_close.audit(period="month_2026-09", commit=True, run_cost_preview=False)
+
+        written = writer.await_args.args[1]
+        stored = json.loads(written["最后结果JSON"])
+        self.assertEqual("待数据同步", written["状态"])
+        self.assertEqual("待数据同步", result["state"])
+        self.assertEqual("instruction", stored["next_card"])
+        self.assertEqual(2, len(stored["missing_stores"]))
+
+    async def test_september_partial_store_explicit_ops_card_is_blocked(self):
+        sender = AsyncMock()
+        with (
+            patch.object(ml_close, "_get_status", AsyncMock(return_value=None)),
+            patch.object(ml_close, "_open_ad_failures", AsyncMock(return_value=[])),
+            patch.object(ml_close, "audit", AsyncMock(return_value={
+                "period": "month_2026-09", "next_card": "instruction",
+                "missing_stores": ["ML 本土3店 DISTRIBUIDOR VALMIGOZ"],
+            })),
+            patch.object(ml_close, "send_card", sender),
+        ):
+            result = await ml_close.card_endpoint(period="month_2026-09", kind="ops_operating", send=True)
+
+        self.assertEqual("skipped", result["status"])
+        self.assertEqual("missing_stores", result["reason"])
+        sender.assert_not_awaited()
+
+    async def test_september_partial_store_ops_confirmation_blocked_even_if_ab_marked(self):
+        status = {
+            "record_id": "rec-status",
+            "fields": {"状态": "待运营确认", "最后卡片 message_id": "om-current"},
+        }
+        summary = {
+            "status": "ok", "period": "month_2026-09", "month": "2026-09",
+            "state": "待数据同步", "next_card": "instruction", "last_error": "",
+            "report_hash": "partial-hash", "ab_verified": True,
+            "operating_ready": False,
+            "missing_stores": ["ML 本土3店 DISTRIBUIDOR VALMIGOZ"],
+        }
+        writer = AsyncMock()
+        sender = AsyncMock()
+        with (
+            patch.object(db, "get_active_ml_close_month_work", AsyncMock(return_value=None)),
+            patch.object(db, "claim_ml_close_action", AsyncMock(return_value={"claimed": True, "status": "processing"})),
+            patch.object(db, "fail_ml_close_action", AsyncMock()),
+            patch.object(ml_close, "_tenant_token", AsyncMock(return_value="token")),
+            patch.object(ml_close, "_get_status", AsyncMock(return_value=status)),
+            patch.object(ml_close, "_current_report_hash", AsyncMock(return_value="partial-hash")),
+            patch.object(ml_close, "_open_ad_failures", AsyncMock(return_value=[])),
+            patch.object(ml_close, "audit", AsyncMock(return_value=summary)),
+            patch.object(ml_close, "_upsert_status", writer),
+            patch.object(ml_close, "send_card", sender),
+            patch.object(ml_close, "patch_or_fallback", AsyncMock(return_value={})),
+        ):
+            result = await ml_close.confirm_action({
+                "action": "ml_profit_ops_confirm", "period": "month_2026-09",
+                "report_hash": "partial-hash", "message_id": "om-current",
+                "operator_name": "运营", "operator_id": ml_close.ML_CLOSE_OPS_APPROVER_OPEN_ID,
+                "patch_message": False,
+            })
+
+        self.assertEqual("blocked", result["status"])
+        self.assertIn("缺少店铺", result["reason"])
+        writer.assert_not_awaited()
+        sender.assert_not_awaited()
 
     def test_v4_revision_is_part_of_identity_title_and_source_approval_hash(self):
         rows = [_report_row()]

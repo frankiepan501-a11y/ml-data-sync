@@ -755,7 +755,7 @@ async def _commit_audit_snapshot(
     )
     last_error = _with_ad_failure(latest_base_error, latest_failed_ad_shops)
     state, next_card = _close_state(
-        bool(result.get("report_rows")),
+        bool(result.get("report_rows")) and not bool(result.get("missing_stores")),
         bool(result.get("gap_row_count")),
         latest_state,
         last_error,
@@ -784,6 +784,7 @@ async def _commit_audit_snapshot(
         "next_card": next_card,
         "report_rows": int(_num(result.get("report_rows"))),
         "store_count": int(_num(result.get("store_count"))),
+        "missing_stores": result.get("missing_stores") or [],
         "order_count": int(_num(result.get("order_count"))),
         "unit_count": _num(result.get("unit_count")),
         "revenue_rmb": _num(result.get("revenue_rmb")),
@@ -1682,6 +1683,13 @@ async def card_endpoint(
 
     requested_kind = kind
     kind = "error" if summary.get("next_card") == "error" else (kind or summary.get("next_card") or "instruction")
+    if summary.get("missing_stores") and kind in (
+        "ops_operating", "ops_final", "finance_operating", "finance_final"
+    ):
+        return {
+            "status": "skipped", "reason": "missing_stores", "kind": "none",
+            "period": summary["period"], "summary": summary,
+        }
     if kind == "finance_final" and not summary.get("ab_verified"):
         return {
             "status": "skipped",
@@ -2727,6 +2735,8 @@ async def _confirm_action_impl(
 
     summary = await audit(period=period, commit=False, run_cost_preview=False)
 
+    if action in confirmation_actions and summary.get("missing_stores"):
+        return await _blocked_confirmation("本月缺少店铺数据，确认已拦截。")
     if action in confirmation_actions and summary.get("next_card") == "error":
         reason = _text(summary.get("last_error")) or "月结存在未解决异常，确认已拦截。"
         return await _blocked_confirmation(reason)
@@ -2822,6 +2832,8 @@ async def _confirm_action_impl(
                             )
                             if _text(live_summary.get("report_hash")) != approved_report_hash:
                                 block_reason = "确认期间报表内容已变化，当前版本需重新确认。"
+                            elif live_summary.get("missing_stores"):
+                                block_reason = "本月缺少店铺数据，经营确认已拦截。"
                             elif (
                                 action == "ml_profit_ops_confirm"
                                 and live_summary.get("ab_verified") is not True
